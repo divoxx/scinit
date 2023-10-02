@@ -12,9 +12,20 @@ use eyre::eyre;
 use std::io::IsTerminal;
 use std::fs::File;
 
+use tracing::{info, debug, instrument};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
 #[tokio::main]
+#[instrument]
 async fn main() -> Result<()> {
     color_eyre::install()?;
+
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(EnvFilter::from_default_env())
+        .init();
+
+    info!("started");
 
     let mut args = std::env::args().skip(1);
 
@@ -27,7 +38,9 @@ async fn main() -> Result<()> {
 
     let tty = File::open("/dev/tty")?;
     if tty.is_terminal() {
-        dbg!(tcsetpgrp(tty.as_raw_fd(), subprocess.process_group_id()?).unwrap());
+        let pgid = subprocess.process_group_id()?;
+        debug!("setting process group {} as foreground", &pgid);
+        tcsetpgrp(tty.as_raw_fd(), pgid)?;
     }
 
     pin! {
@@ -52,6 +65,7 @@ async fn main() -> Result<()> {
 /// 
 /// It providers a wrapper around tokio::process::Child with some additional behavior as it
 /// pertains to this application.
+#[derive(Debug)]
 struct Subprocess {
     /// Store the pid of the child process, for easy of access.
     pid: Pid,
@@ -61,9 +75,10 @@ struct Subprocess {
 }
 
 impl Subprocess {
+    #[instrument]
     fn spawn(bin: String, args: Vec<String>) -> Result<Self> {
-        let child = Command::new(bin)
-            .args(args)
+        let child = Command::new(&bin)
+            .args(&args)
             .process_group(0)
             .kill_on_drop(true)
             .stdin(Stdio::inherit())
@@ -76,12 +91,15 @@ impl Subprocess {
             None => return Err(eyre!("failed to get pid")),
         };
 
+        debug!("spawned subprocess with pid {}", &pid);
+
         Ok(Subprocess { 
             pid,
             child,
         })
     }
 
+    #[instrument]
     fn process_group_id(&self) -> Result<Pid> {
         Ok(getpgid(Some(self.pid))?)
     }
