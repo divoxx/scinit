@@ -15,7 +15,6 @@ use tracing::{debug, info, instrument};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
-#[instrument]
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
