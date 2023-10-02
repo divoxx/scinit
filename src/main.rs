@@ -2,18 +2,17 @@ type Result<T> = color_eyre::eyre::Result<T>;
 
 mod signals;
 
-use nix::unistd::{getpgid, tcsetpgrp, Pid};
+use eyre::eyre;
 use nix::sys::signal::{self, Signal};
+use nix::unistd::{getpgid, tcsetpgrp, Pid};
+use std::fs::File;
+use std::io::IsTerminal;
 use std::os::fd::AsRawFd;
 use std::process::Stdio;
 use tokio::process::{Child, Command};
-use tokio::{select, pin};
-use eyre::eyre;
-use std::io::IsTerminal;
-use std::fs::File;
-
-use tracing::{info, debug, instrument};
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tokio::{pin, select};
+use tracing::{debug, info, instrument};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
 #[instrument]
@@ -62,7 +61,7 @@ async fn main() -> Result<()> {
 }
 
 /// Subprocess represents a running processs.
-/// 
+///
 /// It providers a wrapper around tokio::process::Child with some additional behavior as it
 /// pertains to this application.
 #[derive(Debug)]
@@ -93,10 +92,7 @@ impl Subprocess {
 
         debug!("spawned subprocess with pid {}", &pid);
 
-        Ok(Subprocess { 
-            pid,
-            child,
-        })
+        Ok(Subprocess { pid, child })
     }
 
     #[instrument]
@@ -120,4 +116,3 @@ impl Subprocess {
 //
 //    child
 //}
-
