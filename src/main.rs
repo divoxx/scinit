@@ -13,6 +13,9 @@ use tokio::process::{Child, Command};
 use tokio::{pin, select};
 use tracing::{debug, info, instrument};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use once_cell::sync::Lazy;
+
+static TTY: Lazy<File> = Lazy::new(|| File::open("/dev/tty").unwrap());
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -33,13 +36,7 @@ async fn main() -> Result<()> {
     let mut sigs = signals::Signals::new()?;
 
     let mut subprocess = Subprocess::spawn(bin_name, bin_args)?;
-
-    let tty = File::open("/dev/tty")?;
-    if tty.is_terminal() {
-        let pgid = subprocess.process_group_id()?;
-        debug!("setting process group {} as foreground", &pgid);
-        tcsetpgrp(tty.as_raw_fd(), pgid)?;
-    }
+    process_group_to_foreground(subprocess.process_group_id()?)?;
 
     pin! {
         let subprocess_wait = subprocess.child.wait();
@@ -57,6 +54,15 @@ async fn main() -> Result<()> {
             },
         }
     }
+}
+
+fn process_group_to_foreground(pgid: Pid) -> Result<()> {
+    if TTY.is_terminal() {
+        debug!("setting process group {} as foreground", &pgid);
+        tcsetpgrp(TTY.as_raw_fd(), pgid)?;
+    }
+
+    Ok(())
 }
 
 /// Subprocess represents a running processs.
@@ -77,13 +83,19 @@ impl Subprocess {
     fn spawn(bin: String, args: Vec<String>) -> Result<Self> {
         let child = Command::new(&bin)
             .args(&args)
+            // create a new process group for this child process
             .process_group(0)
+            // ensure scinit kills the process if the Child instance is dropped
             .kill_on_drop(true)
+            // set up stdin/stderr/stdout to inherit from init
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
+            // start the child process and return a handle
             .spawn()?;
 
+        // Grab the PID, and return an error if it's None.
+        // Since this is done immediately after the child is created, it should always be present.
         let pid = match child.id() {
             Some(pid) => Pid::from_raw(pid.try_into()?),
             None => return Err(eyre!("failed to get pid")),
@@ -99,19 +111,3 @@ impl Subprocess {
         Ok(getpgid(Some(self.pid))?)
     }
 }
-
-//async fn spawn_child(bin: String, args: Vec<String>) -> Child {
-//    let child = Command::new(bin)
-//        .args(args)
-//        .process_group(0)
-//        .spawn()
-//        .expect("failed to start child process");
-//
-//    let pid = child.id().map(|id| Pid::from_raw(id as i32));
-//
-//    let pgid = getpgid(pid).unwrap();
-//    dbg!(pgid);
-//    dbg!(tcsetpgrp(std::io::stdin().as_raw_fd(), pgid).unwrap());
-//
-//    child
-//}
