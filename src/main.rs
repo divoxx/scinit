@@ -5,6 +5,7 @@ mod signals;
 use eyre::eyre;
 use nix::sys::signal::{self, Signal};
 use nix::unistd::{getpgid, tcsetpgrp, Pid};
+use once_cell::sync::Lazy;
 use std::fs::File;
 use std::io::IsTerminal;
 use std::os::fd::AsRawFd;
@@ -13,7 +14,6 @@ use tokio::process::{Child, Command};
 use tokio::{pin, select};
 use tracing::{debug, info, instrument};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-use once_cell::sync::Lazy;
 
 static TTY: Lazy<File> = Lazy::new(|| File::open("/dev/tty").unwrap());
 
@@ -35,21 +35,19 @@ async fn main() -> Result<()> {
 
     let mut sigs = signals::Signals::new()?;
 
-    let mut subprocess = Subprocess::spawn(bin_name, bin_args)?;
+    let subprocess = Subprocess::spawn(bin_name, bin_args)?;
     process_group_to_foreground(subprocess.process_group_id()?)?;
-
-    pin! {
-        let subprocess_wait = subprocess.child.wait();
-    }
 
     loop {
         select! {
-            _ = &mut subprocess_wait => {
-                println!("child exitted");
-                break Ok(())
-            },
+            Some(sig) = sigs.next() => {
+                dbg!("received signal {}", sig);
+                if sig == signals::Signal::SIGCHLD {
+                    info!("child exited; exiting scinit");
+                    return Ok(())
+                }
 
-            _ = sigs.next() => {
+                info!("forwarding {} to subprocess", sig);
                 signal::kill(subprocess.pid, Signal::SIGINT).unwrap();
             },
         }
@@ -73,9 +71,6 @@ fn process_group_to_foreground(pgid: Pid) -> Result<()> {
 struct Subprocess {
     /// Store the pid of the child process, for easy of access.
     pid: Pid,
-
-    /// Store a reference to the Child instance.
-    child: Child,
 }
 
 impl Subprocess {
@@ -103,7 +98,7 @@ impl Subprocess {
 
         debug!("spawned subprocess with pid {}", &pid);
 
-        Ok(Subprocess { pid, child })
+        Ok(Subprocess { pid })
     }
 
     #[instrument]
