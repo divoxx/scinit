@@ -6,8 +6,7 @@ use std::pin::Pin;
 
 use async_stream::stream;
 use futures::stream::{Stream, StreamExt};
-use nix::libc::{sigfillset, sigprocmask, sigset_t, sigwait, timespec};
-use nix::sys::signal::SigSet;
+use nix::libc::{sigfillset, sigprocmask, sigset_t, sigwait};
 use std::mem::MaybeUninit;
 use std::ptr;
 

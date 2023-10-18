@@ -11,7 +11,7 @@ use std::io::IsTerminal;
 use std::os::fd::AsRawFd;
 use std::process::Stdio;
 use tokio::process::{Child, Command};
-use tokio::{pin, select};
+use tokio::select;
 use tracing::{debug, info, instrument};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -41,14 +41,17 @@ async fn main() -> Result<()> {
     loop {
         select! {
             Some(sig) = sigs.next() => {
-                dbg!("received signal {}", sig);
-                if sig == signals::Signal::SIGCHLD {
-                    info!("child exited; exiting scinit");
-                    return Ok(())
-                }
+                match sig {
+                    signals::Signal::SIGCHLD => {
+                        info!("child exited; exiting scinit");
+                        return Ok(())
+                    },
 
-                info!("forwarding {} to subprocess", sig);
-                signal::kill(subprocess.pid, Signal::SIGINT).unwrap();
+                    _ => {
+                        info!("forwarding {} to subprocess", sig);
+                        signal::kill(subprocess.pid, Signal::SIGINT).unwrap();
+                    },
+                };
             },
         }
     }
@@ -71,6 +74,10 @@ fn process_group_to_foreground(pgid: Pid) -> Result<()> {
 struct Subprocess {
     /// Store the pid of the child process, for easy of access.
     pid: Pid,
+
+    /// Store a reference to the child instance.
+    /// We do this so that `kill_on_drop` only kills when Subprocess is dropped.
+    _child: Child,
 }
 
 impl Subprocess {
@@ -98,10 +105,9 @@ impl Subprocess {
 
         debug!("spawned subprocess with pid {}", &pid);
 
-        Ok(Subprocess { pid })
+        Ok(Subprocess { pid, _child: child })
     }
 
-    #[instrument]
     fn process_group_id(&self) -> Result<Pid> {
         Ok(getpgid(Some(self.pid))?)
     }
