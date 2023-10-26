@@ -10,8 +10,10 @@ use std::fs::File;
 use std::io::IsTerminal;
 use std::os::fd::AsRawFd;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::select;
+use tokio::time::interval;
 use tracing::{debug, info, instrument};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -33,14 +35,18 @@ async fn main() -> Result<()> {
     let bin_name = args.next().expect("no cmd name provided");
     let bin_args = args.collect::<Vec<String>>();
 
-    let mut sigs = signals::Signals::new()?;
+    let mut sig_monitor = signals::Monitor::new();
+    let mut signals = sig_monitor.monitor()?;
 
     let subprocess = Subprocess::spawn(bin_name, bin_args)?;
     process_group_to_foreground(subprocess.process_group_id()?)?;
 
+    let mut interval = interval(Duration::from_millis(1000));
+
     loop {
         select! {
-            Some(sig) = sigs.next() => {
+            _ = interval.tick() => debug!("tick"),
+            Some(sig) = signals.recv() => {
                 match sig {
                     signals::Signal::SIGCHLD => {
                         info!("child exited; exiting scinit");
