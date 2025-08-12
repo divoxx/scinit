@@ -1,4 +1,5 @@
 use super::Result;
+use crate::process_manager::ProcessManager;
 
 pub use nix::sys::signal::Signal;
 
@@ -6,61 +7,23 @@ use nix::libc::{sigaction, sigemptyset, SIG_IGN, sigtimedwait, timespec};
 use nix::sys::signal::{pthread_sigmask, SigmaskHow, SigSet};
 use std::mem::MaybeUninit;
 use std::ptr;
-use tokio::time::Duration;
-use tracing::{debug, warn};
+use std::time::Duration;
+use tokio::time;
+use tracing::{debug, error, info, warn};
 
-/// Sets up signal masking for the init system before starting tokio runtime
-/// This ensures all threads inherit the correct signal mask
-pub fn setup_signal_masking() -> Result<()> {
-    use std::mem::MaybeUninit;
-    use std::ptr;
-
-    // Create signal set with the signals we want to handle
-    let mut sigset = SigSet::empty();
-    
-    // Signals that init should handle and forward to children
-    let signals_to_handle = [
-        Signal::SIGTERM,
-        Signal::SIGINT, 
-        Signal::SIGQUIT,
-        Signal::SIGUSR1,
-        Signal::SIGUSR2,
-        Signal::SIGHUP,
-        Signal::SIGCHLD,
-    ];
-
-    // Add signals to the set
-    for &sig in &signals_to_handle {
-        sigset.add(sig);
+/// Converts signal number to human-readable name
+pub fn signal_name(signal: i32) -> &'static str {
+    match signal {
+        2 => "SIGINT",
+        9 => "SIGKILL", 
+        15 => "SIGTERM",
+        3 => "SIGQUIT",
+        1 => "SIGHUP",
+        10 => "SIGUSR1",
+        12 => "SIGUSR2",
+        17 => "SIGCHLD",
+        _ => "UNKNOWN",
     }
-
-    // Block the handled signals for this process (add to existing mask)
-    // Use pthread_sigmask instead of sigprocmask for thread safety
-    if let Err(e) = pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&sigset), None) {
-        warn!("Failed to block signals: {}", e);
-        return Err(e.into());
-    } else {
-        debug!("Successfully blocked signals for synchronous handling");
-    }
-
-    // Ignore SIGTTIN and SIGTTOU to prevent blocking on terminal operations
-    let mut ign_action: sigaction = unsafe { MaybeUninit::zeroed().assume_init() };
-    unsafe {
-        ign_action.sa_sigaction = SIG_IGN as usize;
-        sigemptyset(&mut ign_action.sa_mask);
-    }
-
-    unsafe {
-        if sigaction(nix::libc::SIGTTIN, &ign_action, ptr::null_mut()) != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        if sigaction(nix::libc::SIGTTOU, &ign_action, ptr::null_mut()) != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    }
-
-    debug!("Signal masking configured before tokio runtime startup");
-    Ok(())
 }
 
 /// Signal handler for the init system that manages signal blocking and forwarding.
@@ -105,13 +68,13 @@ impl SignalHandler {
             handled_signals.add(sig);
         }
 
-        // Block the handled signals for this process (add to existing mask)
+        // Set the signal mask for this process (replace existing mask)
         // Use pthread_sigmask instead of sigprocmask for thread safety
-        if let Err(e) = pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&handled_signals), None) {
-            warn!("Failed to block signals: {}", e);
+        if let Err(e) = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&handled_signals), None) {
+            warn!("Failed to set signal mask: {}", e);
             return Err(e.into());
         } else {
-            debug!("Successfully blocked signals for synchronous handling");
+            debug!("Successfully set signal mask for synchronous handling");
         }
 
         // Ignore SIGTTIN and SIGTTOU to prevent blocking on terminal operations
@@ -158,11 +121,9 @@ impl SignalHandler {
                 tv_nsec: timeout_duration.subsec_nanos() as i64,
             };
 
-            debug!("Waiting for signals with sigtimedwait (timeout: {}ms)", timeout_duration.as_millis());
             let signal_num = unsafe {
                 sigtimedwait(&handled_signals, ptr::null_mut(), &timeout_spec)
             };
-            debug!("sigtimedwait returned: {}", signal_num);
 
             if signal_num > 0 {
                 // Convert signal number to Signal enum
@@ -182,8 +143,10 @@ impl SignalHandler {
                 
                 if let Some(sig) = signal {
                     debug!("Received signal: {:?}", sig);
+                    Ok(Some(sig))
+                } else {
+                    Ok(None)
                 }
-                Ok(signal)
             } else {
                 let errno = std::io::Error::last_os_error();
                 match errno.raw_os_error() {
@@ -221,4 +184,90 @@ impl Drop for SignalHandler {
         
         debug!("Signal handler cleaned up, signal mask restored");
     }
+}
+
+impl SignalHandler {
+    /// Processes a specific signal according to init system semantics
+    pub async fn process_signal(&self, signal: Signal, process_manager: &mut ProcessManager, graceful_timeout_secs: u64) -> Result<SignalAction> {
+        match signal {
+            Signal::SIGCHLD => {
+                // Reap zombie processes asynchronously - this is always handled by init
+                debug!("received SIGCHLD, reaping zombie processes");
+                Ok(SignalAction::ReapZombies)
+            }
+            Signal::SIGTERM | Signal::SIGINT | Signal::SIGQUIT => {
+                // Scenario B: Signal forwarding with graceful shutdown and timeout
+                info!("received termination signal {:?}, initiating graceful shutdown", signal);
+                self.handle_termination_signal(signal, process_manager, graceful_timeout_secs).await?;
+                Ok(SignalAction::Exit)
+            }
+            Signal::SIGUSR1 | Signal::SIGUSR2 | Signal::SIGHUP => {
+                // These signals should be forwarded to the child process only
+                info!("forwarding signal {:?} to child process", signal);
+                if let Err(e) = process_manager.forward_signal(signal) {
+                    warn!("failed to forward signal {:?} to child: {}", signal, e);
+                }
+                Ok(SignalAction::Continue)
+            }
+            _ => {
+                // Any other signals we somehow receive should be forwarded
+                debug!("forwarding unexpected signal {:?} to child process", signal);
+                if let Err(e) = process_manager.forward_signal(signal) {
+                    warn!("failed to forward signal {:?} to child: {}", signal, e);
+                }
+                Ok(SignalAction::Continue)
+            }
+        }
+    }
+
+    /// Handles termination signals with proper timeout and escalation (Scenario B)
+    async fn handle_termination_signal(&self, signal: Signal, process_manager: &mut ProcessManager, graceful_timeout_secs: u64) -> Result<()> {
+        info!("Termination signal {:?} received, forwarding to child process", signal);
+        
+        // Forward the signal to child process
+        if let Err(e) = process_manager.forward_signal(signal) {
+            warn!("Failed to forward signal {:?} to child: {}", signal, e);
+        }
+        
+        match signal {
+            Signal::SIGTERM => {
+                // SIGTERM gets graceful shutdown with timeout
+                info!("Waiting for child process to exit gracefully (timeout: {}s)", graceful_timeout_secs);
+                
+                if let Err(_) = process_manager.graceful_shutdown().await {
+                    warn!("Graceful shutdown timed out, child process may have been force-killed");
+                }
+            }
+            Signal::SIGINT | Signal::SIGQUIT => {
+                // SIGINT/SIGQUIT get shorter timeout or immediate cleanup
+                info!("Waiting for child process to exit (signal: {:?})", signal);
+                
+                // Wait a bit for child to exit, but don't use full graceful timeout
+                time::sleep(Duration::from_secs(2)).await;
+                
+                // Force kill if still running
+                if process_manager.is_running() {
+                    warn!("Child process didn't exit after {:?}, forcing termination", signal);
+                    if let Err(e) = process_manager.force_kill().await {
+                        error!("Failed to force kill child process: {}", e);
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        
+        info!("scinit exiting due to termination signal {:?}", signal);
+        Ok(())
+    }
+}
+
+/// Actions that signal processing can return
+#[derive(Debug, Clone, PartialEq)]
+pub enum SignalAction {
+    /// Continue normal operation
+    Continue,
+    /// Reap zombie processes
+    ReapZombies, 
+    /// Exit the init system
+    Exit,
 }

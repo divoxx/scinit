@@ -1,10 +1,11 @@
 use super::Result;
+use crate::process_manager::ProcessManager;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Events that can be emitted by the file watcher
 #[derive(Debug, Clone)]
@@ -133,7 +134,7 @@ impl FileWatcher {
                             
                             // Emit the change event
                             if let Err(e) = event_tx.send(FileChangeEvent::FileChanged(
-                                event.paths.first().unwrap_or(&watch_path).clone()
+                                event.paths.first().cloned().unwrap_or_else(|| watch_path.clone())
                             )) {
                                 error!("Failed to send file change event: {}", e);
                                 break;
@@ -206,6 +207,30 @@ impl Drop for FileWatcher {
             self.watcher.take();
         }
     }
+}
+
+/// Handles file change events and triggers process restarts
+pub async fn handle_file_events(file_watcher: &mut Option<FileWatcher>, process_manager: &mut ProcessManager) -> Result<bool> {
+    if let Some(ref mut file_watcher) = file_watcher {
+        if let Some(event) = file_watcher.wait_for_event(Duration::from_millis(100)).await? {
+            match event {
+                FileChangeEvent::FileChanged(path) => {
+                    info!("File changed: {:?}, triggering restart", path);
+                    let restart_result = process_manager
+                        .restart_process_with_reason("file_change")
+                        .await?;
+                    if !restart_result {
+                        info!("Process restart limit exceeded, exiting");
+                        return Ok(true); // Signal to exit
+                    }
+                }
+                FileChangeEvent::WatchError(error) => {
+                    warn!("File watching error: {}", error);
+                }
+            }
+        }
+    }
+    Ok(false) // Continue normal operation
 }
 
 #[cfg(test)]

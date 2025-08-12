@@ -1,8 +1,12 @@
 use super::Result;
 use crate::port_manager::PortManager;
+use crate::signals::signal_name;
 use eyre::eyre;
-use nix::unistd::{getpgid, Pid};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use nix::unistd::{getpgid, tcsetpgrp, Pid};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -186,7 +190,8 @@ impl ProcessManager {
         }
 
         // Spawn the process
-        let child = command.spawn()?;
+        let child = command.spawn()
+            .map_err(|e| eyre!("Failed to spawn process '{}': {}", self.config.command, e))?;
         
         // Get the PID
         let pid = match child.id() {
@@ -219,7 +224,7 @@ impl ProcessManager {
                     self.process_info.state = ProcessState::Stopped;
                     self.child = None;
                     
-                    info!("Process exited with status: {:?}", status);
+                    debug!("Process exited with status: {:?}", status);
                     Ok(Some(status))
                 }
                 Err(e) => {
@@ -388,6 +393,7 @@ impl ProcessManager {
     /// 
     /// # Returns
     /// * `ProcessState` - Current process state
+    #[allow(dead_code)]
     pub fn state(&self) -> ProcessState {
         self.process_info.state.clone()
     }
@@ -404,6 +410,7 @@ impl ProcessManager {
     /// 
     /// This method sets the should_stop flag, which will prevent
     /// further process restarts.
+    #[allow(dead_code)]
     pub fn stop(&mut self) {
         self.should_stop = true;
         info!("Process manager stopped");
@@ -595,4 +602,125 @@ mod tests {
         let restart_result = manager.restart_process_with_reason("manual").await.unwrap();
         assert!(!restart_result);
     }
-} 
+}
+
+/// Sets the process group as the foreground process group if a terminal is available
+pub fn process_group_to_foreground(pgid: Pid) -> Result<()> {
+    match File::open("/dev/tty") {
+        Ok(tty) => {
+            if tty.is_terminal() {
+                debug!("Setting process group {} as foreground", &pgid);
+                if let Err(e) = tcsetpgrp(tty, pgid) {
+                    error!("Failed to set process group {} as foreground: {}", &pgid, e);
+                    return Err(e.into());
+                }
+            } else {
+                debug!("Not a terminal, skipping foreground process group setup");
+            }
+        }
+        Err(e) => {
+            debug!(
+                "Cannot open /dev/tty ({}), skipping foreground process group setup",
+                e
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reaps zombie processes to prevent process table exhaustion
+pub fn reap_zombies() -> Result<()> {
+    let mut reaped_count = 0;
+
+    loop {
+        match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(pid, status)) => {
+                debug!("reaped zombie process {} with exit status {}", pid, status);
+                reaped_count += 1;
+            }
+            Ok(WaitStatus::Signaled(pid, signal, _)) => {
+                debug!(
+                    "reaped zombie process {} killed by signal {:?}",
+                    pid, signal
+                );
+                reaped_count += 1;
+            }
+            Ok(WaitStatus::Stopped(pid, signal)) => {
+                debug!("reaped stopped process {} by signal {:?}", pid, signal);
+                reaped_count += 1;
+            }
+            Ok(WaitStatus::Continued(pid)) => {
+                debug!("reaped continued process {}", pid);
+                reaped_count += 1;
+            }
+            Ok(WaitStatus::StillAlive) => {
+                // No more zombies to reap
+                break;
+            }
+            Ok(WaitStatus::PtraceEvent(_, _, _)) | Ok(WaitStatus::PtraceSyscall(_)) => {
+                // Ignore ptrace events
+                continue;
+            }
+            Err(nix::Error::ECHILD) => {
+                // No child processes
+                break;
+            }
+            Err(e) => {
+                warn!("error reaping zombies: {}", e);
+                break;
+            }
+        }
+    }
+
+    if reaped_count > 0 {
+        debug!("reaped {} zombie processes", reaped_count);
+    }
+
+    Ok(())
+}
+
+/// Handles child process exit (Scenario A)
+/// 
+/// In container environments, scinit's lifecycle is tied to the child process.
+/// When the child exits, scinit should exit with appropriate logging and status.
+pub async fn handle_child_exit(status: std::process::ExitStatus) -> Result<()> {
+    if status.success() {
+        info!("Child process exited successfully, scinit exiting cleanly");
+    } else {
+        if let Some(code) = status.code() {
+            info!("Child process exited with error code {}, scinit exiting", code);
+        } else {
+            // Extract signal information from status
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(signal) = status.signal() {
+                    info!("Child process terminated by signal {} ({}), scinit exiting", 
+                          signal, signal_name(signal));
+                } else {
+                    info!("Child process terminated by signal, scinit exiting");
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                info!("Child process terminated by signal, scinit exiting");
+            }
+        }
+    }
+    
+    // Reap any remaining zombies before exiting
+    debug!("Reaping any remaining zombie processes before exit");
+    reap_zombies_async().await;
+    
+    Ok(())
+}
+
+/// Reaps zombie processes asynchronously to avoid blocking the main loop
+pub async fn reap_zombies_async() {
+    // Spawn zombie reaping in a blocking task to avoid blocking the main loop
+    tokio::task::spawn_blocking(|| {
+        if let Err(e) = reap_zombies() {
+            warn!("error reaping zombies: {}", e);
+        }
+    });
+}
