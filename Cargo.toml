@@ -27,5 +27,6 @@ chrono = "0.4"
 [dev-dependencies]
 tempfile = "3.8"
 chrono = "0.4"
+anyhow = "1.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
