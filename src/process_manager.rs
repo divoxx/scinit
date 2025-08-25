@@ -687,25 +687,23 @@ pub fn reap_zombies() -> Result<()> {
 pub async fn handle_child_exit(status: std::process::ExitStatus) -> Result<()> {
     if status.success() {
         info!("Child process exited successfully, scinit exiting cleanly");
+    } else if let Some(code) = status.code() {
+        info!("Child process exited with error code {}, scinit exiting", code);
     } else {
-        if let Some(code) = status.code() {
-            info!("Child process exited with error code {}, scinit exiting", code);
-        } else {
-            // Extract signal information from status
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::ExitStatusExt;
-                if let Some(signal) = status.signal() {
-                    info!("Child process terminated by signal {} ({}), scinit exiting", 
-                          signal, signal_name(signal));
-                } else {
-                    info!("Child process terminated by signal, scinit exiting");
-                }
-            }
-            #[cfg(not(unix))]
-            {
+        // Extract signal information from status
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(signal) = status.signal() {
+                info!("Child process terminated by signal {} ({}), scinit exiting", 
+                      signal, signal_name(signal));
+            } else {
                 info!("Child process terminated by signal, scinit exiting");
             }
+        }
+        #[cfg(not(unix))]
+        {
+            info!("Child process terminated by signal, scinit exiting");
         }
     }
     

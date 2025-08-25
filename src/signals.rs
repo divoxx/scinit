@@ -263,7 +263,7 @@ impl SignalHandler {
                     graceful_timeout_secs
                 );
 
-                if let Err(_) = process_manager.graceful_shutdown().await {
+                if (process_manager.graceful_shutdown().await).is_err() {
                     warn!("Graceful shutdown timed out, child process may have been force-killed");
                 }
             }

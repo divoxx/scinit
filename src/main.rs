@@ -101,10 +101,9 @@ async fn run_main_loop(
 
     loop {
         // Check for file events first (if enabled)
-        if file_watcher.is_some() {
-            if handle_file_events(file_watcher, process_manager).await? {
-                return Ok(()); // Exit requested
-            }
+        if file_watcher.is_some()
+            && handle_file_events(file_watcher, process_manager).await? {
+            return Ok(()); // Exit requested
         }
 
         select! {
@@ -122,7 +121,7 @@ async fn run_main_loop(
                     }
                     Err(e) => {
                         error!("error waiting for subprocess: {}", e);
-                        return Err(e.into());
+                        return Err(e);
                     }
                 }
             }
