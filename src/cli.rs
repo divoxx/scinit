@@ -43,10 +43,6 @@ pub struct Cli {
     #[arg(long, default_value = "30")]
     pub graceful_timeout_secs: u64,
 
-    /// Signal polling interval (ms)
-    #[arg(long, default_value = "100")]
-    pub signal_poll_interval_ms: u64,
-
     /// Zombie reaping interval (ms)
     #[arg(long, default_value = "5000")]
     pub zombie_reap_interval_ms: u64,
@@ -65,8 +61,6 @@ pub struct Config {
     pub command: String,
     /// Arguments for the command
     pub args: Vec<String>,
-    /// Signal polling interval in milliseconds (optimized for performance)
-    pub signal_poll_interval: Duration,
     /// Zombie reaping interval in milliseconds
     pub zombie_reap_interval: Duration,
     /// Live-reload configuration
@@ -105,7 +99,6 @@ impl Config {
         Ok(Config {
             command: cli.command,
             args: cli.args,
-            signal_poll_interval: Duration::from_millis(cli.signal_poll_interval_ms),
             zombie_reap_interval: Duration::from_millis(cli.zombie_reap_interval_ms),
             live_reload: LiveReloadConfig {
                 enabled: cli.live_reload,
@@ -125,13 +118,17 @@ impl Config {
     /// Get file watch configuration if live-reload is enabled
     pub fn file_watch_config(&self) -> Option<FileWatchConfig> {
         if self.live_reload.enabled {
-            self.live_reload.watch_path.as_ref().map(|path| FileWatchConfig {
-                watch_path: path.clone(),
-                debounce_ms: self.live_reload.debounce_ms,
-                recursive: false,
-            })
+            self.live_reload
+                .watch_path
+                .as_ref()
+                .map(|path| FileWatchConfig {
+                    watch_path: path.clone(),
+                    debounce_ms: self.live_reload.debounce_ms,
+                    recursive: false,
+                })
         } else {
             None
         }
     }
 }
+
