@@ -132,10 +132,10 @@ impl FileWatcher {
                             
                             last_change = Some(now);
                             
-                            // Emit the change event
-                            if let Err(e) = event_tx.send(FileChangeEvent::FileChanged(
-                                event.paths.first().cloned().unwrap_or_else(|| watch_path.clone())
-                            )) {
+                            // Emit the change event with canonicalized path for consistency
+                            let path = event.paths.first().unwrap_or(&watch_path);
+                            let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+                            if let Err(e) = event_tx.send(FileChangeEvent::FileChanged(canonical_path)) {
                                 error!("Failed to send file change event: {}", e);
                                 break;
                             }
@@ -284,7 +284,9 @@ mod tests {
         assert!(event.is_some());
 
         if let Some(FileChangeEvent::FileChanged(path)) = event {
-            assert_eq!(path, test_file);
+            // The FileWatcher now emits canonical paths, so compare with canonical test file path
+            let canonical_test_file = test_file.canonicalize().unwrap_or(test_file);
+            assert_eq!(path, canonical_test_file);
         } else {
             panic!("Expected FileChanged event");
         }

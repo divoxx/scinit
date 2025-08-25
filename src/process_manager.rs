@@ -657,6 +657,7 @@ pub fn reap_zombies() -> Result<()> {
                 // No more zombies to reap
                 break;
             }
+            #[cfg(target_os = "linux")]
             Ok(WaitStatus::PtraceEvent(_, _, _)) | Ok(WaitStatus::PtraceSyscall(_)) => {
                 // Ignore ptrace events
                 continue;

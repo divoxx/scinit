@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
     };
     
     let mut process_manager = ProcessManager::new(process_config, port_manager);
-    let signal_handler = SignalHandler::new()?;
+    let mut signal_handler = SignalHandler::new()?;
 
     // Create file watcher if live-reload is enabled
     let mut file_watcher = if let Some(watch_config) = config.file_watch_config() {
@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
     };
 
     // Run the main event loop
-    run_main_loop(config, &mut process_manager, &signal_handler, &mut file_watcher).await?;
+    run_main_loop(config, &mut process_manager, &mut signal_handler, &mut file_watcher).await?;
 
     info!("scinit exiting");
     Ok(())
@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
 async fn run_main_loop(
     config: Config,
     process_manager: &mut ProcessManager,
-    signal_handler: &SignalHandler, 
+    signal_handler: &mut SignalHandler, 
     file_watcher: &mut Option<FileWatcher>
 ) -> Result<()> {
     let mut zombie_reap_interval = interval(config.zombie_reap_interval);

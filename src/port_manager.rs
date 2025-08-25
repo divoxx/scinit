@@ -1,9 +1,10 @@
 use super::Result;
-use libc::{setsockopt, SO_REUSEPORT, SOL_SOCKET};
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+use nix::sys::socket::{setsockopt, sockopt::ReusePort};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, Shutdown};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, BorrowedFd};
 use tracing::{debug, info};
 
 /// Configuration for port binding behavior
@@ -100,16 +101,7 @@ impl PortManager {
 
         // Set SO_REUSEPORT if enabled
         if self.config.reuse_port {
-            let reuse_port: i32 = 1;
-            unsafe {
-                setsockopt(
-                    socket.as_raw_fd(),
-                    SOL_SOCKET,
-                    SO_REUSEPORT,
-                    &reuse_port as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&reuse_port) as u32,
-                );
-            }
+            setsockopt(&socket, ReusePort, &true)?;
         }
 
         // Bind the socket
@@ -117,13 +109,11 @@ impl PortManager {
         socket.listen(128)?; // Set backlog
 
         // Mark socket as inheritable by clearing close-on-exec flag
-        unsafe {
-            let fd = socket.as_raw_fd();
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            if flags >= 0 {
-                libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
-            }
-        }
+        let fd = socket.as_raw_fd();
+        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
+        let mut flags = FdFlag::from_bits_truncate(fcntl(borrowed_fd, FcntlArg::F_GETFD)?);
+        flags.remove(FdFlag::FD_CLOEXEC);
+        fcntl(borrowed_fd, FcntlArg::F_SETFD(flags))?;
 
         // Store the bound socket and address
         self.bound_ports.insert(port, socket_addr);
