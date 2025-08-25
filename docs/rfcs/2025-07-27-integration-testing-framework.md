@@ -5,620 +5,549 @@
 **Status:** Draft  
 **Author:** Claude Code  
 
-## Summary
+## Executive Summary
 
-This RFC proposes the implementation of a comprehensive integration testing framework for the scinit init system. The framework will provide automated testing for signal handling, socket inheritance, process lifecycle management, failure scenarios, and performance characteristics. This addresses critical testing gaps identified in the current codebase and ensures proper init system semantics validation.
+This RFC proposes the development of a comprehensive integration testing framework for scinit, addressing critical gaps in our current testing approach that leave essential init system behaviors untested. While scinit currently has minimal unit tests embedded in individual modules and basic shell scripts for manual signal testing, it lacks the systematic validation required for a production-ready container init system. The proposed framework will provide automated testing for signal handling semantics, socket inheritance mechanisms, process lifecycle management, failure scenarios, and performance characteristics.
 
-## Motivation
+## Problem Statement
 
-### Current State Analysis
+### Current Testing Landscape Analysis
 
-The scinit project currently has:
-- **Basic unit tests**: Embedded in individual modules but incomplete
-- **Manual test scripts**: Shell scripts for basic signal testing (`test_ctrl_c.sh`, `test_signal_debug.sh`, etc.)
-- **Echo server**: Exists for socket inheritance validation but lacks automated tests
-- **Integration test references**: Mentioned in CLAUDE.md but not implemented
+After analyzing the existing codebase, the current testing infrastructure presents significant gaps that expose scinit to potential reliability and correctness issues in production environments. The testing landscape consists of:
 
-### Problem Statement
+**Limited Unit Test Coverage:** Only three modules (`file_watcher.rs`, `process_manager.rs`, and `port_manager.rs`) contain unit tests, with a single test in `file_watcher.rs` testing only file change relevance detection. This represents minimal coverage of the core init system functionality.
 
-**Critical Testing Gaps:**
-1. **Signal Handling**: No automated tests for SIGTERM, SIGINT, SIGKILL escalation, signal forwarding semantics
-2. **Socket Inheritance**: No validation of zero-downtime restart capabilities
-3. **Process Lifecycle**: Missing tests for graceful shutdown, zombie reaping, process group management
-4. **Failure Scenarios**: No testing of error conditions, resource exhaustion, malformed inputs
-5. **Performance Validation**: No regression testing for signal response times, memory usage
-6. **Container Compatibility**: No validation of proper init system behavior in containerized environments
+**Manual Shell Script Testing:** Five bash scripts provide basic signal testing capabilities. However, these scripts are limited to manual execution, provide no structured validation, lack repeatability, and cannot be integrated into automated CI/CD workflows.
 
-### Business/Technical Drivers
+Here's what our current manual testing looks like:
 
-- **Reliability**: Init systems must handle all signal scenarios correctly
-- **Performance**: Signal response must remain under 100ms for production use
-- **Container Support**: Must validate proper PID 1 behavior in Docker/Kubernetes
-- **Maintenance**: Automated tests reduce manual verification overhead
-- **Compliance**: Init systems have specific POSIX requirements that must be validated
+```bash
+#!/bin/bash
+# test_ctrl_c.sh - Current manual testing approach
+echo "Testing SIGINT (Ctrl+C) handling"
 
-## Detailed Design
+RUST_LOG=debug cargo run -- sleep 10 &
+SCINIT_PID=$!
 
-### Architecture Overview
+echo "Sending SIGINT to PID: $SCINIT_PID"
+kill -INT $SCINIT_PID
+wait $SCINIT_PID
+echo "scinit exit status: $?"
+```
 
-The integration testing framework follows a layered architecture:
+This manual approach provides no structured validation, timing measurement, or automated result verification.
+
+**Missing Integration Test Framework:** Despite being mentioned in the CLAUDE.md documentation, no actual integration tests exist. The documentation references a non-existent echo server for socket inheritance validation, and claims comprehensive testing capabilities that are not implemented.
+
+### Critical Gaps in Testing Coverage
+
+**Signal Handling Validation:** Init systems must handle signals correctly according to POSIX standards, yet scinit lacks comprehensive signal handling tests. The current shell scripts test only basic SIGTERM and SIGINT scenarios, missing crucial signal forwarding semantics, zombie reaping behavior, signal escalation timeouts, and critical signal passthrough validation. This gap is particularly dangerous because incorrect signal handling in an init system can lead to container deadlocks, orphaned processes, and improper shutdown sequences.
+
+**Socket Inheritance Mechanisms:** One of scinit's key features is zero-downtime restart capability through socket inheritance, but this functionality has no automated validation. The port manager implements SO_REUSEPORT support and file descriptor passing via the `SCINIT_INHERITED_FDS` environment variable, yet there are no tests to verify that file descriptors are correctly passed between processes, that SO_REUSEPORT behaves as expected, or that zero-downtime restarts actually achieve sub-second transition times.
+
+**Process Lifecycle Management:** As an init system, scinit is responsible for proper process group creation, zombie reaping, graceful shutdown orchestration, and restart delay management. These critical responsibilities are currently validated only through manual testing, leaving potential issues with process group isolation, child process monitoring, timeout handling, and restart behavior undetected until production deployment.
+
+### Business Impact and Risk Assessment
+
+The absence of comprehensive integration testing creates several critical risks for scinit adoption and reliability:
+
+**Production Reliability Risks:** Without systematic validation of signal handling and process lifecycle management, scinit deployments may experience container deadlocks, improper shutdown behavior, or process orphaning in production environments.
+
+**Development Velocity Impact:** The lack of automated testing creates a maintenance burden where changes must be manually validated, increasing development cycle time and the risk of regression introduction.
+
+## Investigation of Alternative Approaches
+
+### Alternative 1: Enhanced Shell Script Framework
+
+During the analysis phase, we considered expanding the existing shell script approach with structured output, automated execution capabilities, and CI/CD integration.
+
+**Limitations and Drawbacks:** However, this approach presents fundamental limitations that make it unsuitable for comprehensive init system testing. Shell scripts cannot provide precise timing measurements required for performance validation, offer limited process introspection capabilities for validating internal state, and have poor error handling for complex failure scenarios. Most critically, shell scripts cannot easily simulate the complex multi-process interactions required for thorough socket inheritance testing.
+
+### Alternative 2: External Testing Framework Integration
+
+We evaluated integrating with established testing frameworks such as pytest with subprocess management, or using dedicated container testing tools like Testcontainers.
+
+**Integration Challenges:** However, this approach introduces significant complexity in terms of multi-language maintenance overhead, build system integration challenges, and dependency management across different ecosystems. More importantly, external frameworks are optimized for application testing rather than system-level validation.
+
+### Alternative 3: Minimal Integration Testing
+
+A third alternative involved implementing only basic integration tests covering the most critical scenarios, focusing on signal handling and basic process lifecycle management while omitting performance testing and comprehensive failure scenarios.
+
+**Coverage Limitations:** However, this minimal approach fails to address the comprehensive validation requirements of a production init system. Performance regression detection, failure scenario validation, and edge case testing are not optional for system software of this criticality.
+
+## Proposed Solution Architecture
+
+Based on the analysis of current gaps and alternative approaches, we propose a comprehensive Rust-native integration testing framework that provides systematic validation of all critical init system behaviors while maintaining seamless integration with the existing development workflow.
+
+### Framework Architecture Overview
+
+The framework implements a layered architecture where each layer builds upon the previous one to provide increasingly sophisticated testing capabilities:
 
 ```
 ┌─────────────────────────────────────────┐
 │           Test Orchestrator             │
-│        (tests/integration/)             │
+│     (tests/integration/mod.rs)          │
 ├─────────────────────────────────────────┤
 │         Test Scenario Engine            │
-│     - Signal Tests                      │
-│     - Socket Tests                      │
-│     - Lifecycle Tests                   │
-│     - Performance Tests                 │
+│  - SignalHandlingTests                  │
+│  - SocketInheritanceTests               │
+│  - ProcessLifecycleTests                │
+│  - PerformanceTests                     │
 ├─────────────────────────────────────────┤
 │         Test Infrastructure             │
-│   - Process Spawning                    │
-│   - Signal Injection                    │
-│   - Socket Validation                   │
-│   - Performance Measurement             │
+│  - ProcessTestHarness                   │
+│  - SignalTestFramework                  │
+│  - SocketTestFramework                  │
+│  - PerformanceMeasurement               │
 ├─────────────────────────────────────────┤
 │           Test Utilities                │
-│   - Test Servers                        │
-│   - Helper Functions                    │
-│   - Mock Services                       │
+│  - TestEchoServer                       │
+│  - TestAssertions                       │
+│  - TestHelpers                          │
 └─────────────────────────────────────────┘
 ```
 
-### Core Components
+### Core Framework Components
 
-#### 1. Test Infrastructure (`tests/integration/infrastructure/`)
+**Process Test Harness:** At the foundation of the framework lies a sophisticated process management system that handles scinit process spawning with controlled environments, child process lifecycle management, and comprehensive cleanup mechanisms.
 
-**ProcessTestHarness**
 ```rust
+// tests/integration/infrastructure/process_harness.rs
 pub struct ProcessTestHarness {
-    scinit_path: PathBuf,
-    test_server_path: PathBuf,
+    scinit_binary: PathBuf,
     temp_dir: TempDir,
     environment: HashMap<String, String>,
+    cleanup_pids: Vec<Pid>,
 }
 
 impl ProcessTestHarness {
-    pub async fn spawn_scinit(&self, args: &[&str]) -> Result<TestProcess>;
-    pub async fn spawn_test_server(&self, port: u16) -> Result<TestProcess>;
-    pub fn cleanup(&mut self) -> Result<()>;
-}
-```
+    pub fn new() -> Result<Self> {
+        // Initialize temp directory, locate scinit binary
+        // ...
+    }
 
-**SignalTestFramework**
-```rust
-pub struct SignalTestFramework {
-    harness: ProcessTestHarness,
-    signal_timings: HashMap<Signal, Duration>,
-}
+    pub async fn spawn_scinit(&mut self, args: &[&str]) -> Result<TestProcess> {
+        // Spawn scinit with controlled environment
+        // Track PID for cleanup
+        // ...
+    }
 
-impl SignalTestFramework {
-    pub async fn send_signal(&self, process: &TestProcess, signal: Signal) -> Result<()>;
-    pub async fn verify_signal_forwarding(&self, parent: &TestProcess, child: &TestProcess, signal: Signal) -> Result<()>;
-    pub async fn measure_signal_response_time(&self, process: &TestProcess, signal: Signal) -> Result<Duration>;
-}
-```
-
-**SocketTestFramework**
-```rust
-pub struct SocketTestFramework {
-    harness: ProcessTestHarness,
-    port_ranges: Vec<PortRange>,
+    pub fn set_environment(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        // Configure environment variables for test scenarios
+        // ...
+    }
 }
 
-impl SocketTestFramework {
-    pub async fn test_socket_inheritance(&self, ports: &[u16]) -> Result<InheritanceResult>;
-    pub async fn verify_zero_downtime_restart(&self, port: u16) -> Result<DowntimeMetrics>;
-    pub async fn validate_fd_passing(&self, expected_fds: &[RawFd]) -> Result<()>;
-}
-```
-
-#### 2. Test Scenarios (`tests/integration/scenarios/`)
-
-**Signal Handling Tests**
-- `test_sigterm_graceful_shutdown()`: Validates SIGTERM → graceful shutdown sequence
-- `test_sigint_interrupt_handling()`: Tests SIGINT propagation and cleanup
-- `test_sigkill_force_termination()`: Validates SIGKILL escalation after timeout
-- `test_signal_forwarding()`: Tests SIGUSR1/SIGUSR2/SIGHUP forwarding to child processes
-- `test_sigchld_zombie_reaping()`: Validates proper zombie process cleanup
-- `test_critical_signal_passthrough()`: Ensures SIGFPE, SIGILL, SIGSEGV are never blocked
-
-**Socket Inheritance Tests**
-- `test_single_port_inheritance()`: Basic socket inheritance validation
-- `test_multiple_port_inheritance()`: Tests SO_REUSEPORT with multiple ports
-- `test_fd_lifecycle_management()`: Validates FD_CLOEXEC handling
-- `test_zero_downtime_restart()`: Measures actual downtime during restarts
-- `test_socket_inheritance_failure_modes()`: Tests invalid FD scenarios
-
-**Process Lifecycle Tests**
-- `test_process_group_creation()`: Validates proper process group isolation
-- `test_graceful_shutdown_timeout()`: Tests timeout escalation to SIGKILL
-- `test_child_process_monitoring()`: Validates child exit status handling
-- `test_restart_delay_behavior()`: Tests configurable restart delays
-- `test_working_directory_inheritance()`: Validates process working directory
-
-**Failure Scenario Tests**
-- `test_child_crash_handling()`: Validates container exit on child crash
-- `test_resource_exhaustion()`: Tests behavior under resource limits
-- `test_malformed_command_handling()`: Tests invalid command handling
-- `test_permission_denied_scenarios()`: Tests privilege escalation failures
-- `test_file_descriptor_exhaustion()`: Tests FD limit scenarios
-
-#### 3. Performance Testing (`tests/integration/performance/`)
-
-**Performance Benchmarks**
-```rust
-pub struct PerformanceBenchmarks {
-    measurements: HashMap<String, PerformanceMetric>,
-    baseline_results: HashMap<String, Duration>,
-}
-
-impl PerformanceBenchmarks {
-    pub async fn benchmark_signal_response_time(&mut self) -> Result<Duration>;
-    pub async fn benchmark_restart_performance(&mut self) -> Result<RestartMetrics>;
-    pub async fn benchmark_memory_usage(&mut self) -> Result<MemoryMetrics>;
-    pub async fn benchmark_cpu_utilization(&mut self) -> Result<CpuMetrics>;
-}
-```
-
-**Performance Metrics**
-- Signal response time (target: <100ms)
-- Process restart time (target: <1s)
-- Memory usage patterns
-- CPU utilization under load
-- File descriptor usage
-
-#### 4. Test Utilities (`tests/integration/utils/`)
-
-**Enhanced Echo Server**
-```rust
-// Extends existing echo server with testing capabilities
-pub struct TestEchoServer {
-    bind_ports: Vec<u16>,
-    inherited_fds: Vec<RawFd>,
-    metrics: ServerMetrics,
-}
-
-impl TestEchoServer {
-    pub fn from_inherited_fds() -> Result<Self>;
-    pub async fn start_with_metrics(&mut self) -> Result<()>;
-    pub fn get_metrics(&self) -> &ServerMetrics;
-    pub async fn simulate_load(&self, connections: usize) -> Result<LoadMetrics>;
-}
-```
-
-**Test Assertions**
-```rust
-pub mod assertions {
-    pub fn assert_signal_response_time(actual: Duration, expected_max: Duration);
-    pub fn assert_process_state(process: &TestProcess, expected: ProcessState);
-    pub fn assert_fd_inheritance(inherited: &[RawFd], expected: &[RawFd]);
-    pub fn assert_zero_downtime(metrics: &DowntimeMetrics);
-}
-```
-
-### File Structure
-
-```
-tests/
-├── integration/
-│   ├── mod.rs                          # Main integration test module
-│   ├── infrastructure/
-│   │   ├── mod.rs
-│   │   ├── process_harness.rs          # Process spawning and management
-│   │   ├── signal_framework.rs         # Signal testing infrastructure
-│   │   └── socket_framework.rs         # Socket inheritance testing
-│   ├── scenarios/
-│   │   ├── mod.rs
-│   │   ├── signal_handling_tests.rs    # Signal behavior tests
-│   │   ├── socket_inheritance_tests.rs # Socket inheritance validation
-│   │   ├── process_lifecycle_tests.rs  # Process management tests
-│   │   └── failure_scenario_tests.rs   # Error condition tests
-│   ├── performance/
-│   │   ├── mod.rs
-│   │   ├── benchmarks.rs               # Performance regression tests
-│   │   └── metrics.rs                  # Performance measurement utilities
-│   └── utils/
-│       ├── mod.rs
-│       ├── test_servers.rs             # Enhanced test servers
-│       ├── assertions.rs               # Custom test assertions
-│       └── helpers.rs                  # Common test utilities
-└── fixtures/
-    ├── test_configs/                   # Test configuration files
-    ├── test_scripts/                   # Helper scripts for complex scenarios
-    └── expected_outputs/               # Expected output files for validation
-```
-
-### Test Data Models
-
-```rust
-#[derive(Debug, Clone)]
 pub struct TestProcess {
     pub pid: Pid,
     pub process_group: Pid,
-    pub command: String,
-    pub args: Vec<String>,
     pub start_time: Instant,
     pub child: Child,
+}
+
+impl TestProcess {
+    pub async fn wait_for_exit_timeout(&mut self, duration: Duration) -> Result<Option<ExitStatus>> {
+        // Wait for process exit with timeout handling
+        // ...
+    }
+    
+    pub fn runtime(&self) -> Duration {
+        // Calculate process runtime for performance measurement
+        // ...
+    }
+}
+```
+
+**Signal Testing Framework:** Building on the process harness, the signal testing framework provides comprehensive validation of signal handling semantics with precise timing control and behavior verification.
+
+```rust
+// tests/integration/infrastructure/signal_framework.rs
+pub struct SignalTestFramework {
+    harness: ProcessTestHarness,
+    response_time_targets: HashMap<Signal, Duration>,
+}
+
+impl SignalTestFramework {
+    pub async fn test_signal_handling(&mut self, signal: Signal, expected_behavior: SignalBehavior) -> Result<SignalTestResult> {
+        // Spawn scinit with test process
+        let mut scinit_process = self.harness.spawn_scinit(&["sleep", "30"]).await?;
+        
+        // Send signal and measure response time
+        let signal_time = Instant::now();
+        kill(scinit_process.pid, signal)?;
+        
+        // Validate expected behavior (graceful shutdown, forwarding, etc.)
+        let exit_status = match expected_behavior {
+            SignalBehavior::GracefulShutdown => {
+                scinit_process.wait_for_exit_timeout(Duration::from_secs(5)).await?
+            }
+            SignalBehavior::ForwardOnly => {
+                // Signal should be forwarded, scinit should continue running
+                // ...
+            }
+        };
+        
+        Ok(SignalTestResult {
+            signal,
+            response_time: signal_time.elapsed(),
+            // ...
+        })
+    }
+
+    pub async fn test_signal_forwarding(&mut self, signal: Signal) -> Result<ForwardingTestResult> {
+        // Create test script that logs received signals
+        // Spawn scinit with signal logging child
+        // Send signal to scinit and verify child receives it
+        // ...
+    }
+}
+
+#[derive(Debug)]
+pub enum SignalBehavior {
+    GracefulShutdown,
+    ForwardOnly,
+    ImmediateTermination,
 }
 
 #[derive(Debug)]
 pub struct SignalTestResult {
     pub signal: Signal,
     pub response_time: Duration,
-    pub forwarded_to_child: bool,
-    pub child_exit_status: Option<ExitStatus>,
-    pub cleanup_successful: bool,
-}
-
-#[derive(Debug)]
-pub struct InheritanceResult {
-    pub inherited_fds: Vec<RawFd>,
-    pub bound_ports: Vec<u16>,
-    pub inheritance_successful: bool,
-    pub fd_validation_results: HashMap<RawFd, bool>,
-}
-
-#[derive(Debug)]
-pub struct PerformanceMetric {
-    pub name: String,
-    pub value: Duration,
-    pub baseline: Option<Duration>,
-    pub threshold: Duration,
-    pub passed: bool,
+    pub performance_target_met: bool,
+    // ...
 }
 ```
 
-## Implementation Plan
+**Socket Inheritance Testing Framework:** A specialized component handles validation of socket inheritance mechanisms, including file descriptor passing and zero-downtime restart measurement.
 
-### Phase 1: Core Infrastructure (Week 1-2)
-1. **Setup test directory structure**
-   - Create `tests/integration/` hierarchy
-   - Configure Cargo.toml for integration tests
-   - Setup test dependencies
+```rust
+// tests/integration/infrastructure/socket_framework.rs
+pub struct SocketTestFramework {
+    harness: ProcessTestHarness,
+    test_ports: Vec<u16>,
+}
 
-2. **Implement ProcessTestHarness**
-   - Process spawning utilities
-   - Cleanup mechanisms
-   - Environment management
+impl SocketTestFramework {
+    pub async fn test_socket_inheritance(&mut self) -> Result<SocketInheritanceResult> {
+        let port = self.test_ports[0];
+        
+        // Create and compile test echo server
+        let echo_server = self.create_test_echo_server().await?;
+        
+        // Start scinit with socket inheritance enabled
+        self.harness.set_environment("RUST_LOG", "debug");
+        let mut scinit_process = self.harness.spawn_scinit(&[
+            "--ports", &port.to_string(),
+            "--bind-addr", "127.0.0.1", 
+            echo_server.to_str().unwrap()
+        ]).await?;
 
-3. **Basic Signal Testing Framework**
-   - Signal injection capabilities
-   - Response time measurement
-   - Process state validation
+        // Test initial connection
+        let mut initial_stream = TcpStream::connect(("127.0.0.1", port))?;
+        // ... test connection and get response with PID
 
-**Deliverables:**
-- Working test infrastructure
-- Basic signal tests (SIGTERM, SIGINT)
-- Documentation for test framework usage
+        // Trigger restart (SIGHUP)
+        kill(scinit_process.pid, Signal::SIGHUP)?;
+        
+        // Measure downtime during restart
+        let restart_start = Instant::now();
+        // ... attempt connections during restart to measure actual downtime
+        
+        Ok(SocketInheritanceResult {
+            port,
+            inheritance_successful: true,
+            measured_downtime: restart_start.elapsed(),
+            zero_downtime_achieved: measured_downtime < Duration::from_millis(100),
+            // ...
+        })
+    }
+
+    async fn create_test_echo_server(&self) -> Result<PathBuf> {
+        let server_source = r#"
+fn main() -> Result<()> {
+    let listener = if let Ok(fds) = env::var("SCINIT_INHERITED_FDS") {
+        // Parse inherited file descriptors
+        // ...
+    } else {
+        TcpListener::bind("127.0.0.1:0")?
+    };
+
+    for stream in listener.incoming() {
+        // Echo back with PID information for restart verification
+        let response = format!("ECHO PID={}: {}", process::id(), received_data);
+        // ...
+    }
+    Ok(())
+}
+        "#;
+        
+        // Write, compile and return path to test server
+        // ...
+    }
+}
+```
+
+### Test Scenario Implementation Examples
+
+Here's how a complete test scenario would look in practice:
+
+```rust
+// tests/integration/scenarios/signal_handling_tests.rs
+use super::infrastructure::{ProcessTestHarness, SignalTestFramework, SignalBehavior};
+
+#[tokio::test]
+async fn test_sigterm_graceful_shutdown() -> Result<()> {
+    let harness = ProcessTestHarness::new()?;
+    let mut signal_framework = SignalTestFramework::new(harness);
+    
+    // Test SIGTERM should result in graceful shutdown
+    let result = signal_framework
+        .test_signal_handling(Signal::SIGTERM, SignalBehavior::GracefulShutdown)
+        .await?;
+    
+    // Validate behavior
+    assert!(result.actual_exit_status.is_some(), "Process should exit after SIGTERM");
+    assert!(result.performance_target_met, "Response time should be under 100ms");
+    
+    println!("✓ SIGTERM graceful shutdown test passed. Response time: {:?}", result.response_time);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sigusr1_forwarding() -> Result<()> {
+    let harness = ProcessTestHarness::new()?;
+    let mut signal_framework = SignalTestFramework::new(harness);
+    
+    // Test SIGUSR1 should be forwarded to child, not handled by scinit
+    let result = signal_framework.test_signal_forwarding(Signal::SIGUSR1).await?;
+    
+    assert!(result.signal_forwarded, "SIGUSR1 should be forwarded to child process");
+    assert!(result.child_received_signal, "Child process should receive SIGUSR1");
+    
+    println!("✓ SIGUSR1 forwarding test passed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_signal_escalation_timeout() -> Result<()> {
+    let harness = ProcessTestHarness::new()?;
+    
+    // Create process that ignores SIGTERM to test escalation
+    let test_script = harness.temp_path().join("ignore_sigterm.sh");
+    std::fs::write(&test_script, r#"#!/bin/bash
+trap '' TERM  # Ignore SIGTERM
+sleep 30
+"#)?;
+    
+    let mut scinit_process = harness.spawn_scinit(&[test_script.to_str().unwrap()]).await?;
+    
+    // Send SIGTERM and verify escalation to SIGKILL
+    let start = Instant::now();
+    kill(scinit_process.pid, Signal::SIGTERM)?;
+    
+    let exit_status = scinit_process.wait_for_exit_timeout(Duration::from_secs(10)).await?;
+    let total_time = start.elapsed();
+    
+    assert!(exit_status.is_some(), "Process should eventually be killed");
+    assert!(total_time >= Duration::from_secs(5), "Should wait for escalation timeout");
+    
+    println!("✓ Signal escalation test passed. Total time: {:?}", total_time);
+    Ok(())
+}
+```
+
+### Complete File Structure
+
+The framework would create this file structure:
+
+```
+tests/
+├── integration/
+│   ├── mod.rs                             # Main test orchestrator
+│   ├── infrastructure/
+│   │   ├── process_harness.rs             # Process spawning and management
+│   │   ├── signal_framework.rs            # Signal testing infrastructure  
+│   │   └── socket_framework.rs            # Socket inheritance testing
+│   ├── scenarios/
+│   │   ├── signal_handling_tests.rs       # Complete signal behavior tests
+│   │   ├── socket_inheritance_tests.rs    # Socket inheritance validation
+│   │   ├── process_lifecycle_tests.rs     # Process management tests
+│   │   └── failure_scenario_tests.rs      # Error condition tests
+│   ├── performance/
+│   │   ├── benchmarks.rs                  # Performance regression tests
+│   │   └── metrics.rs                     # Performance measurement utilities
+│   └── utils/
+│       ├── test_servers.rs                # Test echo servers and utilities
+│       ├── assertions.rs                  # Custom test assertions
+│       └── helpers.rs                     # Common test utilities
+└── fixtures/
+    ├── test_configs/                       # Test configuration files
+    ├── test_scripts/                       # Helper scripts for complex scenarios  
+    └── expected_outputs/                   # Expected output files for validation
+```
+
+Here's what the main test orchestrator would look like:
+
+```rust
+// tests/integration/mod.rs
+pub mod infrastructure;
+pub mod scenarios;
+pub mod performance;
+pub mod utils;
+
+// Re-export commonly used types
+pub use infrastructure::{ProcessTestHarness, SignalTestFramework, SocketTestFramework};
+pub use utils::assertions::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn comprehensive_integration_test() -> Result<()> {
+        println!("🚀 Starting comprehensive scinit integration tests...");
+        
+        // Run all test categories
+        scenarios::signal_handling_tests::run_all_signal_tests().await?;
+        println!("✅ Signal handling tests passed");
+        
+        scenarios::socket_inheritance_tests::run_all_socket_tests().await?;
+        println!("✅ Socket inheritance tests passed");
+        
+        scenarios::process_lifecycle_tests::run_all_lifecycle_tests().await?;
+        println!("✅ Process lifecycle tests passed");
+        
+        performance::benchmarks::run_all_performance_tests().await?;
+        println!("✅ Performance tests passed");
+        
+        println!("🎉 All integration tests passed successfully!");
+        Ok(())
+    }
+}
+```
+
+### CI/CD Integration Example
+
+The framework would integrate with GitHub Actions:
+
+```yaml
+# .github/workflows/integration-tests.yml
+name: Integration Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      
+    - name: Install system dependencies
+      run: sudo apt-get update && sudo apt-get install -y procps strace lsof
+        
+    - name: Build scinit
+      run: cargo build --release
+      
+    - name: Run integration tests
+      run: cargo test --test integration_test -- --test-threads=1
+      env:
+        RUST_LOG: debug
+        
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: test-results
+        path: target/test-results/
+```
+
+### Expected Test Output Examples
+
+When running the tests, developers would see structured output like this:
+
+```
+$ cargo test --test integration_test
+
+running 15 tests
+
+test scenarios::signal_handling_tests::test_sigterm_graceful_shutdown ... ok (127ms)
+✓ SIGTERM graceful shutdown test passed. Response time: 89ms
+
+test scenarios::signal_handling_tests::test_sigusr1_forwarding ... ok (156ms)
+✓ SIGUSR1 forwarding test passed
+
+test scenarios::socket_inheritance_tests::test_zero_downtime_restart ... ok (612ms)
+✓ Zero-downtime restart test passed. Measured downtime: 18ms
+
+test performance::benchmarks::test_signal_response_performance ... ok (1.2s)
+✓ Signal response performance test passed. Average: 76ms, Max: 94ms
+
+Performance Summary:
+┌─────────────────────┬──────────┬───────────┬──────────┐
+│ Metric              │ Current  │ Baseline  │ Status   │
+├─────────────────────┼──────────┼───────────┼──────────┤
+│ SIGTERM Response    │ 89ms     │ 85ms      │ ✅ PASS  │
+│ SIGINT Response     │ 72ms     │ 78ms      │ ✅ PASS  │
+│ Socket Restart      │ 23ms     │ 30ms      │ ✅ PASS  │
+│ Memory Usage        │ 8.2MB    │ 8.5MB     │ ✅ PASS  │
+└─────────────────────┴──────────┴───────────┴──────────┘
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.43s
+```
+
+### Implementation Trade-offs and Design Decisions
+
+**Performance vs. Comprehensiveness Trade-off:** The framework prioritizes comprehensive validation over test execution speed, accepting longer test suite execution times (target: under 5 minutes) in exchange for thorough validation coverage. This decision reflects the reality that init systems require extremely high reliability, making comprehensive testing more valuable than fast test cycles.
+
+**Test Isolation vs. Resource Efficiency Trade-off:** Each test scenario executes in complete isolation with dedicated temporary directories and process cleanup, even when this increases resource consumption. This isolation approach ensures deterministic results and prevents test interference, which is critical for reliable continuous integration.
+
+**Native Rust vs. External Tool Integration Trade-off:** The framework implements all testing capabilities in native Rust rather than integrating external testing tools. This provides type safety, performance, and seamless integration with the existing codebase while avoiding multi-language maintenance overhead.
+
+### Risk Assessment and Mitigation Strategies
+
+**Test Environment Sensitivity Risk:** Integration tests may exhibit different behavior across various CI/CD environments due to system load variations or container runtime differences. The framework mitigates this through environment detection and adaptive timing adjustments, generous timeout values for CI environments, and retry mechanisms for timing-sensitive tests.
+
+**Performance Baseline Drift Risk:** Performance baselines may shift over time due to infrastructure changes. The framework addresses this through relative performance measurement rather than absolute thresholds, baseline recalibration mechanisms, and trend analysis to distinguish between infrastructure changes and actual regressions.
+
+**Test Maintenance Overhead Risk:** A comprehensive testing framework may require significant ongoing maintenance effort. The framework architecture prioritizes reusable components and clear abstractions to minimize maintenance overhead, with comprehensive documentation and contribution guidelines to reduce the barrier to framework maintenance.
+
+## Implementation Timeline
+
+### Phase 1: Core Infrastructure (Weeks 1-2)
+Establish the process test harness and basic signal testing capabilities. This foundation enables all subsequent testing scenarios.
 
 ### Phase 2: Signal Handling Tests (Week 3)
-1. **Complete signal test scenarios**
-   - All signal types (SIGTERM, SIGINT, SIGKILL, SIGUSR1, SIGUSR2, SIGHUP, SIGCHLD)
-   - Signal forwarding validation
-   - Critical signal passthrough tests
-
-2. **Process lifecycle tests**
-   - Graceful shutdown sequences
-   - Timeout handling
-   - Zombie reaping validation
-
-**Deliverables:**
-- Comprehensive signal handling test suite
-- Process lifecycle validation tests
-- Signal forwarding verification
+Implement comprehensive signal handling validation for all signal types, including forwarding behavior and performance measurement.
 
 ### Phase 3: Socket Inheritance Tests (Week 4)
-1. **Socket inheritance framework**
-   - FD passing validation
-   - SO_REUSEPORT testing
-   - Zero-downtime restart measurement
+Develop socket inheritance testing framework with zero-downtime restart measurement and file descriptor validation.
 
-2. **Enhanced echo server**
-   - Metrics collection
-   - Load simulation
-   - Inheritance validation
+### Phase 4: Performance and Failure Testing (Week 5)
+Add performance benchmarking capabilities and comprehensive failure scenario testing.
 
-**Deliverables:**
-- Socket inheritance test suite
-- Zero-downtime restart validation
-- Enhanced test echo server
+### Phase 5: CI/CD Integration (Week 6)
+Complete CI/CD integration, documentation, and validation of all acceptance criteria.
 
-### Phase 4: Failure Scenarios & Performance (Week 5)
-1. **Failure scenario tests**
-   - Resource exhaustion scenarios
-   - Invalid command handling
-   - Permission failures
+## Success Criteria
 
-2. **Performance testing framework**
-   - Baseline establishment
-   - Regression detection
-   - Performance reporting
+The framework's success will be measured by:
 
-**Deliverables:**
-- Failure scenario test suite
-- Performance benchmarking framework
-- Automated performance regression detection
+- **Comprehensive Signal Handling Validation:** All signal types properly tested with expected behaviors
+- **Socket Inheritance Validation:** Zero-downtime restart measured and validated consistently
+- **Performance Regression Detection:** Ability to detect 10% performance regressions reliably
+- **CI/CD Integration:** Tests pass consistently in automated environments
+- **Developer Experience:** Clear test output and easy framework extension
 
-### Phase 5: CI/CD Integration & Documentation (Week 6)
-1. **CI/CD integration**
-   - GitHub Actions workflow
-   - Container testing environment
-   - Performance tracking
+## Conclusion
 
-2. **Documentation and validation**
-   - Test framework documentation
-   - Usage guidelines
-   - Acceptance criteria validation
+This comprehensive integration testing framework addresses critical gaps in scinit's current testing approach while providing a foundation for long-term reliability and maintainability. The framework's Rust-native implementation with concrete architectural examples ensures that any developer can understand, implement, and extend the testing capabilities.
 
-**Deliverables:**
-- Complete CI/CD integration
-- Comprehensive documentation
-- Validated test framework
-
-## Test Scenarios Specification
-
-### Signal Handling Test Matrix
-
-| Signal | Test Scenario | Expected Behavior | Validation Method |
-|--------|---------------|-------------------|-------------------|
-| SIGTERM | Graceful shutdown | Forward to child, wait for exit, clean shutdown | Process exit status, timing |
-| SIGINT | Interrupt handling | Forward to child, graceful shutdown | Signal propagation, cleanup |
-| SIGKILL | Force termination | Immediate termination | Process state, cleanup |
-| SIGUSR1 | User signal forwarding | Forward to child only | Child receives signal |
-| SIGUSR2 | User signal forwarding | Forward to child only | Child receives signal |
-| SIGHUP | Hangup forwarding | Forward to child only | Child receives signal |
-| SIGCHLD | Child exit handling | Zombie reaping, status collection | Zombie process count |
-| SIGFPE | Critical signal | Never blocked, immediate termination | Signal handling state |
-
-### Socket Inheritance Test Scenarios
-
-| Scenario | Configuration | Expected Result | Validation |
-|----------|---------------|-----------------|------------|
-| Single port inheritance | `--ports 8080` | Child inherits FD for port 8080 | Socket connection works |
-| Multiple port inheritance | `--ports 8080,8081,8082` | Child inherits all FDs | All ports accessible |
-| Zero-downtime restart | File change trigger | <1ms connection interruption | Connection timing |
-| Invalid FD handling | Malformed FD environment | Graceful error handling | Error messages |
-| SO_REUSEPORT validation | Multiple processes | Port sharing works | Concurrent connections |
-
-### Performance Test Specifications
-
-| Metric | Target | Measurement Method | Acceptance Criteria |
-|--------|--------|-------------------|---------------------|
-| Signal response time | <100ms | Signal send to process exit | Must be under threshold |
-| Process restart time | <1s | File change to new process ready | Must be under threshold |
-| Memory usage baseline | <10MB | Process memory monitoring | No memory leaks |
-| CPU utilization | <5% idle | Process CPU monitoring | Minimal CPU usage |
-| File descriptor leaks | 0 | FD count before/after tests | No FD leaks |
-
-## Testing Strategy
-
-### Unit Test Integration
-- Existing unit tests remain unchanged
-- Integration tests validate end-to-end behavior
-- Unit tests focus on individual component logic
-
-### Container Testing
-```dockerfile
-# Test container for CI/CD
-FROM rust:1.75-slim
-RUN apt-get update && apt-get install -y \
-    procps \
-    strace \
-    lsof \
-    netstat-nat
-COPY . /app
-WORKDIR /app
-RUN cargo build --release
-CMD ["cargo", "test", "--", "--test-threads=1"]
-```
-
-### Test Isolation
-- Each test runs in isolated temporary directory
-- Process cleanup ensures no interference
-- Dedicated port ranges prevent conflicts
-- Timeout mechanisms prevent hanging tests
-
-### Test Data Validation
-- Expected output files for complex scenarios
-- Golden file comparison for regression testing
-- Structured test result serialization
-- Performance baseline tracking
-
-## Alternatives Considered
-
-### Alternative 1: Shell Script Testing Framework
-**Pros:**
-- Simpler implementation
-- Easier to understand
-- Lower maintenance overhead
-
-**Cons:**
-- Limited validation capabilities
-- Poor CI/CD integration
-- Difficult performance measurement
-- No structured result reporting
-
-**Decision:** Rejected due to limited validation capabilities and poor CI/CD integration.
-
-### Alternative 2: External Testing Framework (e.g., pytest)
-**Pros:**
-- Rich testing features
-- Good reporting capabilities
-- Familiar to many developers
-
-**Cons:**
-- Additional language dependency
-- Complex integration with Rust builds
-- Process management complexity
-- Performance measurement limitations
-
-**Decision:** Rejected to maintain single-language codebase and better integration.
-
-### Alternative 3: Minimal Integration Tests Only
-**Pros:**
-- Faster implementation
-- Lower complexity
-- Focused scope
-
-**Cons:**
-- Insufficient coverage for init system
-- Missing performance validation
-- No failure scenario testing
-- Limited CI/CD value
-
-**Decision:** Rejected due to insufficient coverage for critical init system requirements.
-
-## Risks & Mitigation
-
-### Risk 1: Test Flakiness in CI/CD
-**Risk:** Signal timing and process lifecycle tests may be flaky in containerized CI environments.
-
-**Mitigation:**
-- Generous timeout values for CI environments
-- Retry mechanisms for timing-sensitive tests
-- Environment detection and adjustment
-- Test isolation and cleanup mechanisms
-
-### Risk 2: Performance Test Baseline Drift
-**Risk:** Performance baselines may drift over time due to infrastructure changes.
-
-**Mitigation:**
-- Relative performance measurement (percentage changes)
-- Baseline recalibration mechanisms
-- Infrastructure-specific baselines
-- Trend analysis rather than absolute values
-
-### Risk 3: Platform-Specific Signal Behavior
-**Risk:** Signal handling may behave differently across Linux distributions and container runtimes.
-
-**Mitigation:**
-- Platform detection and conditional test logic
-- Container runtime specific test configurations
-- Comprehensive documentation of platform differences
-- CI testing across multiple environments
-
-### Risk 4: Test Maintenance Overhead
-**Risk:** Comprehensive test suite may require significant maintenance effort.
-
-**Mitigation:**
-- Well-structured test framework with reusable components
-- Clear documentation and contribution guidelines
-- Automated test generation where possible
-- Regular test suite review and cleanup
-
-## Implementation Dependencies
-
-### Build Dependencies
-```toml
-[dev-dependencies]
-# Existing
-tempfile = "3.8"
-chrono = "0.4"
-
-# New dependencies for integration testing
-nix = { version = "0.30.1", features = ["process", "term", "signal", "sys"] }
-libc = "0.2"
-sysinfo = "0.30"
-procfs = "0.16"
-criterion = { version = "0.5", features = ["html_reports"] }
-serial_test = "3.0"
-```
-
-### System Dependencies
-- `/proc` filesystem access for process monitoring
-- `strace` for signal tracing validation (optional)
-- `lsof` for file descriptor validation
-- Container runtime for container-specific tests
-
-### Test Infrastructure Requirements
-- Minimum 2GB RAM for parallel test execution
-- Root privileges for process group management tests
-- Network access for socket inheritance tests
-- Temporary directory with sufficient space (100MB)
-
-## Migration Plan
-
-### Phase 1: Framework Setup (No Breaking Changes)
-- Add test infrastructure without modifying existing code
-- Create parallel test structure
-- Establish CI/CD pipeline updates
-
-### Phase 2: Test Implementation (Additive Changes)
-- Implement test scenarios incrementally
-- Add performance baselines
-- Enhance existing echo server for testing
-
-### Phase 3: Integration (Configuration Changes)
-- Update CI/CD workflows
-- Add performance monitoring
-- Update documentation
-
-### Phase 4: Validation (Verification Phase)
-- Run comprehensive test suite
-- Validate performance baselines
-- Confirm CI/CD integration
-
-**Rollback Plan:**
-- Tests are additive and can be disabled via feature flags
-- Framework removal does not affect core functionality
-- Performance baselines can be reset if needed
-
-## Future Considerations
-
-### Extensibility
-The testing framework is designed to support future enhancements:
-
-1. **Additional Signal Types**: Framework can easily add new signal test scenarios
-2. **Container Runtime Testing**: Support for Docker, Podman, containerd-specific tests
-3. **Performance Profiling**: Integration with profiling tools for detailed analysis
-4. **Load Testing**: Stress testing capabilities for high-load scenarios
-5. **Security Testing**: Permission and privilege escalation validation
-
-### Long-term Vision
-This framework establishes the foundation for:
-- Automated performance regression detection
-- Comprehensive init system compliance validation
-- Container runtime certification testing
-- Production readiness validation
-
-### Integration Opportunities
-- **Monitoring Integration**: Export test metrics to monitoring systems
-- **Documentation Generation**: Auto-generate compatibility matrices
-- **Benchmarking Database**: Historical performance tracking
-- **Security Scanning**: Integration with security testing tools
-
-## Acceptance Criteria
-
-### Functional Requirements
-- [ ] All signal types properly tested with expected behaviors
-- [ ] Socket inheritance validated for single and multiple ports
-- [ ] Zero-downtime restart measured and validated
-- [ ] Process lifecycle management fully tested
-- [ ] Failure scenarios comprehensively covered
-- [ ] Performance baselines established and tracked
-
-### Non-Functional Requirements
-- [ ] Test suite runs in under 5 minutes
-- [ ] Tests pass consistently in CI/CD environment
-- [ ] Test coverage exceeds 90% for integration scenarios
-- [ ] Performance tests detect 10% regressions
-- [ ] Documentation complete and up-to-date
-
-### Quality Requirements
-- [ ] Test framework is maintainable and extensible
-- [ ] Test results are clearly reported and actionable
-- [ ] Test isolation prevents interference between tests
-- [ ] Test cleanup prevents resource leaks
-- [ ] Test framework integrates seamlessly with existing workflows
-
-### Success Metrics
-- **Signal Response Time**: Consistently under 100ms
-- **Test Reliability**: >99% pass rate in CI/CD
-- **Coverage**: >90% integration scenario coverage
-- **Performance Baseline**: Established for all key metrics
-- **Documentation**: Complete framework usage guide
-
-This comprehensive integration testing framework will ensure scinit meets the rigorous requirements of a production-ready init system while providing confidence for future development and deployment.
+The detailed code examples demonstrate how tests will be structured and how developers can use and extend the framework, while the phased implementation approach enables incremental value delivery. This framework will establish scinit as a comprehensively validated, production-ready init system suitable for enterprise container deployments.
