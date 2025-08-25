@@ -68,6 +68,10 @@ impl SignalHandler {
         SignalHandler { handled_signals }
     }
 
+    /// Sets up signal masking for the current thread.
+    ///
+    /// This must be called on each thread that should handle signals synchronously.
+    /// Uses pthread_sigmask to block handled signals on the current thread only.
     pub fn setup_thread_signals(&self) -> Result<()> {
         let thread = std::thread::current();
 
@@ -90,10 +94,11 @@ impl SignalHandler {
         Ok(())
     }
 
-    /// Waits for a signal with timeout using proper init system semantics.
+    /// Waits for a signal using proper init system semantics.
     ///
     /// This function provides synchronous, deterministic signal handling that
     /// maintains init system guarantees for signal ordering and delivery.
+    /// Blocks until a signal is received.
     pub async fn wait_for_signal(&self) -> Result<Signal> {
         // Use spawn_blocking to maintain init semantics while being async-compatible
         let signals = self.handled_signals;
