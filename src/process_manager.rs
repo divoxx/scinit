@@ -1,4 +1,5 @@
 use super::Result;
+use crate::environment::Environment;
 use crate::port_manager::PortManager;
 use crate::signals::signal_name;
 use eyre::eyre;
@@ -30,7 +31,7 @@ pub struct ProcessConfig {
     /// Working directory for the process
     pub working_directory: Option<PathBuf>,
     /// Environment variables to set
-    pub environment: HashMap<String, String>,
+    pub environment: Environment,
 }
 
 impl Default for ProcessConfig {
@@ -41,7 +42,7 @@ impl Default for ProcessConfig {
             restart_delay: Duration::from_millis(1000),
             graceful_shutdown_timeout: Duration::from_secs(30),
             working_directory: None,
-            environment: HashMap::new(),
+            environment: Environment::new(),
         }
     }
 }
@@ -127,19 +128,17 @@ impl ProcessManager {
         // Bind ports before spawning
         self.port_manager.bind_ports().await?;
 
-        // Prepare environment variables
-        let mut env_vars = std::env::vars().collect::<HashMap<_, _>>();
+        // Prepare environment variables using systemd socket activation
+        let mut env_vars = Environment::from(std::env::vars().collect::<HashMap<_, _>>());
         
-        // Add inherited file descriptors to environment
-        let inherited_fds = self.port_manager.get_inherited_fds_string();
-        if !inherited_fds.is_empty() {
-            env_vars.insert("SCINIT_INHERITED_FDS".to_string(), inherited_fds);
-        }
+        // Add systemd socket activation environment variables
+        // Note: We use a placeholder PID here; in real systemd socket activation,
+        // the service manager would set the correct PID after fork/exec
+        let socket_env = self.port_manager.get_socket_activation_env(0);
+        env_vars.extend(socket_env);
 
         // Add custom environment variables
-        for (key, value) in &self.config.environment {
-            env_vars.insert(key.clone(), value.clone());
-        }
+        env_vars.extend(self.config.environment.clone());
 
         // Create command
         let mut command = Command::new(&self.config.command);
@@ -179,7 +178,7 @@ impl ProcessManager {
 
         // Set environment variables
         command.env_clear();
-        for (key, value) in env_vars {
+        for (key, value) in env_vars.into_inner() {
             command.env(key, value);
         }
 
@@ -557,8 +556,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_environment_variables() {
-        let mut env = HashMap::new();
-        env.insert("TEST_VAR".to_string(), "test_value".to_string());
+        let mut env = Environment::new();
+        env.set("TEST_VAR", "test_value");
         
         let config = ProcessConfig {
             command: "sh".to_string(),

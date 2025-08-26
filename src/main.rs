@@ -1,6 +1,7 @@
 type Result<T> = color_eyre::eyre::Result<T>;
 
 mod cli;
+mod environment;
 mod file_watcher;
 mod port_manager;
 mod process_manager;
@@ -8,7 +9,7 @@ mod signals;
 
 use clap::Parser;
 use once_cell::sync::OnceCell;
-use std::collections::HashMap;
+use environment::Environment;
 use std::time::Duration;
 use tokio::select;
 use tokio::time::interval;
@@ -74,7 +75,7 @@ async fn app_main(signal_handler: &SignalHandler) -> Result<()> {
         restart_delay: Duration::from_millis(config.live_reload.restart_delay_ms),
         graceful_shutdown_timeout: Duration::from_secs(config.live_reload.graceful_timeout_secs),
         working_directory: None,
-        environment: HashMap::new(),
+        environment: Environment::new(),
     };
 
     let mut process_manager = ProcessManager::new(process_config, port_manager);

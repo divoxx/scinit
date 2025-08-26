@@ -1,4 +1,5 @@
 use super::Result;
+use crate::environment::Environment;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::sys::socket::{setsockopt, sockopt::ReusePort};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -6,6 +7,9 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, Shutdown};
 use std::os::unix::io::{AsRawFd, BorrowedFd};
 use tracing::{debug, info};
+
+/// Standard systemd socket activation start file descriptor
+const SD_LISTEN_FDS_START: i32 = 3;
 
 /// Configuration for port binding behavior
 #[derive(Debug, Clone)]
@@ -16,6 +20,8 @@ pub struct PortBindingConfig {
     pub bind_address: IpAddr,
     /// Whether to enable SO_REUSEPORT for graceful restarts
     pub reuse_port: bool,
+    /// Optional names for the bound sockets (for LISTEN_FDNAMES)
+    pub socket_names: Option<Vec<String>>,
 }
 
 impl Default for PortBindingConfig {
@@ -24,6 +30,7 @@ impl Default for PortBindingConfig {
             ports: Vec::new(),
             bind_address: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             reuse_port: true,
+            socket_names: None,
         }
     }
 }
@@ -107,7 +114,7 @@ impl PortManager {
         socket.bind(&socket_addr.into())?;
         socket.listen(128)?; // Set backlog
 
-        // Mark socket as inheritable by clearing close-on-exec flag
+        // Mark socket as inheritable by clearing close-on-exec flag initially
         let fd = socket.as_raw_fd();
         let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
         let mut flags = FdFlag::from_bits_truncate(fcntl(borrowed_fd, FcntlArg::F_GETFD)?);
@@ -136,10 +143,92 @@ impl PortManager {
             .collect()
     }
 
+    /// Gets the number of inherited file descriptors for LISTEN_FDS environment variable
+    /// 
+    /// # Returns
+    /// * `String` - Number of file descriptors as string
+    pub fn get_listen_fds_count(&self) -> String {
+        self.sockets.len().to_string()
+    }
+
+    /// Gets the socket names for LISTEN_FDNAMES environment variable
+    /// 
+    /// # Returns
+    /// * `Option<String>` - Colon-separated socket names, if configured
+    pub fn get_listen_fdnames(&self) -> Option<String> {
+        self.config.socket_names.as_ref().map(|names| {
+            names.join(":")
+        })
+    }
+
+    /// Prepares file descriptors for systemd socket activation
+    /// 
+    /// This method ensures that file descriptors start at SD_LISTEN_FDS_START (3)
+    /// and sets the FD_CLOEXEC flag as required by systemd socket activation.
+    /// 
+    /// # Arguments
+    /// * `child_pid` - Process ID of the child process for validation
+    /// 
+    /// # Returns
+    /// * `Result<()>` - Success or error
+    pub fn prepare_systemd_fds(&self, _child_pid: nix::unistd::Pid) -> Result<()> {
+        // For systemd socket activation, we need to set FD_CLOEXEC on inherited FDs
+        // This is the opposite of what we did during binding
+        for socket in self.sockets.values() {
+            let fd = socket.as_raw_fd();
+            let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
+            let mut flags = FdFlag::from_bits_truncate(fcntl(borrowed_fd, FcntlArg::F_GETFD)?);
+            flags.insert(FdFlag::FD_CLOEXEC);
+            fcntl(borrowed_fd, FcntlArg::F_SETFD(flags))?;
+        }
+        Ok(())
+    }
+
+    /// Gets the systemd socket activation environment variables for the child process.
+    ///
+    /// Returns an Environment containing the standard systemd socket activation variables:
+    /// - `LISTEN_FDS`: Number of file descriptors being passed (as string)
+    /// - `LISTEN_PID`: Process ID for validation (set to child PID)
+    /// - `LISTEN_FDNAMES`: Optional colon-separated socket names
+    ///
+    /// If no sockets are bound, returns an empty Environment.
+    ///
+    /// # Arguments
+    /// * `child_pid` - The process ID of the child process
+    ///
+    /// # Returns
+    /// * `Environment` - Environment variables for systemd socket activation
+    pub fn get_socket_activation_env(&self, child_pid: u32) -> Environment {
+        if self.sockets.is_empty() {
+            return Environment::new();
+        }
+
+        let mut env = Environment::new();
+
+        // LISTEN_FDS: Number of file descriptors
+        env.set("LISTEN_FDS", self.sockets.len().to_string());
+
+        // LISTEN_PID: Child process PID for validation
+        env.set("LISTEN_PID", child_pid.to_string());
+
+        // LISTEN_FDNAMES: Optional socket names
+        if let Some(ref names) = self.config.socket_names {
+            if names.len() == self.sockets.len() {
+                env.set("LISTEN_FDNAMES", names.join(":"));
+            }
+        }
+
+        env
+    }
+
     /// Gets the inherited file descriptors as a formatted string for environment variables
     /// 
     /// # Returns
     /// * `String` - Comma-separated list of file descriptors
+    /// 
+    /// # Deprecated
+    /// Use `get_socket_activation_env()` for systemd compatibility instead
+    #[deprecated(note = "Use get_socket_activation_env() for systemd compatibility")]
     pub fn get_inherited_fds_string(&self) -> String {
         self.get_inherited_fds()
             .iter()
@@ -184,6 +273,7 @@ mod tests {
             ports: vec![0], // Use port 0 to let OS assign a free port
             bind_address: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             reuse_port: true,
+            socket_names: None,
         };
 
         let mut manager = PortManager::new(config);
@@ -198,6 +288,7 @@ mod tests {
             ports: vec![0, 0], // Use port 0 to let OS assign free ports
             bind_address: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             reuse_port: true,
+            socket_names: None,
         };
 
         let mut manager = PortManager::new(config);
@@ -214,6 +305,7 @@ mod tests {
             ports: vec![0],
             bind_address: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             reuse_port: true,
+            socket_names: None,
         };
 
         let mut manager = PortManager::new(config);

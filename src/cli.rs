@@ -51,6 +51,7 @@ pub struct Cli {
     pub command: String,
 
     /// Arguments for the command
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
 }
 
@@ -111,6 +112,7 @@ impl Config {
                 ports: cli.ports,
                 bind_address,
                 reuse_port: true,
+                socket_names: None,
             },
         })
     }
