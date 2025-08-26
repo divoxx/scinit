@@ -3,9 +3,7 @@ use crate::process_manager::ProcessManager;
 
 pub use nix::sys::signal::Signal;
 
-use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet};
-#[cfg(target_os = "linux")]
-use nix::sys::signalfd::{SfdFlags, SignalFd};
+use nix::sys::signal::{pthread_sigmask, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
@@ -29,15 +27,10 @@ pub fn signal_name(signal: i32) -> &'static str {
 /// This handler uses platform-appropriate signal handling that maintains
 /// proper init system semantics: synchronous, deterministic signal processing
 /// with guaranteed delivery order.
-///
-/// - Linux: Uses SignalFd for safe, synchronous signal handling
-/// - Other platforms: Uses sigtimedwait for proper init system semantics
+#[derive(Debug)]
 pub(super) struct SignalHandler {
     /// Set of signals we handle (blocked for synchronous handling)
     handled_signals: SigSet,
-    /// SignalFd for reading blocked signals safely (Linux only)
-    #[cfg(target_os = "linux")]
-    signal_fd: SignalFd,
 }
 
 impl SignalHandler {
@@ -48,7 +41,7 @@ impl SignalHandler {
     /// - Leaves critical signals (SIGFPE, SIGILL, etc.) unblocked
     /// - Uses platform-appropriate synchronous signal handling
     /// - Maintains proper init system semantics across platforms
-    pub fn new() -> Result<Self> {
+    pub fn new() -> Self {
         // Create signal set with the signals we want to handle
         let mut handled_signals = SigSet::empty();
 
@@ -72,9 +65,23 @@ impl SignalHandler {
             handled_signals.add(sig);
         }
 
+        SignalHandler { handled_signals }
+    }
+
+    /// Sets up signal masking for the current thread.
+    ///
+    /// This must be called on each thread that should handle signals synchronously.
+    /// Uses pthread_sigmask to block handled signals on the current thread only.
+    pub fn setup_thread_signals(&self) -> Result<()> {
+        let thread = std::thread::current();
+
         // Block these signals for synchronous handling
-        handled_signals.thread_block()?;
-        debug!("Successfully blocked signals for synchronous init system handling");
+        pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&self.handled_signals), None)?;
+        debug!(
+            "Successfully blocked signals for thread {} {:?}",
+            thread.name().unwrap(),
+            thread.id(),
+        );
 
         // Ignore SIGTTIN and SIGTTOU to prevent blocking on terminal operations
         // This is critical for init systems running in containers
@@ -84,114 +91,29 @@ impl SignalHandler {
             nix::sys::signal::sigaction(Signal::SIGTTOU, &ignore_action)?;
         }
 
-        // Platform-specific initialization
-        #[cfg(target_os = "linux")]
-        {
-            // Linux: Use SignalFd for safe synchronous signal handling
-            let signal_fd = SignalFd::new(
-                &handled_signals,
-                SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK,
-            )?;
-            debug!("Signal handler initialized with SignalFd for Linux init semantics");
-
-            Ok(SignalHandler {
-                handled_signals,
-                signal_fd,
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            // Non-Linux: Use sigtimedwait for proper init system semantics
-            debug!("Signal handler initialized with sigtimedwait for init system semantics");
-
-            Ok(SignalHandler { handled_signals })
-        }
+        Ok(())
     }
 
-    /// Waits for a signal with timeout using proper init system semantics.
+    /// Waits for a signal using proper init system semantics.
     ///
     /// This function provides synchronous, deterministic signal handling that
     /// maintains init system guarantees for signal ordering and delivery.
-    ///
-    /// # Arguments
-    /// * `timeout_duration` - The maximum time to wait for a signal
-    pub async fn wait_for_signal(&mut self, timeout_duration: Duration) -> Result<Option<Signal>> {
+    /// Blocks until a signal is received.
+    pub async fn wait_for_signal(&self) -> Result<Signal> {
         // Use spawn_blocking to maintain init semantics while being async-compatible
         let signals = self.handled_signals;
 
-        #[cfg(target_os = "linux")]
-        {
-            // Linux: Use SignalFd with blocking read in spawn_blocking
-            let mut signal_fd = std::mem::replace(
-                &mut self.signal_fd,
-                SignalFd::new(&signals, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK)?,
-            );
-
-            let result = tokio::time::timeout(
-                timeout_duration,
-                tokio::task::spawn_blocking(move || -> Result<Signal> {
-                    loop {
-                        match signal_fd.read_signal() {
-                            Ok(Some(signal_info)) => {
-                                let signal = Signal::try_from(signal_info.ssi_signo as i32)?;
-                                debug!("Received signal: {:?} (init semantics)", signal);
-                                return Ok(signal);
-                            }
-                            Ok(None) => {
-                                // Would block - continue reading
-                                std::thread::sleep(Duration::from_millis(10));
-                                continue;
-                            }
-                            Err(nix::errno::Errno::EAGAIN) => {
-                                // Would block - continue reading
-                                std::thread::sleep(Duration::from_millis(10));
-                                continue;
-                            }
-                            Err(e) => {
-                                return Err(e.into());
-                            }
-                        }
-                    }
-                }),
-            )
-            .await;
-
-            // Restore signal_fd
-            self.signal_fd = signal_fd;
-
-            match result {
-                Ok(Ok(signal)) => Ok(Some(signal)),
-                Ok(Err(e)) => Err(e),
-                Err(_) => {
-                    debug!("Signal wait timed out after {:?}", timeout_duration);
-                    Ok(None)
+        tokio::task::spawn_blocking(move || -> Result<Signal> {
+            // Use sigwait for synchronous signal waiting
+            match signals.wait() {
+                Ok(signal) => {
+                    debug!("Received signal: {:?} (init semantics)", signal);
+                    Ok(signal)
                 }
+                Err(e) => Err(e.into()),
             }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            // Non-Linux: Use sigwait with timeout for proper init system semantics
-            let task = tokio::task::spawn_blocking(move || -> Result<Signal> {
-                // Use sigwait for synchronous signal waiting
-                match signals.wait() {
-                    Ok(signal) => {
-                        debug!("Received signal: {:?} (init semantics)", signal);
-                        Ok(signal)
-                    }
-                    Err(e) => Err(e.into()),
-                }
-            });
-
-            match tokio::time::timeout(timeout_duration, task).await {
-                Ok(Ok(Ok(signal))) => Ok(Some(signal)),
-                Ok(Ok(Err(e))) => Err(e),
-                Ok(Err(join_err)) => Err(join_err.into()),
-                Err(_) => {
-                    debug!("Signal wait timed out after {:?}", timeout_duration);
-                    Ok(None)
-                }
-            }
-        }
+        })
+        .await?
     }
 }
 

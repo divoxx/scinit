@@ -28,11 +28,10 @@ impl Default for PortBindingConfig {
     }
 }
 
-/// Manages port binding and inheritance for child processes
+/// Manages port binding and socket inheritance for zero-downtime restarts.
 /// 
-/// This manager handles binding ports before spawning child processes
-/// and provides file descriptors that can be inherited by the child.
-/// It supports SO_REUSEPORT for graceful restarts without port conflicts.
+/// Binds ports before spawning child processes and provides file descriptors
+/// for inheritance. Uses SO_REUSEPORT for graceful restarts without port conflicts.
 pub struct PortManager {
     /// Currently bound ports and their socket addresses
     bound_ports: HashMap<u16, SocketAddr>,

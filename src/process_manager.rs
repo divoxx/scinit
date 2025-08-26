@@ -74,10 +74,10 @@ pub struct ProcessInfo {
     pub exit_status: Option<std::process::ExitStatus>,
 }
 
-/// Manages the lifecycle of child processes with support for graceful restarts
+/// Manages the lifecycle of child processes with graceful shutdown and port inheritance.
 /// 
 /// This manager handles spawning, monitoring, and restarting child processes.
-/// It supports graceful shutdown, port inheritance, and restart limiting.
+/// Only file-change restarts are allowed in container environments.
 pub struct ProcessManager {
     /// Configuration for process management
     config: ProcessConfig,
@@ -115,13 +115,7 @@ impl ProcessManager {
         }
     }
 
-    /// Spawns a new process with the current configuration
-    /// 
-    /// This method spawns a new child process with port inheritance
-    /// and updates the process state accordingly.
-    /// 
-    /// # Returns
-    /// * `Result<()>` - Success or error
+    /// Spawns a new process with port inheritance and proper signal mask reset
     pub async fn spawn_process(&mut self) -> Result<()> {
         if self.should_stop {
             return Ok(());

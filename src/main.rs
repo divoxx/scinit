@@ -7,6 +7,7 @@ mod process_manager;
 mod signals;
 
 use clap::Parser;
+use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::select;
@@ -15,13 +16,17 @@ use tracing::{debug, error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use cli::{Cli, Config};
-use file_watcher::{FileWatcher, handle_file_events};
+use file_watcher::{handle_file_events, FileWatcher};
 use port_manager::PortManager;
-use process_manager::{ProcessConfig, ProcessManager, process_group_to_foreground, handle_child_exit, reap_zombies_async};
-use signals::{SignalHandler, SignalAction};
+use process_manager::{
+    handle_child_exit, process_group_to_foreground, reap_zombies_async, ProcessConfig,
+    ProcessManager,
+};
+use signals::{SignalAction, SignalHandler};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+static SIGNAL_HANDLER: OnceCell<SignalHandler> = OnceCell::new();
+
+fn main() -> Result<()> {
     // Initialize error handling and logging
     color_eyre::install()?;
 
@@ -30,11 +35,30 @@ async fn main() -> Result<()> {
         .with(EnvFilter::from_default_env())
         .init();
 
-    // Note: We don't create a separate process group for scinit to allow Ctrl+C during development
-    // Signal masking is handled when SignalHandler is created (pthread_sigmask affects only calling thread)
-
     info!("scinit starting");
 
+    let signal_handler = SignalHandler::new();
+    SIGNAL_HANDLER.set(signal_handler).unwrap();
+
+    debug!("starting tokio runtime");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(|| {
+            SIGNAL_HANDLER
+                .get()
+                .unwrap()
+                .setup_thread_signals()
+                .unwrap()
+        })
+        .build()?;
+
+    rt.block_on(app_main(SIGNAL_HANDLER.get().unwrap()))?;
+    rt.shutdown_timeout(Duration::from_millis(100));
+
+    Ok(())
+}
+
+async fn app_main(signal_handler: &SignalHandler) -> Result<()> {
     // Parse CLI arguments
     let cli = Cli::parse();
 
@@ -43,7 +67,7 @@ async fn main() -> Result<()> {
 
     // Setup components
     let port_manager = PortManager::new(config.port_binding.clone());
-    
+
     let process_config = ProcessConfig {
         command: config.command.clone(),
         args: config.args.clone(),
@@ -52,9 +76,8 @@ async fn main() -> Result<()> {
         working_directory: None,
         environment: HashMap::new(),
     };
-    
+
     let mut process_manager = ProcessManager::new(process_config, port_manager);
-    let mut signal_handler = SignalHandler::new()?;
 
     // Create file watcher if live-reload is enabled
     let mut file_watcher = if let Some(watch_config) = config.file_watch_config() {
@@ -64,7 +87,13 @@ async fn main() -> Result<()> {
     };
 
     // Run the main event loop
-    run_main_loop(config, &mut process_manager, &mut signal_handler, &mut file_watcher).await?;
+    run_main_loop(
+        config,
+        &mut process_manager,
+        signal_handler,
+        &mut file_watcher,
+    )
+    .await?;
 
     info!("scinit exiting");
     Ok(())
@@ -74,12 +103,15 @@ async fn main() -> Result<()> {
 async fn run_main_loop(
     config: Config,
     process_manager: &mut ProcessManager,
-    signal_handler: &mut SignalHandler, 
-    file_watcher: &mut Option<FileWatcher>
+    signal_handler: &SignalHandler,
+    file_watcher: &mut Option<FileWatcher>,
 ) -> Result<()> {
     let mut zombie_reap_interval = interval(config.zombie_reap_interval);
 
-    info!("init system started, managing subprocess: {}", config.command);
+    info!(
+        "init system started, managing subprocess: {}",
+        config.command
+    );
 
     // Start file watching if enabled
     if let Some(ref mut file_watcher) = file_watcher {
@@ -91,7 +123,7 @@ async fn run_main_loop(
 
     // Spawn initial process
     process_manager.spawn_process().await?;
-    
+
     // Setup process group
     if let Some(pid) = process_manager.process_info().pid {
         use nix::unistd::getpgid;
@@ -101,8 +133,7 @@ async fn run_main_loop(
 
     loop {
         // Check for file events first (if enabled)
-        if file_watcher.is_some()
-            && handle_file_events(file_watcher, process_manager).await? {
+        if file_watcher.is_some() && handle_file_events(file_watcher, process_manager).await? {
             return Ok(()); // Exit requested
         }
 
@@ -127,19 +158,11 @@ async fn run_main_loop(
             }
 
             // Synchronous signal handling - proper for init systems
-            signal = signal_handler.wait_for_signal(config.signal_poll_interval) => {
-                match signal? {
-                    Some(signal) => {
-                        info!("received signal: {:?}", signal);
-                        match signal_handler.process_signal(signal, process_manager, config.live_reload.graceful_timeout_secs).await? {
-                            SignalAction::Exit => return Ok(()),
-                            SignalAction::ReapZombies => reap_zombies_async().await,
-                            SignalAction::Continue => {},
-                        }
-                    }
-                    None => {
-                        // No signal received, continue
-                    }
+            signal = signal_handler.wait_for_signal() => {
+                match signal_handler.process_signal(signal?, process_manager, config.live_reload.graceful_timeout_secs).await? {
+                    SignalAction::Exit => return Ok(()),
+                    SignalAction::ReapZombies => reap_zombies_async().await,
+                    SignalAction::Continue => {},
                 }
             }
 
@@ -150,3 +173,4 @@ async fn run_main_loop(
         }
     }
 }
+
