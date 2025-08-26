@@ -40,6 +40,11 @@ impl ProcessTestHarness {
         self.temp_dir.path()
     }
 
+    /// Get the temporary directory path as a string for convenience
+    pub fn temp_path_str(&self) -> String {
+        self.temp_dir.path().to_str().unwrap().to_string()
+    }
+
     /// Spawn scinit with the given arguments
     pub async fn spawn_scinit(&mut self, args: &[&str]) -> Result<TestProcess> {
         let mut cmd = Command::new(&self.scinit_binary);

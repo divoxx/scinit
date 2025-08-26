@@ -10,7 +10,7 @@ async fn test_basic_live_reload() -> Result<()> {
     
     
     let mut harness = ProcessTestHarness::new()?;
-    let watch_path = harness.temp_path().to_str().unwrap().to_string();
+    let watch_path = harness.temp_path_str();
     
     // Start scinit with live-reload enabled
     let mut process = harness.spawn_scinit(&[
@@ -52,7 +52,7 @@ async fn test_live_reload_debouncing() -> Result<()> {
     
     
     let mut harness = ProcessTestHarness::new()?;
-    let watch_path = harness.temp_path().to_str().unwrap().to_string();
+    let watch_path = harness.temp_path_str();
     
     // Start scinit with live-reload and longer debounce time
     let mut process = harness.spawn_scinit(&[
@@ -93,7 +93,7 @@ async fn test_live_reload_file_modification() -> Result<()> {
     
     
     let mut harness = ProcessTestHarness::new()?;
-    let watch_path = harness.temp_path().to_str().unwrap().to_string();
+    let watch_path = harness.temp_path_str();
     
     // Create a file first
     let test_file = harness.temp_path().join("modify_test.txt");
@@ -134,7 +134,7 @@ async fn test_live_reload_restart_delay() -> Result<()> {
     
     
     let mut harness = ProcessTestHarness::new()?;
-    let watch_path = harness.temp_path().to_str().unwrap().to_string();
+    let watch_path = harness.temp_path_str();
     
     // Start scinit with live-reload and restart delay
     let mut process = harness.spawn_scinit(&[
@@ -183,7 +183,7 @@ async fn test_live_reload_no_false_triggers() -> Result<()> {
     
     
     let mut harness = ProcessTestHarness::new()?;
-    let watch_path = harness.temp_path().to_str().unwrap().to_string();
+    let watch_path = harness.temp_path_str();
     
     // Start scinit with live-reload
     let mut process = harness.spawn_scinit(&[

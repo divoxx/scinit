@@ -85,7 +85,7 @@ async fn test_zero_downtime_basic() -> Result<()> {
     
     // Test with live-reload enabled and socket inheritance
     let test_port = socket_utils.get_free_port()?;
-    let watch_path = harness.temp_path().to_str().unwrap().to_string();
+    let watch_path = harness.temp_path_str();
     let mut process = harness.spawn_scinit(&[
         "--live-reload",
         "--watch-path", &watch_path,

@@ -100,6 +100,27 @@ impl Environment {
     pub fn len(&self) -> usize {
         self.0.len()
     }
+
+    /// Returns an iterator over the environment variables.
+    ///
+    /// # Returns
+    /// * `impl Iterator<Item = (&String, &String)>` - Iterator over key-value pairs
+    ///
+    /// # Examples
+    /// ```
+    /// use scinit::Environment;
+    /// 
+    /// let mut env = Environment::new();
+    /// env.set("PATH", "/usr/bin");
+    /// env.set("HOME", "/home/user");
+    /// 
+    /// for (key, value) in env.iter() {
+    ///     println!("{}={}", key, value);
+    /// }
+    /// ```
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.0.iter()
+    }
 }
 
 impl From<HashMap<String, String>> for Environment {
@@ -193,5 +214,32 @@ mod tests {
         assert_eq!(env.get("KEY1"), Some(&"string_literal".to_string()));
         assert_eq!(env.get("KEY2"), Some(&"owned_string".to_string()));
         assert_eq!(env.get("KEY3"), Some(&"value3".to_string()));
+    }
+
+    #[test]
+    fn test_environment_iter() {
+        let mut env = Environment::new();
+        env.set("PATH", "/usr/bin");
+        env.set("HOME", "/home/user");
+        env.set("SHELL", "/bin/bash");
+        
+        // Collect all key-value pairs from iterator
+        let mut pairs: Vec<(&String, &String)> = env.iter().collect();
+        pairs.sort(); // HashMap iteration order is not deterministic
+        
+        assert_eq!(pairs.len(), 3);
+        
+        // Find specific pairs (order may vary due to HashMap)
+        let has_path = pairs.iter().any(|(k, v)| k.as_str() == "PATH" && v.as_str() == "/usr/bin");
+        let has_home = pairs.iter().any(|(k, v)| k.as_str() == "HOME" && v.as_str() == "/home/user");
+        let has_shell = pairs.iter().any(|(k, v)| k.as_str() == "SHELL" && v.as_str() == "/bin/bash");
+        
+        assert!(has_path);
+        assert!(has_home);
+        assert!(has_shell);
+        
+        // Test that iteration doesn't consume the environment
+        assert_eq!(env.len(), 3);
+        assert_eq!(env.get("PATH"), Some(&"/usr/bin".to_string()));
     }
 }
