@@ -98,6 +98,7 @@ The live-reload system integrates:
 - **Harness** (`tests/integration/harness.rs`): `Scinit::builder()` spawns the real scinit binary with the fixture as child, captures stdout/stderr, and offers polling helpers (`wait_for`, `child_pid`, `wait_exit`) instead of fixed sleeps. Plain `#[test]`, no tokio
 - **Scenarios** (`tests/integration/scenarios/`): `cli`, `exit_codes`, `signals`, `sockets`, `live_reload`, and `linux` (Linux only: `/proc` checks and scinit as PID 1 via `unshare`). All compile into the single `integration_test` target
 - **Linux runner** (`scripts/test-linux.sh`, `tests/container/Containerfile`): builds a test image and runs `cargo test` in rootless podman (args pass through), with the permissions the `linux` PID-1 tests need; `SCINIT_REQUIRE_PID1=1` makes them fail rather than skip
+- **CI** (`.github/workflows/ci.yml`): on every PR and push to `main`, runs `cargo test` on a macOS runner and `scripts/test-linux.sh` on an Ubuntu runner
 
 ### Known Bugs
 
