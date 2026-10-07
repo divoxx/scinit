@@ -52,7 +52,7 @@ scinit writes its own messages to **stderr** only, so stdout carries nothing but
 [scinit] ERROR Failed to spawn process 'my-app': No such file or directory (os error 2)
 ```
 
-There are no timestamps (container runtimes add them), and color is used only when stderr is a terminal (`NO_COLOR` turns it off).
+Lines carry no timestamp: container log drivers (Docker's `json-file`, Kubernetes' CRI log files, journald) record one per line, shown with `docker logs -t` or `kubectl logs --timestamps`. Attached runs (`docker run` without `-d`) and runs outside a container get none. Color is used only when stderr is a terminal (`NO_COLOR` turns it off).
 
 Verbosity is set with **`SCINIT_LOG`**, using [tracing's `EnvFilter` syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html). The default is `error`.
 

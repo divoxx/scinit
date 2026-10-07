@@ -39,8 +39,8 @@ fn use_color() -> bool {
     std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
-/// `[scinit] LEVEL message fields`, with no timestamp: container runtimes
-/// already timestamp every line
+/// `[scinit] LEVEL message fields`, with no timestamp: container log drivers
+/// record one per line (as do tini, dumb-init and catatonit, which omit it too)
 struct Prefixed;
 
 impl<S, N> FormatEvent<S, N> for Prefixed
