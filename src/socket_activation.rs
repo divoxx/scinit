@@ -13,7 +13,7 @@
 use crate::environment::Environment;
 use crate::Result;
 use eyre::eyre;
-use std::ffi::{CString, OsStr};
+use std::ffi::{CString, OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::RawFd;
@@ -60,13 +60,14 @@ impl SocketActivationExec {
         listen_fds: Vec<RawFd>,
         overrides: Environment,
     ) -> Result<Self> {
-        let program = c_string(resolve_program(command)?.as_os_str().as_bytes())?;
+        let program = resolve_program(command)?;
+        let env = child_env(overrides);
+
+        // execve takes C strings, and the child must not allocate, so they
+        // are converted here
+        let program = c_string(program)?;
         let argv = c_strings(std::iter::once(command).chain(args.iter().map(String::as_str)))?;
-        let envp = c_strings(
-            child_env(overrides)
-                .into_iter()
-                .map(|(key, value)| env_entry(&key, &value)),
-        )?;
+        let envp = c_strings(env)?;
 
         let mut pid_slot = LISTEN_PID_PREFIX.to_vec();
         pid_slot.resize(LISTEN_PID_PREFIX.len() + PID_DIGITS, 0);
@@ -128,31 +129,34 @@ impl SocketActivationExec {
     }
 }
 
-fn c_string(bytes: &[u8]) -> Result<CString> {
-    CString::new(bytes).map_err(|_| eyre!("argument or environment contains a NUL byte"))
+fn c_string(s: impl AsRef<OsStr>) -> Result<CString> {
+    CString::new(s.as_ref().as_bytes())
+        .map_err(|_| eyre!("argument or environment contains a NUL byte"))
 }
 
-fn c_strings<T: AsRef<[u8]>>(items: impl IntoIterator<Item = T>) -> Result<Vec<CString>> {
-    items.into_iter().map(|item| c_string(item.as_ref())).collect()
+fn c_strings<T: AsRef<OsStr>>(items: impl IntoIterator<Item = T>) -> Result<Vec<CString>> {
+    items.into_iter().map(c_string).collect()
 }
 
-/// scinit's environment with `overrides` applied. Inherited `LISTEN_*`
-/// describe someone else's sockets, so they are dropped.
-fn child_env(overrides: Environment) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut env: Vec<(Vec<u8>, Vec<u8>)> = std::env::vars_os()
-        .filter(|(k, _)| !k.as_bytes().starts_with(b"LISTEN_"))
-        .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+/// scinit's environment with `overrides` applied, as `KEY=value` entries.
+/// Inherited `LISTEN_*` describe someone else's sockets, so they are dropped.
+fn child_env(overrides: Environment) -> Vec<OsString> {
+    let mut env: Vec<(OsString, OsString)> = std::env::vars_os()
+        .filter(|(key, _)| !key.as_bytes().starts_with(b"LISTEN_"))
         .collect();
     for (key, value) in overrides.into_inner() {
-        env.retain(|(k, _)| k != key.as_bytes());
-        env.push((key.into_bytes(), value.into_bytes()));
+        env.retain(|(k, _)| k != key.as_str());
+        env.push((key.into(), value.into()));
     }
-    env
+    env.iter().map(|(key, value)| env_entry(key, value)).collect()
 }
 
 /// `key=value`, as `execve` expects it
-fn env_entry(key: &[u8], value: &[u8]) -> Vec<u8> {
-    [key, b"=", value].concat()
+fn env_entry(key: &OsStr, value: &OsStr) -> OsString {
+    let mut entry = key.to_os_string();
+    entry.push("=");
+    entry.push(value);
+    entry
 }
 
 fn null_terminated(ptrs: impl Iterator<Item = *const libc::c_char>) -> Vec<*const libc::c_char> {
