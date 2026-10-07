@@ -40,7 +40,7 @@ fn use_color() -> bool {
 }
 
 /// `[scinit] LEVEL message fields`, with no timestamp: container log drivers
-/// record one per line (as do tini, dumb-init and catatonit, which omit it too)
+/// record one per line. tini, dumb-init and catatonit leave it out too.
 struct Prefixed;
 
 impl<S, N> FormatEvent<S, N> for Prefixed
