@@ -97,6 +97,11 @@ impl Event {
         self.parse_field("pid").expect("event has no pid")
     }
 
+    /// When the fixture reported the event (from its `t=` field)
+    pub fn time(&self) -> Duration {
+        Duration::from_micros(self.parse_field("t").expect("event has no t"))
+    }
+
     pub fn pgid(&self) -> i32 {
         self.parse_field("pgid").expect("event has no pgid")
     }

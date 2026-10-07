@@ -129,16 +129,15 @@ fn restart_delay_is_respected() {
         start_and_settle(live_reload_with(b, &dir, 200, DELAY.as_millis() as u64).child(["run"]));
     modify(&file, "v2");
 
-    scinit
+    let exited = scinit
         .wait_for_nth_match("old child exit", 1, TIMEOUT, |e| e.is("exit") && e.pid() == old)
         .unwrap();
-    let exited = Instant::now();
-    scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
-    let gap = exited.elapsed();
+    let started = scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
+    // From the events' own timestamps, so polling delays don't skew it
+    let gap = started.time().saturating_sub(exited.time());
 
-    // Allow for the 20ms poll interval on both observations
     assert!(
-        gap + Duration::from_millis(40) >= DELAY,
+        gap >= DELAY,
         "new child started {:?} after the old one exited, expected >= {:?}\n{}",
         gap,
         DELAY,
