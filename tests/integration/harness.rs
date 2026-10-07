@@ -133,7 +133,7 @@ pub struct ScinitBuilder {
     report_dir: TempDir,
     scinit_args: Vec<OsString>,
     command: Vec<OsString>,
-    env: Vec<(String, String)>,
+    env: Vec<(OsString, OsString)>,
 }
 
 impl ScinitBuilder {
@@ -189,7 +189,8 @@ impl ScinitBuilder {
         self
     }
 
-    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+    /// Set a variable in scinit's environment (values need not be UTF-8)
+    pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
         self.env.push((key.into(), value.into()));
         self
     }

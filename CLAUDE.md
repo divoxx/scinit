@@ -98,7 +98,7 @@ The live-reload system integrates:
 - **Harness** (`tests/integration/harness.rs`): `Scinit::builder()` spawns the real scinit binary with the fixture as child (with only stdio open), captures stdout/stderr, and offers builder shortcuts (`start`, `spawn_dump`, `ports`, `watch`), polling helpers (`wait_for`, `wait_for_nth_match`, `wait_exit`, `poll_until`) and assertions (`assert_exit_code`, `assert_start_count`, `assert_reply_from`) instead of fixed sleeps. Plain `#[test]`, no tokio
 - **Scenarios** (`tests/integration/scenarios/`): `cli`, `exit_codes`, `signals`, `sockets`, `live_reload`, and `linux` (Linux only: `/proc` checks and scinit as PID 1 via `unshare`). All compile into the single `integration_test` target
 - **Linux runner** (`scripts/test-linux.sh`, `tests/container/Containerfile`): builds a test image and runs `cargo test` in rootless podman (args pass through), with the permissions the `linux` PID-1 tests need; `SCINIT_REQUIRE_PID1=1` makes them fail rather than skip
-- **CI** (`.github/workflows/ci.yml`): on every PR and push to `main`, runs `cargo test` on a macOS runner and `scripts/test-linux.sh` on an Ubuntu runner
+- **CI** (`.github/workflows/ci.yml`): on every PR and push to `main`, runs `cargo clippy --all-targets -- -D warnings` on macOS and Linux, `cargo test` on a macOS runner and `scripts/test-linux.sh` on an Ubuntu runner
 
 ### Known Bugs
 
@@ -115,9 +115,11 @@ The `listen` fixture mode verifies socket inheritance end to end:
 
 - Never allow crash-based restarts in container environments
 - Always use process groups for proper signal forwarding
+- Listening sockets always set `SO_REUSEADDR` (rebinding over TIME_WAIT after a scinit restart); `SO_REUSEPORT` only with `--reuse-port`, since restarts reuse the same sockets and don't need it
 - Bound sockets stay close-on-exec; the child gets `dup2` copies at fds 3.. (which clears the flag), so only those are inherited
 - Code in the child between fork and exec (`pre_exec`) must be async-signal-safe: build everything before forking, never allocate there
 - **Signal masking**: Block handled signals on the main thread before any other thread exists; never block critical/synchronous signals or SIGCHLD
 - **Signal handling**: Consume handled signals only on the dedicated sigwait thread; never call `sigwait` from per-iteration tasks (cancelled waits leave threads that swallow signals)
 - Zombie reaping runs in background tasks to avoid blocking main loop
 - Terminal signals (SIGTTIN, SIGTTOU) are ignored to prevent blocking in containers
+- scinit's own logs (`src/logging.rs`) go to stderr only, in tracing's standard format without timestamps (`LEVEL scinit::module: message`; color only on a terminal), filtered by `SCINIT_LOG` (default `error`); never read `RUST_LOG`, which belongs to the child. Fatal errors are logged the same way
