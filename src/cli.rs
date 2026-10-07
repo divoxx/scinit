@@ -48,6 +48,10 @@ pub struct Cli {
     #[arg(long, default_value = "127.0.0.1")]
     pub bind_addr: String,
 
+    /// Set SO_REUSEPORT on the bound ports, so other processes can bind them too
+    #[arg(long)]
+    pub reuse_port: bool,
+
     /// Debounce time for file changes (ms)
     #[arg(long, default_value = "500")]
     pub debounce_ms: u64,
@@ -128,6 +132,7 @@ impl Config {
             port_binding: PortBindingConfig {
                 ports: cli.ports,
                 bind_address,
+                reuse_port: cli.reuse_port,
             },
         })
     }
