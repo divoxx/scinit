@@ -13,7 +13,10 @@
 //! events when its main `select!` wakes up, which in practice is the reap
 //! timer (see `restart_is_prompt_with_default_reap_interval`).
 
-use crate::integration::harness::{free_port, request, Scinit, ScinitBuilder, TEST_CHILD, TIMEOUT};
+use crate::integration::harness::{
+    free_port, let_setup_writes_age, loopback, request, Scinit, ScinitBuilder, TEST_CHILD, TIMEOUT,
+};
+use nix::sys::signal::Signal;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -22,12 +25,6 @@ const SETTLE: Duration = Duration::from_millis(500);
 
 /// How long to watch for a restart that must not happen
 const QUIET: Duration = Duration::from_secs(3);
-
-/// FSEvents (macOS) can report writes made just before the watcher starts as
-/// fresh changes. Called right before spawning, after the test set up its files.
-fn let_setup_writes_age() {
-    std::thread::sleep(Duration::from_secs(1));
-}
 
 /// Live-reload flags with short delays so restarts are quick
 fn live_reload(builder: ScinitBuilder, watch: &Path) -> ScinitBuilder {
@@ -42,8 +39,7 @@ fn live_reload_with(
 ) -> ScinitBuilder {
     let_setup_writes_age();
     builder
-        .args(["--live-reload", "--watch-path"])
-        .args([watch])
+        .watch(watch)
         .args(["--debounce-ms", &debounce_ms.to_string()])
         .args(["--restart-delay-ms", &restart_delay_ms.to_string()])
         .args(["--zombie-reap-interval-ms", "100"])
@@ -53,8 +49,7 @@ fn live_reload_with(
 fn live_reload_default_reap(builder: ScinitBuilder, watch: &Path) -> ScinitBuilder {
     let_setup_writes_age();
     builder
-        .args(["--live-reload", "--watch-path"])
-        .args([watch])
+        .watch(watch)
         .args(["--debounce-ms", "200", "--restart-delay-ms", "100"])
 }
 
@@ -66,11 +61,12 @@ fn watched_dir(builder: &ScinitBuilder) -> PathBuf {
     dir
 }
 
-/// Wait for the first child, then let pre-start filesystem events drain
-fn start_and_settle(scinit: &Scinit) -> i32 {
-    let pid = scinit.child_pid().unwrap();
+/// Start scinit and wait for the first child, then let pre-start filesystem
+/// events drain
+fn start_and_settle(builder: ScinitBuilder) -> (Scinit, i32) {
+    let started = builder.start();
     std::thread::sleep(SETTLE);
-    pid
+    started
 }
 
 /// Write to an existing file in place (a plain content modification)
@@ -81,14 +77,7 @@ fn modify(path: &Path, content: &str) {
 /// Assert no restart happens within `QUIET`
 fn assert_no_restart(scinit: &mut Scinit, what: &str) {
     scinit.assert_running_for(QUIET);
-    let pids = scinit.started_pids();
-    assert_eq!(
-        pids.len(),
-        1,
-        "{} must not restart the child\n{}",
-        what,
-        scinit.diagnostics()
-    );
+    scinit.assert_start_count(1, &format!("{} must not restart the child", what));
 }
 
 /// Modifying a watched file stops the old child with SIGTERM and starts a new one
@@ -98,14 +87,12 @@ fn file_modify_restarts_child() {
     let dir = watched_dir(&b);
     let file = dir.join("app.conf");
     modify(&file, "v1");
-    let mut scinit = live_reload(b, &dir).child(["run"]).spawn().unwrap();
-
-    let old = start_and_settle(&scinit);
+    let (mut scinit, old) = start_and_settle(live_reload(b, &dir).child(["run"]));
     modify(&file, "v2");
 
     let new = scinit.wait_for_nth("started", 2, TIMEOUT).unwrap().pid();
     assert_ne!(old, new, "restart must spawn a new process");
-    scinit.wait_for_signal(old, "TERM", TIMEOUT).unwrap();
+    scinit.wait_for_signal(old, Signal::SIGTERM, TIMEOUT).unwrap();
     assert!(
         scinit.is_running(),
         "scinit must survive the restart\n{}",
@@ -119,9 +106,7 @@ fn watch_single_file_restarts_child() {
     let b = Scinit::builder();
     let file = watched_dir(&b).join("app.conf");
     modify(&file, "v1");
-    let scinit = live_reload(b, &file).child(["run"]).spawn().unwrap();
-
-    let old = start_and_settle(&scinit);
+    let (scinit, old) = start_and_settle(live_reload(b, &file).child(["run"]));
     modify(&file, "v2");
 
     let new = scinit.wait_for_nth("started", 2, TIMEOUT).unwrap().pid();
@@ -136,18 +121,12 @@ fn restart_delay_is_respected() {
     let dir = watched_dir(&b);
     let file = dir.join("app.conf");
     modify(&file, "v1");
-    let scinit = live_reload_with(b, &dir, 200, DELAY.as_millis() as u64)
-        .child(["run"])
-        .spawn()
-        .unwrap();
-
-    let old = start_and_settle(&scinit);
+    let (scinit, old) =
+        start_and_settle(live_reload_with(b, &dir, 200, DELAY.as_millis() as u64).child(["run"]));
     modify(&file, "v2");
 
     scinit
-        .wait_for("old child exit", TIMEOUT, |evs| {
-            evs.iter().any(|e| e.name == "exit" && e.pid() == old)
-        })
+        .wait_for_nth_match("old child exit", 1, TIMEOUT, |e| e.is("exit") && e.pid() == old)
         .unwrap();
     let exited = Instant::now();
     scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
@@ -177,12 +156,7 @@ fn burst_of_writes_restarts_once() {
     let dir = watched_dir(&b);
     let file = dir.join("app.conf");
     modify(&file, "v0");
-    let mut scinit = live_reload_with(b, &dir, 1500, 100)
-        .child(["run"])
-        .spawn()
-        .unwrap();
-
-    start_and_settle(&scinit);
+    let (mut scinit, _) = start_and_settle(live_reload_with(b, &dir, 1500, 100).child(["run"]));
     for i in 1..=5 {
         modify(&file, &format!("v{}", i));
         std::thread::sleep(Duration::from_millis(50));
@@ -191,12 +165,7 @@ fn burst_of_writes_restarts_once() {
     scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
     // Well past debounce + restart delay: any second restart would show up
     scinit.assert_running_for(QUIET);
-    assert_eq!(
-        scinit.started_pids().len(),
-        2,
-        "a burst within the debounce window must restart exactly once\n{}",
-        scinit.diagnostics()
-    );
+    scinit.assert_start_count(2, "a burst within the debounce window must restart exactly once");
 }
 
 /// A change made inside the debounce window that follows a restart must still
@@ -208,12 +177,7 @@ fn change_within_debounce_window_is_not_lost() {
     let dir = watched_dir(&b);
     let file = dir.join("app.conf");
     modify(&file, "v0");
-    let scinit = live_reload_with(b, &dir, 1000, 100)
-        .child(["run"])
-        .spawn()
-        .unwrap();
-
-    start_and_settle(&scinit);
+    let (scinit, _) = start_and_settle(live_reload_with(b, &dir, 1000, 100).child(["run"]));
     modify(&file, "v1");
     scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
     // Well inside the 1000ms window opened by the v1 change
@@ -230,9 +194,7 @@ fn writes_outside_debounce_window_each_restart() {
     let dir = watched_dir(&b);
     let file = dir.join("app.conf");
     modify(&file, "v0");
-    let scinit = live_reload(b, &dir).child(["run"]).spawn().unwrap();
-
-    start_and_settle(&scinit);
+    let (scinit, _) = start_and_settle(live_reload(b, &dir).child(["run"]));
     modify(&file, "v1");
     scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
     std::thread::sleep(SETTLE);
@@ -258,9 +220,7 @@ fn writes_outside_debounce_window_each_restart() {
 fn creating_file_does_not_restart() {
     let b = Scinit::builder();
     let dir = watched_dir(&b);
-    let mut scinit = live_reload(b, &dir).child(["run"]).spawn().unwrap();
-
-    start_and_settle(&scinit);
+    let (mut scinit, _) = start_and_settle(live_reload(b, &dir).child(["run"]));
     std::fs::File::create(dir.join("new.conf")).unwrap();
 
     assert_no_restart(&mut scinit, "creating a file");
@@ -275,9 +235,7 @@ fn deleting_file_does_not_restart() {
     modify(&file, "v1");
     // Let the creation event age out before the watcher starts
     std::thread::sleep(SETTLE);
-    let mut scinit = live_reload(b, &dir).child(["run"]).spawn().unwrap();
-
-    start_and_settle(&scinit);
+    let (mut scinit, _) = start_and_settle(live_reload(b, &dir).child(["run"]));
     std::fs::remove_file(&file).unwrap();
 
     assert_no_restart(&mut scinit, "deleting a file");
@@ -293,9 +251,7 @@ fn modifying_file_in_subdirectory_does_not_restart() {
     let file = sub.join("nested.conf");
     modify(&file, "v1");
     std::thread::sleep(SETTLE);
-    let mut scinit = live_reload(b, &dir).child(["run"]).spawn().unwrap();
-
-    start_and_settle(&scinit);
+    let (mut scinit, _) = start_and_settle(live_reload(b, &dir).child(["run"]));
     modify(&file, "v2");
 
     assert_no_restart(&mut scinit, "modifying a file in a subdirectory");
@@ -311,13 +267,8 @@ fn child_exit_is_not_restarted() {
         .run(TIMEOUT)
         .unwrap();
 
-    assert_eq!(
-        scinit.started_pids().len(),
-        1,
-        "an exited child must not be restarted\n{}",
-        scinit.diagnostics()
-    );
-    crate::integration::harness::assert_exit_code(&scinit, status, 3);
+    scinit.assert_start_count(1, "an exited child must not be restarted");
+    scinit.assert_exit_code(status, 3);
 }
 
 /// A child killed by a signal under live-reload is not restarted either
@@ -330,13 +281,8 @@ fn child_crash_is_not_restarted() {
         .run(TIMEOUT)
         .unwrap();
 
-    assert_eq!(
-        scinit.started_pids().len(),
-        1,
-        "a crashed child must not be restarted\n{}",
-        scinit.diagnostics()
-    );
-    crate::integration::harness::assert_exit_code(&scinit, status, 139);
+    scinit.assert_start_count(1, "a crashed child must not be restarted");
+    scinit.assert_exit_code(status, 139);
 }
 
 /// scinit still exits (without restarting) when its zombie reaper wins the
@@ -355,7 +301,7 @@ fn child_exit_with_fast_reaper_is_not_restarted_and_exits() {
             .child(["exit", "3"])
             .run(Duration::from_secs(3))
             .unwrap();
-        assert_eq!(scinit.started_pids().len(), 1, "{}", scinit.diagnostics());
+        scinit.assert_start_count(1, "an exited child must not be restarted");
     }
 }
 
@@ -368,14 +314,14 @@ fn restart_drops_no_connections() {
     use std::sync::Arc;
 
     let port = free_port();
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = loopback(port);
     let b = Scinit::builder();
     let dir = watched_dir(&b);
     let file = dir.join("app.conf");
     modify(&file, "v1");
     // A long restart delay widens the window with no child accepting
     let scinit = live_reload_with(b, &dir, 200, 500)
-        .args(["--ports", &port.to_string()])
+        .ports(&[port])
         .child(["listen"])
         .spawn()
         .unwrap();
@@ -420,26 +366,20 @@ fn restart_drops_no_connections() {
 #[test]
 fn listener_survives_restart() {
     let port = free_port();
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = loopback(port);
     let b = Scinit::builder();
     let dir = watched_dir(&b);
     let file = dir.join("app.conf");
     modify(&file, "v1");
     let scinit = live_reload(b, &dir)
-        .args(["--ports", &port.to_string()])
+        .ports(&[port])
         .child(["listen"])
         .spawn()
         .unwrap();
 
     scinit.wait_for_event("ready", TIMEOUT).unwrap();
     let old = scinit.child_pid().unwrap();
-    let reply = request(&addr).unwrap();
-    assert!(
-        reply.starts_with(&format!("pid={} ", old)),
-        "reply {:?} from pid {}",
-        reply,
-        old
-    );
+    scinit.assert_reply_from(&addr, old);
 
     std::thread::sleep(SETTLE);
     modify(&file, "v2");
@@ -447,14 +387,7 @@ fn listener_survives_restart() {
     let new = scinit.child_pid().unwrap();
     assert_ne!(old, new);
 
-    let reply = request(&addr).unwrap_or_else(|e| {
-        panic!(
-            "port {} unreachable after restart: {}\n{}",
-            port,
-            e,
-            scinit.diagnostics()
-        )
-    });
+    let reply = scinit.assert_reply_from(&addr, new);
     assert!(
         reply.starts_with(&format!("pid={} fd=3 ", new)),
         "after restart, reply {:?} should come from new pid {} on fd 3\n{}",
@@ -472,15 +405,11 @@ fn restart_is_prompt_with_default_reap_interval() {
     let file = dir.join("app.conf");
     modify(&file, "v1");
     // Default --zombie-reap-interval-ms (5000)
-    let scinit = b
-        .args(["--live-reload", "--watch-path"])
-        .args([&dir])
-        .args(["--debounce-ms", "200", "--restart-delay-ms", "100"])
-        .child(["run"])
-        .spawn()
-        .unwrap();
-
-    start_and_settle(&scinit);
+    let (scinit, _) = start_and_settle(
+        b.watch(&dir)
+            .args(["--debounce-ms", "200", "--restart-delay-ms", "100"])
+            .child(["run"]),
+    );
     let modified = Instant::now();
     modify(&file, "v2");
     scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
@@ -504,27 +433,21 @@ fn nonexistent_watch_path_exits_1() {
         .run(TIMEOUT)
         .unwrap();
 
-    crate::integration::harness::assert_exit_code(&scinit, status, 1);
-    assert!(
-        scinit.started_pids().is_empty(),
-        "no child should start when the watch fails\n{}",
-        scinit.diagnostics()
-    );
+    scinit.assert_exit_code(status, 1);
+    scinit.assert_start_count(0, "no child should start when the watch fails");
 }
 
 /// Without `--watch-path`, the watch path defaults to the command string. An
 /// absolute command path is therefore watchable and scinit runs normally.
 #[test]
 fn default_watch_path_is_absolute_command() {
-    let mut scinit = Scinit::builder()
+    let (mut scinit, _) = Scinit::builder()
         .args(["--live-reload", "--zombie-reap-interval-ms", "100"])
         .child(["run"])
-        .spawn()
-        .unwrap();
+        .start();
 
-    scinit.child_pid().unwrap();
     scinit.assert_running_for(Duration::from_secs(1));
-    assert_eq!(scinit.started_pids().len(), 1, "{}", scinit.diagnostics());
+    scinit.assert_start_count(1, "the child must keep running");
 }
 
 /// Current behaviour: without `--watch-path`, a bare command name (resolved via
@@ -549,6 +472,6 @@ fn default_watch_path_bare_command_exits_1() {
         .run(TIMEOUT)
         .unwrap();
 
-    crate::integration::harness::assert_exit_code(&scinit, status, 1);
-    assert!(scinit.started_pids().is_empty(), "{}", scinit.diagnostics());
+    scinit.assert_exit_code(status, 1);
+    scinit.assert_start_count(0, "a bare command can't be watched");
 }

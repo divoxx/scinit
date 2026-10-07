@@ -8,8 +8,8 @@ fn harness_smoke() {
     assert_eq!(started.len(), 1, "{}", scinit.diagnostics());
     assert_ne!(started[0].pid(), scinit.pid().as_raw());
     assert_eq!(
-        started[0].get("pgid"),
-        Some(started[0].pid().to_string().as_str()),
+        started[0].pgid(),
+        started[0].pid(),
         "child should lead its own process group"
     );
 }

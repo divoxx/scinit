@@ -1,58 +1,38 @@
 //! Signal handling: forwarding to the child's process group, termination and
 //! SIGKILL escalation, and the signal state the child inherits.
 
-use crate::integration::harness::{wait_for_pid_gone, Event, Scinit, TIMEOUT};
+use crate::integration::harness::{let_setup_writes_age, wait_for_pid_gone, Scinit, TIMEOUT};
 use nix::sys::signal::Signal;
 use std::time::{Duration, Instant};
 
 /// Generous upper bound for scinit to exit after a termination signal
 const EXIT_BOUND: Duration = Duration::from_secs(10);
 
-/// Start scinit with `scinit_args` and the fixture `run` subcommand, and wait
-/// for the child to come up
-fn start_run(scinit_args: &[&str], run_args: &[&str]) -> (Scinit, i32) {
-    let mut child = vec!["run"];
-    child.extend_from_slice(run_args);
-    let scinit = Scinit::builder()
-        .args(scinit_args.iter().copied())
-        .child(child)
-        .spawn()
-        .unwrap();
-    let pid = scinit.child_pid().unwrap();
-    (scinit, pid)
-}
-
-fn short(sig: Signal) -> &'static str {
-    sig.as_str().trim_start_matches("SIG")
-}
-
 /// A forwarded signal reaches a trapping child, and neither scinit nor the
 /// child goes away: a second signal is delivered too
 fn assert_forwarded_twice(sig: Signal) {
-    let (mut scinit, pid) = start_run(&[], &[]);
-    let name = short(sig);
+    let (mut scinit, pid) = Scinit::builder().child(["run"]).start();
 
     scinit.signal(sig).unwrap();
-    scinit.wait_for_signal(pid, name, TIMEOUT).unwrap();
+    scinit.wait_for_signal(pid, sig, TIMEOUT).unwrap();
     scinit.assert_running_for(Duration::from_millis(500));
 
     scinit.signal(sig).unwrap();
-    scinit.wait_for_signal_count(pid, name, 2, TIMEOUT).unwrap();
+    scinit.wait_for_signal_count(pid, sig, 2, TIMEOUT).unwrap();
     scinit.assert_running_for(Duration::from_millis(500));
     assert!(
         scinit.events_named("exit").is_empty(),
         "child exited after {}\n{}",
-        name,
+        sig,
         scinit.diagnostics()
     );
 }
 
 /// Send `count` signals spaced out, checking each one arrives before the next
 fn assert_repeated_delivery(scinit: &mut Scinit, pid: i32, sig: Signal, count: usize) {
-    let name = short(sig);
     for i in 1..=count {
         scinit.signal(sig).unwrap();
-        scinit.wait_for_signal_count(pid, name, i, TIMEOUT).unwrap();
+        scinit.wait_for_signal_count(pid, sig, i, TIMEOUT).unwrap();
         std::thread::sleep(Duration::from_millis(300));
     }
     scinit.assert_running_for(Duration::from_millis(300));
@@ -77,27 +57,23 @@ fn hup_forwarded_to_child() {
 /// child's group receives the signal too
 #[test]
 fn usr1_forwarded_to_grandchild_in_group() {
-    let (mut scinit, pid) = start_run(&[], &["--grandchild"]);
+    let (mut scinit, pid) = Scinit::builder().child(["run", "--grandchild"]).start();
     let grandchild = scinit
-        .wait_for("grandchild started", TIMEOUT, |evs| {
-            evs.iter()
-                .any(|e| e.name == "started" && e.get("role") == Some("grandchild"))
+        .wait_for_nth_match("grandchild started", 1, TIMEOUT, |e| {
+            e.is("started") && e.field_is("role", "grandchild")
         })
-        .unwrap()
-        .into_iter()
-        .find(|e| e.name == "started" && e.get("role") == Some("grandchild"))
         .unwrap();
     assert_eq!(
-        grandchild.get("pgid"),
-        Some(pid.to_string().as_str()),
+        grandchild.pgid(),
+        pid,
         "grandchild should share the child's process group"
     );
 
     scinit.signal(Signal::SIGUSR1).unwrap();
     scinit
-        .wait_for_signal(grandchild.pid(), "USR1", TIMEOUT)
+        .wait_for_signal(grandchild.pid(), Signal::SIGUSR1, TIMEOUT)
         .unwrap();
-    scinit.wait_for_signal(pid, "USR1", TIMEOUT).unwrap();
+    scinit.wait_for_signal(pid, Signal::SIGUSR1, TIMEOUT).unwrap();
     scinit.assert_running_for(Duration::from_millis(300));
 }
 
@@ -105,7 +81,7 @@ fn usr1_forwarded_to_grandchild_in_group() {
 /// fired (the tick cancels the pending sigwait branch of select!)
 #[test]
 fn repeated_usr1_after_reap_tick() {
-    let (mut scinit, pid) = start_run(&[], &[]);
+    let (mut scinit, pid) = Scinit::builder().child(["run"]).start();
     std::thread::sleep(Duration::from_millis(5500));
     assert_repeated_delivery(&mut scinit, pid, Signal::SIGUSR1, 5);
 }
@@ -114,7 +90,10 @@ fn repeated_usr1_after_reap_tick() {
 /// signal must still arrive
 #[test]
 fn repeated_usr1_with_short_reap_interval() {
-    let (mut scinit, pid) = start_run(&["--zombie-reap-interval-ms", "200"], &[]);
+    let (mut scinit, pid) = Scinit::builder()
+        .args(["--zombie-reap-interval-ms", "200"])
+        .child(["run"])
+        .start();
     std::thread::sleep(Duration::from_millis(1500));
     assert_repeated_delivery(&mut scinit, pid, Signal::SIGUSR1, 5);
 }
@@ -126,16 +105,8 @@ fn repeated_usr1_with_live_reload() {
     let builder = Scinit::builder();
     let watched = builder.dir().join("watched.txt");
     std::fs::write(&watched, "v1").unwrap();
-    // FSEvents can report a write made just before the watcher starts as a
-    // change, causing a spurious restart; let it age first
-    std::thread::sleep(Duration::from_secs(1));
-    let mut scinit = builder
-        .args(["--live-reload", "--watch-path"])
-        .args([&watched])
-        .child(["run"])
-        .spawn()
-        .unwrap();
-    let pid = scinit.child_pid().unwrap();
+    let_setup_writes_age();
+    let (mut scinit, pid) = builder.watch(&watched).child(["run"]).start();
     std::thread::sleep(Duration::from_millis(5500));
     assert_repeated_delivery(&mut scinit, pid, Signal::SIGUSR1, 5);
     assert_eq!(
@@ -152,10 +123,10 @@ fn repeated_usr1_with_live_reload() {
 /// (it relies on tokio's SIGCHLD handler, so scinit must not consume SIGCHLD).
 #[test]
 fn sigterm_forwarded_then_scinit_exits() {
-    let (mut scinit, pid) = start_run(&[], &[]);
+    let (mut scinit, pid) = Scinit::builder().child(["run"]).start();
     let start = Instant::now();
     scinit.signal(Signal::SIGTERM).unwrap();
-    scinit.wait_for_signal(pid, "TERM", TIMEOUT).unwrap();
+    scinit.wait_for_signal(pid, Signal::SIGTERM, TIMEOUT).unwrap();
     let status = scinit.wait_exit(EXIT_BOUND).unwrap();
     assert!(
         start.elapsed() < Duration::from_secs(3),
@@ -174,7 +145,10 @@ fn sigterm_forwarded_then_scinit_exits() {
 /// --graceful-timeout-secs expires, not before. The 3s timeout is longer than
 /// the fixed 2s SIGINT/SIGQUIT delay scinit used to apply.
 fn assert_escalates_to_sigkill(sig: Signal) {
-    let (mut scinit, pid) = start_run(&["--graceful-timeout-secs", "3"], &["--ignore", short(sig)]);
+    let (mut scinit, pid) = Scinit::builder()
+        .args(["--graceful-timeout-secs", "3"])
+        .child(["run", "--ignore", sig.as_str()])
+        .start();
     let start = Instant::now();
     scinit.signal(sig).unwrap();
     scinit.wait_exit(EXIT_BOUND).unwrap();
@@ -211,9 +185,9 @@ fn sigquit_escalates_to_sigkill() {
 }
 
 fn assert_termination_forwarded(sig: Signal) {
-    let (mut scinit, pid) = start_run(&[], &[]);
+    let (mut scinit, pid) = Scinit::builder().child(["run"]).start();
     scinit.signal(sig).unwrap();
-    scinit.wait_for_signal(pid, short(sig), TIMEOUT).unwrap();
+    scinit.wait_for_signal(pid, sig, TIMEOUT).unwrap();
     scinit.wait_exit(EXIT_BOUND).unwrap();
     assert!(wait_for_pid_gone(pid, Duration::from_secs(3)), "child {} still alive", pid);
 }
@@ -231,16 +205,16 @@ fn sigquit_forwarded_then_scinit_exits() {
 /// When the child exits promptly on SIGINT/SIGQUIT, scinit should not wait
 /// out a fixed delay
 fn assert_prompt_exit(sig: Signal) {
-    let (mut scinit, pid) = start_run(&[], &[]);
+    let (mut scinit, pid) = Scinit::builder().child(["run"]).start();
     let start = Instant::now();
     scinit.signal(sig).unwrap();
-    scinit.wait_for_signal(pid, short(sig), TIMEOUT).unwrap();
+    scinit.wait_for_signal(pid, sig, TIMEOUT).unwrap();
     scinit.wait_exit(EXIT_BOUND).unwrap();
     assert!(
         start.elapsed() < Duration::from_millis(1500),
         "scinit took {:?} to exit after {} though the child exited at once",
         start.elapsed(),
-        short(sig)
+        sig
     );
 }
 
@@ -255,23 +229,15 @@ fn sigquit_exits_promptly_when_child_exits() {
     assert_prompt_exit(Signal::SIGQUIT);
 }
 
-fn dump_events() -> (Scinit, Vec<Event>) {
-    let scinit = Scinit::builder().child(["dump"]).spawn().unwrap();
-    let events = scinit
-        .wait_for("dump-done", TIMEOUT, |evs| evs.iter().any(|e| e.name == "dump-done"))
-        .unwrap();
-    (scinit, events)
-}
-
 /// scinit ignores TTIN/TTOU and the ignored disposition survives exec
 /// (current intended behaviour for container use)
 #[test]
 fn child_inherits_ignored_ttin_ttou() {
-    let (scinit, events) = dump_events();
+    let (scinit, events) = Scinit::builder().spawn_dump(&[]);
     for sig in ["TTIN", "TTOU"] {
         let disp = events
             .iter()
-            .find(|e| e.name == "sigdisp" && e.get("sig") == Some(sig))
+            .find(|e| e.is("sigdisp") && e.field_is("sig", sig))
             .unwrap_or_else(|| panic!("no sigdisp for {}\n{}", sig, scinit.diagnostics()));
         assert_eq!(disp.get("ignored"), Some("true"), "{}\n{}", sig, scinit.diagnostics());
     }
@@ -281,10 +247,10 @@ fn child_inherits_ignored_ttin_ttou() {
 /// signal mask
 #[test]
 fn child_signal_mask_is_empty() {
-    let (scinit, events) = dump_events();
+    let (scinit, events) = Scinit::builder().spawn_dump(&[]);
     let mask = events
         .iter()
-        .find(|e| e.name == "sigmask")
+        .find(|e| e.is("sigmask"))
         .unwrap_or_else(|| panic!("no sigmask event\n{}", scinit.diagnostics()));
     assert_eq!(mask.get("blocked"), Some(""), "{}", scinit.diagnostics());
 }

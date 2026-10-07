@@ -1,6 +1,6 @@
 //! Command-line parsing and argument passthrough
 
-use crate::integration::harness::{assert_exit_code, Scinit, SCINIT, TEST_CHILD, TIMEOUT};
+use crate::integration::harness::{Scinit, SCINIT, TEST_CHILD, TIMEOUT};
 use std::process::{Command, Output};
 use std::time::Duration;
 
@@ -53,12 +53,8 @@ fn invalid_bind_addr_exits_one() {
         .child(["exit", "0"])
         .run(TIMEOUT)
         .unwrap();
-    assert_exit_code(&scinit, status, 1);
-    assert!(
-        scinit.events_named("started").is_empty(),
-        "child must not start with an invalid config\n{}",
-        scinit.diagnostics()
-    );
+    scinit.assert_exit_code(status, 1);
+    scinit.assert_start_count(0, "child must not start with an invalid config");
     assert!(
         scinit.stderr().contains("Invalid bind address"),
         "{}",
@@ -82,7 +78,7 @@ fn trailing_and_hyphenated_args_reach_child() {
     ];
     let (scinit, status) = Scinit::builder().child(child_args).run(TIMEOUT).unwrap();
     assert!(status.success(), "{:?}\n{}", status, scinit.diagnostics());
-    scinit.wait_for_event("dump-done", TIMEOUT).unwrap();
+    scinit.wait_for_dump();
 
     let argv: Vec<String> = scinit
         .events_named("arg")
@@ -100,14 +96,12 @@ fn trailing_and_hyphenated_args_reach_child() {
 fn watch_path_without_live_reload_is_ignored() {
     let builder = Scinit::builder();
     let missing = builder.dir().join("does-not-exist");
-    let mut scinit = builder
+    let (mut scinit, _) = builder
         .args(["--watch-path".into(), missing.into_os_string()])
         .child(["run"])
-        .spawn()
-        .unwrap();
-    scinit.child_pid().unwrap();
+        .start();
     scinit.assert_running_for(Duration::from_millis(1000));
-    assert_eq!(scinit.started_pids().len(), 1, "{}", scinit.diagnostics());
+    scinit.assert_start_count(1, "--watch-path alone must not restart the child");
 }
 
 /// A command that cannot be executed makes scinit exit 1
@@ -117,5 +111,5 @@ fn nonexistent_command_exits_one() {
         .command(["/nonexistent/scinit-no-such-binary"])
         .run(TIMEOUT)
         .unwrap();
-    assert_exit_code(&scinit, status, 1);
+    scinit.assert_exit_code(status, 1);
 }

@@ -12,6 +12,7 @@ use std::io::Read;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -23,7 +24,23 @@ pub const TEST_CHILD: &str = env!("CARGO_BIN_EXE_scinit-test-child");
 /// Default timeout for waiting on events; generous to tolerate loaded CI hosts
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// How often the polling helpers check again
+pub const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Call `f` every `POLL_INTERVAL` until it returns `Some`, giving up with
+/// `None` once `timeout` has passed
+pub fn poll_until<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(value) = f() {
+            return Some(value);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
 
 /// One line from the child's report file: `<name> key=value ...`
 #[derive(Debug, Clone)]
@@ -33,7 +50,7 @@ pub struct Event {
 }
 
 impl Event {
-    fn parse(line: &str) -> Option<Self> {
+    pub(crate) fn parse(line: &str) -> Option<Self> {
         let mut rest = line.trim_end();
         let (name, tail) = rest.split_once(' ').unwrap_or((rest, ""));
         let name = name.to_string();
@@ -57,6 +74,10 @@ impl Event {
         }
     }
 
+    pub fn is(&self, name: &str) -> bool {
+        self.name == name
+    }
+
     pub fn get(&self, key: &str) -> Option<&str> {
         self.fields
             .iter()
@@ -64,11 +85,41 @@ impl Event {
             .map(|(_, v)| v.as_str())
     }
 
-    pub fn pid(&self) -> i32 {
-        self.get("pid")
-            .and_then(|p| p.parse().ok())
-            .expect("event has no pid")
+    pub fn field_is(&self, key: &str, value: &str) -> bool {
+        self.get(key) == Some(value)
     }
+
+    /// Field `key` parsed as a `T`; `None` if missing or unparseable
+    pub fn parse_field<T: FromStr>(&self, key: &str) -> Option<T> {
+        self.get(key)?.parse().ok()
+    }
+
+    pub fn pid(&self) -> i32 {
+        self.parse_field("pid").expect("event has no pid")
+    }
+
+    pub fn pgid(&self) -> i32 {
+        self.parse_field("pgid").expect("event has no pgid")
+    }
+}
+
+/// Every event in the report file at `path` (none if it doesn't exist yet)
+pub(crate) fn read_events(path: &Path) -> Vec<Event> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(Event::parse)
+        .collect()
+}
+
+/// Report file, stdout and stderr, for assertion messages
+pub(crate) fn format_diagnostics(report: &Path, stdout: &str, stderr: &str) -> String {
+    format!(
+        "--- report ---\n{}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        std::fs::read_to_string(report).unwrap_or_default(),
+        stdout,
+        stderr
+    )
 }
 
 /// Builder for a scinit invocation
@@ -95,6 +146,22 @@ impl ScinitBuilder {
     {
         self.scinit_args.extend(args.into_iter().map(Into::into));
         self
+    }
+
+    /// `--ports` with the given ports, in order
+    pub fn ports(self, ports: &[u16]) -> Self {
+        let list = ports
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.args(["--ports", &list])
+    }
+
+    /// `--live-reload --watch-path <path>`. Call `let_setup_writes_age` first
+    /// if the test just wrote files there.
+    pub fn watch(self, path: &Path) -> Self {
+        self.args(["--live-reload", "--watch-path"]).args([path])
     }
 
     /// Run the test-child fixture with the given subcommand and args
@@ -165,6 +232,22 @@ impl ScinitBuilder {
         })
     }
 
+    /// Spawn and wait for the child to start; returns scinit and the child's pid
+    pub fn start(self) -> (Scinit, i32) {
+        let scinit = self.spawn().unwrap();
+        let pid = scinit.child_pid().unwrap();
+        (scinit, pid)
+    }
+
+    /// Spawn the fixture's `dump` subcommand with `args` and wait for its dump
+    pub fn spawn_dump(self, args: &[&str]) -> (Scinit, Vec<Event>) {
+        let mut child = vec!["dump"];
+        child.extend_from_slice(args);
+        let scinit = self.child(child).spawn().unwrap();
+        let events = scinit.wait_for_dump();
+        (scinit, events)
+    }
+
     /// Spawn, wait for exit and return the status (for short-lived invocations)
     pub fn run(self, timeout: Duration) -> Result<(Scinit, ExitStatus)> {
         let mut scinit = self.spawn()?;
@@ -179,7 +262,14 @@ fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn drain(mut src: impl Read + Send + 'static, dst: Arc<Mutex<String>>) -> JoinHandle<()> {
+/// FSEvents (macOS) can report writes made just before the watcher starts as
+/// fresh changes. Call right before spawning, after the test set up its files.
+pub fn let_setup_writes_age() {
+    std::thread::sleep(Duration::from_secs(1));
+}
+
+/// Copy everything read from `src` into `dst` on a background thread
+pub(crate) fn drain(mut src: impl Read + Send + 'static, dst: Arc<Mutex<String>>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -231,15 +321,11 @@ impl Scinit {
 
     /// All events reported so far
     pub fn events(&self) -> Vec<Event> {
-        std::fs::read_to_string(&self.report)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(Event::parse)
-            .collect()
+        read_events(&self.report)
     }
 
     pub fn events_named(&self, name: &str) -> Vec<Event> {
-        self.events().into_iter().filter(|e| e.name == name).collect()
+        self.events().into_iter().filter(|e| e.is(name)).collect()
     }
 
     /// Poll the report until `pred` holds, returning the events at that point
@@ -247,35 +333,40 @@ impl Scinit {
     where
         F: Fn(&[Event]) -> bool,
     {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let events = self.events();
-            if pred(&events) {
-                return Ok(events);
-            }
-            if Instant::now() >= deadline {
-                bail!(
-                    "timed out after {:?} waiting for {}\nevents: {:#?}\n{}",
-                    timeout,
-                    desc,
-                    events,
-                    self.diagnostics()
-                );
-            }
-            std::thread::sleep(POLL_INTERVAL);
+        if let Some(events) = poll_until(timeout, || Some(self.events()).filter(|evs| pred(evs))) {
+            return Ok(events);
         }
+        bail!(
+            "timed out after {:?} waiting for {}\nevents: {:#?}\n{}",
+            timeout,
+            desc,
+            self.events(),
+            self.diagnostics()
+        )
+    }
+
+    /// Wait until at least `n` events match `pred`; return the `n`th
+    pub fn wait_for_nth_match<F>(&self, desc: &str, n: usize, timeout: Duration, pred: F) -> Result<Event>
+    where
+        F: Fn(&Event) -> bool,
+    {
+        let events = self.wait_for(desc, timeout, |evs| evs.iter().filter(|e| pred(e)).count() >= n)?;
+        Ok(events.into_iter().filter(|e| pred(e)).nth(n - 1).unwrap())
     }
 
     /// Wait until at least `count` events named `name` exist; return the last
     pub fn wait_for_nth(&self, name: &str, count: usize, timeout: Duration) -> Result<Event> {
-        let events = self.wait_for(&format!("{} x{}", name, count), timeout, |evs| {
-            evs.iter().filter(|e| e.name == name).count() >= count
-        })?;
-        Ok(events.into_iter().filter(|e| e.name == name).nth(count - 1).unwrap())
+        self.wait_for_nth_match(&format!("{} x{}", name, count), count, timeout, |e| e.is(name))
     }
 
     pub fn wait_for_event(&self, name: &str, timeout: Duration) -> Result<Event> {
         self.wait_for_nth(name, 1, timeout)
+    }
+
+    /// Wait for the `dump` child to finish reporting; return the events
+    pub fn wait_for_dump(&self) -> Vec<Event> {
+        self.wait_for("dump-done", TIMEOUT, |evs| evs.iter().any(|e| e.is("dump-done")))
+            .unwrap()
     }
 
     /// Wait for the child to report `started` and return its pid
@@ -283,7 +374,7 @@ impl Scinit {
         let events = self.wait_for("child started", TIMEOUT, |evs| {
             evs.iter().any(is_child_started)
         })?;
-        Ok(events.iter().filter(|e| is_child_started(e)).last().unwrap().pid())
+        Ok(events.iter().rfind(|e| is_child_started(e)).unwrap().pid())
     }
 
     /// Pids of every `started` event from the direct child, in order
@@ -295,12 +386,64 @@ impl Scinit {
             .collect()
     }
 
-    /// Wait for the child (or whoever reported) to log a received signal
-    pub fn wait_for_signal(&self, pid: i32, sig: &str, timeout: Duration) -> Result<Event> {
-        let events = self.wait_for(&format!("pid {} to receive {}", pid, sig), timeout, |evs| {
-            evs.iter().any(|e| is_signal(e, pid, sig))
-        })?;
-        Ok(events.into_iter().find(|e| is_signal(e, pid, sig)).unwrap())
+    /// Assert the direct child has started exactly `n` times
+    pub fn assert_start_count(&self, n: usize, what: &str) {
+        let pids = self.started_pids();
+        assert_eq!(
+            pids.len(),
+            n,
+            "{}: expected {} child start(s), got {:?}\n{}",
+            what,
+            n,
+            pids,
+            self.diagnostics()
+        );
+    }
+
+    /// Wait for `pid` to log a received `sig`
+    pub fn wait_for_signal(&self, pid: i32, sig: Signal, timeout: Duration) -> Result<Event> {
+        self.wait_for_nth_match(&format!("pid {} to receive {}", pid, sig), 1, timeout, |e| {
+            is_signal(e, pid, sig)
+        })
+    }
+
+    /// Wait until `pid` has logged `sig` at least `count` times
+    pub fn wait_for_signal_count(&self, pid: i32, sig: Signal, count: usize, timeout: Duration) -> Result<()> {
+        self.wait_for_nth_match(
+            &format!("pid {} to receive {} x{}", pid, sig, count),
+            count,
+            timeout,
+            |e| is_signal(e, pid, sig),
+        )
+        .map(|_| ())
+    }
+
+    /// `(fd, port)` of every listener the `listen` child reported
+    pub fn listeners(&self) -> Vec<(i32, u16)> {
+        self.events_named("listening")
+            .iter()
+            .map(|e| {
+                (
+                    e.parse_field("fd").expect("listening event has no fd"),
+                    e.parse_field("port").expect("listening event has no port"),
+                )
+            })
+            .collect()
+    }
+
+    /// Request `addr` and assert the `listen` child `pid` answered; returns the reply
+    pub fn assert_reply_from(&self, addr: &str, pid: i32) -> String {
+        let reply = request(addr)
+            .unwrap_or_else(|e| panic!("request to {} failed: {}\n{}", addr, e, self.diagnostics()));
+        assert!(
+            reply.starts_with(&format!("pid={} ", pid)),
+            "reply {:?} from {} did not come from child {}\n{}",
+            reply,
+            addr,
+            pid,
+            self.diagnostics()
+        );
+        reply
     }
 
     pub fn signal(&self, sig: Signal) -> Result<()> {
@@ -337,34 +480,41 @@ impl Scinit {
     }
 
     pub fn wait_exit(&mut self, timeout: Duration) -> Result<ExitStatus> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(status) = self.exit {
-                return Ok(status);
-            }
-            if let Some(status) = self.child.try_wait()? {
-                self.exit = Some(status);
-                self.join_readers();
-                return Ok(status);
-            }
-            if Instant::now() >= deadline {
-                return Err(anyhow!(
-                    "scinit did not exit within {:?}\n{}",
-                    timeout,
-                    self.diagnostics()
-                ));
-            }
-            std::thread::sleep(POLL_INTERVAL);
+        if let Some(status) = self.exit {
+            return Ok(status);
         }
+        let status = poll_until(timeout, || self.child.try_wait().transpose()).transpose()?;
+        let Some(status) = status else {
+            return Err(anyhow!(
+                "scinit did not exit within {:?}\n{}",
+                timeout,
+                self.diagnostics()
+            ));
+        };
+        self.exit = Some(status);
+        self.join_readers();
+        Ok(status)
+    }
+
+    /// Assert scinit exited with the given code
+    pub fn assert_exit_code(&self, status: ExitStatus, code: i32) {
+        assert_eq!(
+            status.code(),
+            Some(code),
+            "expected exit code {}, got {:?} (signal {:?})\n{}",
+            code,
+            status.code(),
+            status.signal(),
+            self.diagnostics()
+        );
     }
 
     /// Let the output readers drain so diagnostics are complete. Bounded: an
     /// orphaned child still holding the pipes would otherwise block forever
     fn join_readers(&mut self) {
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < deadline && !self.readers.iter().all(|r| r.is_finished()) {
-            std::thread::sleep(POLL_INTERVAL);
-        }
+        poll_until(Duration::from_millis(500), || {
+            self.readers.iter().all(|r| r.is_finished()).then_some(())
+        });
         for reader in self.readers.drain(..) {
             if reader.is_finished() {
                 let _ = reader.join();
@@ -372,31 +522,18 @@ impl Scinit {
         }
     }
 
-    /// Wait until `pid` has logged `sig` at least `count` times
-    pub fn wait_for_signal_count(&self, pid: i32, sig: &str, count: usize, timeout: Duration) -> Result<()> {
-        self.wait_for(&format!("pid {} to receive {} x{}", pid, sig, count), timeout, |evs| {
-            evs.iter().filter(|e| is_signal(e, pid, sig)).count() >= count
-        })
-        .map(|_| ())
-    }
-
     /// Report file, stdout and stderr, for assertion messages
     pub fn diagnostics(&self) -> String {
-        format!(
-            "--- report ---\n{}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            std::fs::read_to_string(&self.report).unwrap_or_default(),
-            self.stdout(),
-            self.stderr()
-        )
+        format_diagnostics(&self.report, &self.stdout(), &self.stderr())
     }
 }
 
-fn is_signal(e: &Event, pid: i32, sig: &str) -> bool {
-    e.name == "signal" && e.pid() == pid && e.get("sig") == Some(sig)
+fn is_signal(e: &Event, pid: i32, sig: Signal) -> bool {
+    e.is("signal") && e.pid() == pid && e.field_is("sig", sig.as_str().trim_start_matches("SIG"))
 }
 
 fn is_child_started(e: &Event) -> bool {
-    e.name == "started" && e.get("role") == Some("child")
+    e.is("started") && e.field_is("role", "child")
 }
 
 impl Drop for Scinit {
@@ -411,10 +548,9 @@ impl Drop for Scinit {
         }
         let mut groups: Vec<i32> = if running { child_pids(self.pid) } else { Vec::new() };
         groups.extend(
-            self.events()
+            self.events_named("started")
                 .iter()
-                .filter(|e| e.name == "started")
-                .filter_map(|e| e.get("pgid").and_then(|p| p.parse::<i32>().ok())),
+                .filter_map(|e| e.parse_field::<i32>("pgid")),
         );
         for pgid in groups {
             let _ = kill(Pid::from_raw(-pgid), Signal::SIGKILL);
@@ -441,19 +577,6 @@ fn child_pids(pid: Pid) -> Vec<i32> {
         .unwrap_or_default()
 }
 
-/// Assert scinit exited with the given code
-pub fn assert_exit_code(scinit: &Scinit, status: ExitStatus, code: i32) {
-    assert_eq!(
-        status.code(),
-        Some(code),
-        "expected exit code {}, got {:?} (signal {:?})\n{}",
-        code,
-        status.code(),
-        status.signal(),
-        scinit.diagnostics()
-    );
-}
-
 /// Ask the OS for a free TCP port on 127.0.0.1
 pub fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -474,18 +597,23 @@ pub fn free_ports(n: usize) -> Vec<u16> {
     ports
 }
 
+/// `127.0.0.1:<port>`
+pub fn loopback(port: u16) -> String {
+    format!("127.0.0.1:{}", port)
+}
+
 /// Value of a `dump` `env` event for `key`, if the child saw it
 pub fn env_value(events: &[Event], key: &str) -> Option<String> {
     events
         .iter()
-        .find(|e| e.name == "env" && e.get("key") == Some(key))
+        .find(|e| e.is("env") && e.field_is("key", key))
         .and_then(|e| e.get("value"))
         .map(str::to_string)
 }
 
 /// The child's socket fds from the `dump` `fds` event
 pub fn socket_fds(events: &[Event]) -> Vec<i32> {
-    let fds = events.iter().find(|e| e.name == "fds").expect("no fds event");
+    let fds = events.iter().find(|e| e.is("fds")).expect("no fds event");
     fds.get("sockets")
         .unwrap_or("")
         .split(',')
@@ -496,16 +624,10 @@ pub fn socket_fds(events: &[Event]) -> Vec<i32> {
 
 /// Poll until `pid` no longer exists
 pub fn wait_for_pid_gone(pid: i32, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if kill(Pid::from_raw(pid), None) == Err(nix::errno::Errno::ESRCH) {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(POLL_INTERVAL);
-    }
+    poll_until(timeout, || {
+        (kill(Pid::from_raw(pid), None) == Err(nix::errno::Errno::ESRCH)).then_some(())
+    })
+    .is_some()
 }
 
 /// Connect and return the trimmed reply line

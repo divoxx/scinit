@@ -2,34 +2,12 @@
 //! passes them via the systemd protocol (`LISTEN_FDS`, `LISTEN_PID`, fds 3..).
 
 use crate::integration::harness::{
-    assert_exit_code, env_value, free_ports, request, socket_fds, Event, Scinit, TIMEOUT,
+    env_value, free_ports, loopback, socket_fds, Event, Scinit, TIMEOUT,
 };
 use std::net::TcpListener;
 
-/// Comma-separated `--ports` value
-fn ports_arg(ports: &[u16]) -> String {
-    ports
-        .iter()
-        .map(|p| p.to_string())
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// Start scinit with `--ports` and a `dump` child; wait for the dump to finish
-fn dump_with_ports(ports: &[u16]) -> (Scinit, Vec<Event>) {
-    let scinit = Scinit::builder()
-        .args(["--ports", &ports_arg(ports)])
-        .child(["dump"])
-        .spawn()
-        .unwrap();
-    let events = scinit
-        .wait_for("dump-done", TIMEOUT, |evs| evs.iter().any(|e| e.name == "dump-done"))
-        .unwrap();
-    (scinit, events)
-}
-
 fn listen_fds_matches_port_count(n: usize) {
-    let (scinit, events) = dump_with_ports(&free_ports(n));
+    let (scinit, events) = Scinit::builder().ports(&free_ports(n)).spawn_dump(&[]);
     assert_eq!(
         env_value(&events, "LISTEN_FDS"),
         Some(n.to_string()),
@@ -53,7 +31,7 @@ fn listen_fds_three_ports() {
 /// `LISTEN_PID` must be the child's own pid, or sd_listen_fds() ignores the fds
 #[test]
 fn listen_pid_is_child_pid() {
-    let (scinit, events) = dump_with_ports(&free_ports(1));
+    let (scinit, events) = Scinit::builder().ports(&free_ports(1)).spawn_dump(&[]);
     let pid = scinit.child_pid().unwrap();
     assert_eq!(
         env_value(&events, "LISTEN_PID"),
@@ -67,7 +45,7 @@ fn listen_pid_is_child_pid() {
 #[test]
 fn inherited_fds_start_at_3_and_are_contiguous() {
     let n = 3;
-    let (scinit, events) = dump_with_ports(&free_ports(n));
+    let (scinit, events) = Scinit::builder().ports(&free_ports(n)).spawn_dump(&[]);
     let expected: Vec<i32> = (3..3 + n as i32).collect();
     assert_eq!(socket_fds(&events), expected, "{}", scinit.diagnostics());
 }
@@ -79,18 +57,16 @@ fn fds_follow_ports_order() {
     // Descending, so port order can't be mistaken for sorted order
     ports.sort_unstable_by(|a, b| b.cmp(a));
     let scinit = Scinit::builder()
-        .args(["--ports", &ports_arg(&ports)])
+        .ports(&ports)
         .child(["listen"])
         .spawn()
         .unwrap();
     scinit.wait_for_event("ready", TIMEOUT).unwrap();
+    let listeners = scinit.listeners();
     for (i, port) in ports.iter().enumerate() {
-        let fd = 3 + i;
+        let fd = 3 + i as i32;
         assert!(
-            scinit.events_named("listening").iter().any(|e| {
-                e.get("fd") == Some(fd.to_string().as_str())
-                    && e.get("port") == Some(port.to_string().as_str())
-            }),
+            listeners.contains(&(fd, *port)),
             "expected fd {} to be port {}\n{}",
             fd,
             port,
@@ -103,18 +79,12 @@ fn fds_follow_ports_order() {
 /// someone else's sockets and are replaced, not passed through
 #[test]
 fn inherited_listen_vars_replaced_with_ports() {
-    let ports = free_ports(1);
-    let scinit = Scinit::builder()
+    let (scinit, events) = Scinit::builder()
         .env("LISTEN_FDS", "7")
         .env("LISTEN_PID", "1")
         .env("LISTEN_FDNAMES", "stale")
-        .args(["--ports", &ports_arg(&ports)])
-        .child(["dump"])
-        .spawn()
-        .unwrap();
-    let events = scinit
-        .wait_for("dump-done", TIMEOUT, |evs| evs.iter().any(|e| e.name == "dump-done"))
-        .unwrap();
+        .ports(&free_ports(1))
+        .spawn_dump(&[]);
     let pid = scinit.child_pid().unwrap();
     assert_eq!(env_value(&events, "LISTEN_FDS"), Some("1".to_string()));
     assert_eq!(env_value(&events, "LISTEN_PID"), Some(pid.to_string()));
@@ -125,13 +95,12 @@ fn inherited_listen_vars_replaced_with_ports() {
 /// pid in LISTEN_PID (checked here by a shell against `$$`)
 #[test]
 fn listen_pid_matches_shell_pid_via_path_lookup() {
-    let ports = free_ports(1);
     let (scinit, status) = Scinit::builder()
-        .args(["--ports", &ports_arg(&ports)])
+        .ports(&free_ports(1))
         .command(["sh", "-c", "echo \"listen_pid=$LISTEN_PID self=$$\""])
         .run(TIMEOUT)
         .unwrap();
-    assert_exit_code(&scinit, status, 0);
+    scinit.assert_exit_code(status, 0);
     let stdout = scinit.stdout();
     let line = stdout
         .lines()
@@ -146,18 +115,14 @@ fn listen_pid_matches_shell_pid_via_path_lookup() {
 fn listen_child_answers_on_every_port() {
     let ports = free_ports(3);
     let scinit = Scinit::builder()
-        .args(["--ports", &ports_arg(&ports)])
+        .ports(&ports)
         .child(["listen"])
         .spawn()
         .unwrap();
     scinit.wait_for_event("ready", TIMEOUT).unwrap();
     let pid = scinit.child_pid().unwrap();
 
-    let listening: Vec<u16> = scinit
-        .events_named("listening")
-        .iter()
-        .map(|e| e.get("port").unwrap().parse().unwrap())
-        .collect();
+    let listening: Vec<u16> = scinit.listeners().iter().map(|(_, port)| *port).collect();
     for port in &ports {
         assert!(
             listening.contains(port),
@@ -165,16 +130,7 @@ fn listen_child_answers_on_every_port() {
             port,
             scinit.diagnostics()
         );
-        let reply = request(&format!("127.0.0.1:{}", port))
-            .unwrap_or_else(|e| panic!("request to {} failed: {}\n{}", port, e, scinit.diagnostics()));
-        assert!(
-            reply.starts_with(&format!("pid={} ", pid)),
-            "reply {:?} on port {} did not come from child {}\n{}",
-            reply,
-            port,
-            pid,
-            scinit.diagnostics()
-        );
+        let reply = scinit.assert_reply_from(&loopback(*port), pid);
         assert!(reply.ends_with(&format!("port={}", port)), "reply {:?}", reply);
     }
 }
@@ -191,21 +147,14 @@ fn ipv6_bind_addr() {
         }
     };
     let scinit = Scinit::builder()
-        .args(["--bind-addr", "::1", "--ports", &port.to_string()])
+        .args(["--bind-addr", "::1"])
+        .ports(&[port])
         .child(["listen"])
         .spawn()
         .unwrap();
     scinit.wait_for_event("ready", TIMEOUT).unwrap();
     let pid = scinit.child_pid().unwrap();
-    let reply = request(&format!("[::1]:{}", port))
-        .unwrap_or_else(|e| panic!("request failed: {}\n{}", e, scinit.diagnostics()));
-    assert!(
-        reply.starts_with(&format!("pid={} ", pid)),
-        "reply {:?} did not come from child {}\n{}",
-        reply,
-        pid,
-        scinit.diagnostics()
-    );
+    scinit.assert_reply_from(&format!("[::1]:{}", port), pid);
 }
 
 /// Without `--ports`, a `LISTEN_FDS` already in scinit's environment reaches
@@ -217,14 +166,9 @@ fn ipv6_bind_addr() {
 /// to assert `None` and rename it `inherited_listen_fds_stripped_without_ports`.
 #[test]
 fn inherited_listen_fds_leaks_without_ports() {
-    let scinit = Scinit::builder()
+    let (scinit, events) = Scinit::builder()
         .env("LISTEN_FDS", "7")
-        .child(["dump", "--then-exit"])
-        .spawn()
-        .unwrap();
-    let events = scinit
-        .wait_for("dump-done", TIMEOUT, |evs| evs.iter().any(|e| e.name == "dump-done"))
-        .unwrap();
+        .spawn_dump(&["--then-exit"]);
     assert_eq!(
         env_value(&events, "LISTEN_FDS").as_deref(),
         Some("7"),
@@ -236,16 +180,10 @@ fn inherited_listen_fds_leaks_without_ports() {
 /// Without `--ports`, scinit sets no `LISTEN_*` variables
 #[test]
 fn no_ports_no_listen_vars() {
-    let scinit = Scinit::builder()
-        .child(["dump", "--then-exit"])
-        .spawn()
-        .unwrap();
-    let events = scinit
-        .wait_for("dump-done", TIMEOUT, |evs| evs.iter().any(|e| e.name == "dump-done"))
-        .unwrap();
+    let (scinit, events) = Scinit::builder().spawn_dump(&["--then-exit"]);
     let listen: Vec<&Event> = events
         .iter()
-        .filter(|e| e.name == "env" && e.get("key").is_some_and(|k| k.starts_with("LISTEN_")))
+        .filter(|e| e.is("env") && e.get("key").is_some_and(|k| k.starts_with("LISTEN_")))
         .collect();
     assert!(listen.is_empty(), "unexpected LISTEN_* vars: {:?}", listen);
     assert!(socket_fds(&events).is_empty(), "{}", scinit.diagnostics());
@@ -262,20 +200,16 @@ fn port_in_use_exits_1() {
     let holder = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = holder.local_addr().unwrap().port();
     let (scinit, status) = Scinit::builder()
-        .args(["--ports", &port.to_string()])
+        .ports(&[port])
         .child(["dump", "--then-exit"])
         .run(TIMEOUT)
         .unwrap();
-    assert_exit_code(&scinit, status, 1);
+    scinit.assert_exit_code(status, 1);
     assert!(
         scinit.stderr().contains("Address already in use"),
         "expected EADDRINUSE\n{}",
         scinit.diagnostics()
     );
-    assert!(
-        scinit.events_named("started").is_empty(),
-        "child should not start when binding fails\n{}",
-        scinit.diagnostics()
-    );
+    scinit.assert_start_count(0, "child should not start when binding fails");
     drop(holder);
 }

@@ -6,15 +6,16 @@
 //! log line instead of failing, unless `SCINIT_REQUIRE_PID1` is set (as
 //! `scripts/test-linux.sh` does).
 
-use crate::integration::harness::*;
+use crate::integration::harness::{
+    drain, format_diagnostics, poll_until, read_events, Event, Scinit, SCINIT, TEST_CHILD, TIMEOUT,
+};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use std::io::{BufRead, BufReader};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tempfile::TempDir;
 
 /// Signals scinit claims to handle synchronously (src/signals.rs)
@@ -29,15 +30,21 @@ const HANDLED: &[Signal] = &[
     Signal::SIGHUP,
 ];
 
-/// Read a hex signal-set field (`SigBlk`, `SigIgn`, ...) from a status file
+/// Parse a hex signal-set field (`SigBlk`, `SigIgn`, ...) from the text of a
+/// `/proc/<pid>/status` file
+fn parse_sigset_field(text: &str, field: &str) -> Option<u64> {
+    let value = text
+        .lines()
+        .find_map(|l| l.strip_prefix(field)?.strip_prefix(':'))?;
+    Some(u64::from_str_radix(value.trim(), 16).expect("bad signal set"))
+}
+
+/// Read a hex signal-set field from a status file
 fn sigset_field(status_path: &Path, field: &str) -> u64 {
     let status = std::fs::read_to_string(status_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", status_path.display(), e));
-    let line = status
-        .lines()
-        .find_map(|l| l.strip_prefix(&format!("{}:", field)))
-        .unwrap_or_else(|| panic!("no {} in {}", field, status_path.display()));
-    u64::from_str_radix(line.trim(), 16).expect("bad signal set")
+    parse_sigset_field(&status, field)
+        .unwrap_or_else(|| panic!("no {} in {}", field, status_path.display()))
 }
 
 fn sig_bit(sig: Signal) -> u64 {
@@ -52,14 +59,10 @@ fn child_sigblk_is_empty() {
         .command(["grep", "^SigBlk:", "/proc/self/status"])
         .run(TIMEOUT)
         .unwrap();
-    assert_exit_code(&scinit, status, 0);
+    scinit.assert_exit_code(status, 0);
 
-    let stdout = scinit.stdout();
-    let line = stdout
-        .lines()
-        .find(|l| l.starts_with("SigBlk:"))
+    let blocked = parse_sigset_field(&scinit.stdout(), "SigBlk")
         .unwrap_or_else(|| panic!("no SigBlk line\n{}", scinit.diagnostics()));
-    let blocked = u64::from_str_radix(line["SigBlk:".len()..].trim(), 16).unwrap();
     assert_eq!(
         blocked, 0,
         "child SigBlk should be 0, got {:016x}\n{}",
@@ -76,8 +79,7 @@ fn child_sigblk_is_empty() {
 /// temporarily unblocks the awaited signals in its `SigBlk`.
 #[test]
 fn all_scinit_threads_block_handled_signals() {
-    let scinit = Scinit::builder().child(["run"]).spawn().unwrap();
-    scinit.child_pid().unwrap();
+    let (scinit, _) = Scinit::builder().child(["run"]).start();
 
     let tasks = PathBuf::from(format!("/proc/{}/task", scinit.pid()));
     let mut unmasked = Vec::new();
@@ -158,9 +160,8 @@ struct Pid1Scinit {
     unshare: Child,
     _dir: TempDir,
     report: PathBuf,
-    stdout: mpsc::Receiver<String>,
-    stdout_lines: Vec<String>,
-    stderr: std::sync::Arc<std::sync::Mutex<String>>,
+    stdout: Arc<Mutex<String>>,
+    stderr: Arc<Mutex<String>>,
 }
 
 impl Pid1Scinit {
@@ -183,86 +184,53 @@ impl Pid1Scinit {
             .spawn()
             .expect("failed to spawn unshare");
 
-        let (tx, rx) = mpsc::channel();
-        let out = unshare.stdout.take().unwrap();
-        std::thread::spawn(move || {
-            for line in BufReader::new(out).lines().map_while(Result::ok) {
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        let stderr = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let err = unshare.stderr.take().unwrap();
-        let sink = stderr.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(err).lines().map_while(Result::ok) {
-                let mut s = sink.lock().unwrap();
-                s.push_str(&line);
-                s.push('\n');
-            }
-        });
+        let stdout = Arc::new(Mutex::new(String::new()));
+        let stderr = Arc::new(Mutex::new(String::new()));
+        drain(unshare.stdout.take().unwrap(), stdout.clone());
+        drain(unshare.stderr.take().unwrap(), stderr.clone());
 
         Self {
             unshare,
             _dir: dir,
             report,
-            stdout: rx,
-            stdout_lines: Vec::new(),
+            stdout,
             stderr,
         }
     }
 
-    fn report(&self) -> String {
-        std::fs::read_to_string(&self.report).unwrap_or_default()
-    }
-
     fn diagnostics(&self) -> String {
-        format!(
-            "--- report ---\n{}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            self.report(),
-            self.stdout_lines.join("\n"),
-            self.stderr.lock().unwrap()
+        format_diagnostics(
+            &self.report,
+            &self.stdout.lock().unwrap(),
+            &self.stderr.lock().unwrap(),
         )
     }
 
-    /// Wait for a stdout line matching `pred`
-    fn wait_stdout(&mut self, timeout: Duration, pred: impl Fn(&str) -> bool) -> Option<String> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match self.stdout.recv_timeout(left) {
-                Ok(line) => {
-                    self.stdout_lines.push(line.clone());
-                    if pred(&line) {
-                        return Some(line);
-                    }
-                }
-                Err(_) => return None,
-            }
-        }
+    /// Wait for a complete stdout line matching `pred`
+    fn wait_stdout(&self, timeout: Duration, pred: impl Fn(&str) -> bool) -> Option<String> {
+        poll_until(timeout, || {
+            let stdout = self.stdout.lock().unwrap();
+            stdout
+                .split_inclusive('\n')
+                .filter_map(|l| l.strip_suffix('\n'))
+                .find(|l| pred(l))
+                .map(str::to_string)
+        })
     }
 
-    /// Wait until the report contains a line matching `pred`
-    fn wait_report(&self, timeout: Duration, pred: impl Fn(&str) -> bool) -> Option<String> {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if let Some(line) = self.report().lines().find(|l| pred(l)) {
-                return Some(line.to_string());
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        None
+    /// Wait until the report contains an event matching `pred`
+    fn wait_report(&self, timeout: Duration, pred: impl Fn(&Event) -> bool) -> Option<Event> {
+        poll_until(timeout, || read_events(&self.report).into_iter().find(|e| pred(e)))
     }
 
     /// The child's `started` line, asserting scinit (its parent) is PID 1
     fn assert_child_of_pid1(&self) {
         let started = self
-            .wait_report(TIMEOUT, |l| l.starts_with("started ") && l.contains("role=child"))
+            .wait_report(TIMEOUT, |e| e.is("started") && e.field_is("role", "child"))
             .unwrap_or_else(|| panic!("child never started\n{}", self.diagnostics()));
         assert!(
-            started.split_whitespace().any(|f| f == "ppid=1"),
-            "child's parent should be scinit as PID 1: {}\n{}",
+            started.field_is("ppid", "1"),
+            "child's parent should be scinit as PID 1: {:?}\n{}",
             started,
             self.diagnostics()
         );
@@ -271,22 +239,17 @@ impl Pid1Scinit {
     /// scinit's pid as seen from our (ancestor) namespace: unshare's only child
     fn scinit_outer_pid(&self) -> Pid {
         let parent = self.unshare.id().to_string();
-        let deadline = Instant::now() + TIMEOUT;
-        while Instant::now() < deadline {
-            for entry in std::fs::read_dir("/proc").unwrap().flatten() {
-                let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
-                    continue;
-                };
-                let ppid = status.lines().find_map(|l| l.strip_prefix("PPid:"));
-                if ppid.map(str::trim) == Some(parent.as_str()) {
-                    if let Ok(pid) = entry.file_name().to_string_lossy().parse() {
-                        return Pid::from_raw(pid);
-                    }
+        poll_until(TIMEOUT, || {
+            std::fs::read_dir("/proc").unwrap().flatten().find_map(|entry| {
+                let status = std::fs::read_to_string(entry.path().join("status")).ok()?;
+                let ppid = status.lines().find_map(|l| l.strip_prefix("PPid:"))?;
+                if ppid.trim() != parent {
+                    return None;
                 }
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        panic!("could not find scinit under unshare\n{}", self.diagnostics());
+                entry.file_name().to_string_lossy().parse().ok().map(Pid::from_raw)
+            })
+        })
+        .unwrap_or_else(|| panic!("could not find scinit under unshare\n{}", self.diagnostics()))
     }
 }
 
@@ -298,7 +261,7 @@ impl Drop for Pid1Scinit {
     }
 }
 
-fn orphan_verdict(mut scinit: Pid1Scinit) {
+fn orphan_verdict(scinit: Pid1Scinit) {
     scinit.assert_child_of_pid1();
     // spawn-orphan checks the orphan ~2s after it exits
     let verdict = scinit.wait_stdout(Duration::from_secs(15), |l| l.starts_with("ORPHAN_"));
@@ -345,8 +308,8 @@ fn sigterm_forwarded_as_pid1() {
     scinit.assert_child_of_pid1();
 
     kill(scinit.scinit_outer_pid(), Signal::SIGTERM).unwrap();
-    let got = scinit.wait_report(Duration::from_secs(5), |l| {
-        l.starts_with("signal ") && l.contains("sig=TERM")
+    let got = scinit.wait_report(Duration::from_secs(5), |e| {
+        e.is("signal") && e.field_is("sig", "TERM")
     });
     assert!(
         got.is_some(),
