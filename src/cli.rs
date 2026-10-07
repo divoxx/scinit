@@ -17,11 +17,19 @@ use crate::Result;
 #[command(version)]
 #[command(after_help = "\
 Environment:
-  SCINIT_LOG  scinit's own log filter, in tracing EnvFilter syntax
-              (e.g. info, debug, scinit::file_watcher=debug). Default: error.
-              Logs go to stderr as `LEVEL scinit::module: message`; stdout
-              is left to the child. RUST_LOG is not read by scinit and is passed to
-              the child unchanged.")]
+  SCINIT_LOG  Filter for scinit's own logs, in tracing EnvFilter syntax:
+              a level (error, warn, info, debug, trace) and/or per-module
+              directives such as scinit::file_watcher=debug.
+              Default: error.
+
+              Logs go to stderr only, one event per line, without
+              timestamps:
+                ERROR scinit: Failed to spawn process 'my-app': ...
+                 INFO scinit::process_manager: Spawning process: ...
+              Colored only when stderr is a terminal and NO_COLOR is unset.
+
+              scinit does not read RUST_LOG; it reaches the child
+              unchanged.")]
 pub struct Cli {
     /// Enable live-reload functionality
     #[arg(long)]
