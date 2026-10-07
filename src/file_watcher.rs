@@ -1,7 +1,7 @@
 use crate::process_manager::ProcessManager;
 use crate::Result;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -41,7 +41,7 @@ impl FileWatcher {
     /// background task that debounces the changes into events
     pub fn start(config: FileWatchConfig) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (tx, mut rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::channel(100);
 
         // Create the notify watcher
         let mut watcher = RecommendedWatcher::new(
@@ -58,51 +58,8 @@ impl FileWatcher {
         watcher.watch(&watch_path, RecursiveMode::NonRecursive)?;
         info!("Started watching path: {:?}", watch_path);
 
-        // Spawn the event processing task
         let debounce = Duration::from_millis(config.debounce_ms);
-
-        tokio::spawn(async move {
-            // Trailing-edge debounce: every relevant change (re)arms the
-            // deadline, and the restart fires once changes have been quiet
-            // for the debounce period, so the last change is never dropped
-            let mut pending: Option<PathBuf> = None;
-            let deadline = tokio::time::sleep(Duration::ZERO);
-            tokio::pin!(deadline);
-
-            loop {
-                tokio::select! {
-                    res = rx.recv() => {
-                        let Some(res) = res else { break };
-                        match res {
-                            Ok(event) => {
-                                debug!("File system event: {:?}", event);
-                                if Self::is_relevant_change(&event) {
-                                    if pending.is_some() {
-                                        debug!("Debouncing file change");
-                                    }
-                                    let path = event.paths.first().unwrap_or(&watch_path);
-                                    pending = Some(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
-                                    deadline.as_mut().reset(tokio::time::Instant::now() + debounce);
-                                }
-                            }
-                            Err(e) => {
-                                error!("File watching error: {}", e);
-                                if event_tx.send(FileChangeEvent::WatchError(e.to_string())).is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    _ = &mut deadline, if pending.is_some() => {
-                        let path = pending.take().unwrap();
-                        if let Err(e) = event_tx.send(FileChangeEvent::FileChanged(path)) {
-                            error!("Failed to send file change event: {}", e);
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+        tokio::spawn(debounce_events(rx, event_tx, watch_path, debounce));
 
         Ok(FileWatcher {
             _watcher: watcher,
@@ -144,6 +101,61 @@ impl FileWatcher {
         // Only files count, not directories
         content_or_rename && event.paths.iter().any(|path| path.is_file())
     }
+}
+
+/// Turns raw notify events into debounced [`FileChangeEvent`]s.
+///
+/// Trailing-edge debounce: every relevant change (re)arms the deadline, and
+/// the restart fires once changes have been quiet for `debounce`, so the
+/// last change is never dropped.
+async fn debounce_events(
+    mut rx: mpsc::Receiver<notify::Result<notify::Event>>,
+    event_tx: mpsc::UnboundedSender<FileChangeEvent>,
+    watch_path: PathBuf,
+    debounce: Duration,
+) {
+    let mut pending: Option<PathBuf> = None;
+    let deadline = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            res = rx.recv() => {
+                let Some(res) = res else { break };
+                match res {
+                    Ok(event) => {
+                        debug!("File system event: {:?}", event);
+                        if FileWatcher::is_relevant_change(&event) {
+                            if pending.is_some() {
+                                debug!("Debouncing file change");
+                            }
+                            pending = Some(changed_path(&event, &watch_path));
+                            deadline.as_mut().reset(tokio::time::Instant::now() + debounce);
+                        }
+                    }
+                    Err(e) => {
+                        error!("File watching error: {}", e);
+                        if event_tx.send(FileChangeEvent::WatchError(e.to_string())).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ = &mut deadline, if pending.is_some() => {
+                let path = pending.take().unwrap();
+                if let Err(e) = event_tx.send(FileChangeEvent::FileChanged(path)) {
+                    error!("Failed to send file change event: {}", e);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// The event's first path (or `fallback`), canonicalized when possible
+fn changed_path(event: &notify::Event, fallback: &Path) -> PathBuf {
+    let path = event.paths.first().map_or(fallback, PathBuf::as_path);
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Handles one file watcher event, restarting the process on a change

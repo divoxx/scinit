@@ -10,6 +10,8 @@ use nix::unistd::{getpgid, tcsetpgrp, Pid};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::IsTerminal;
+use std::ops::ControlFlow;
+use std::os::unix::process::ExitStatusExt;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
@@ -122,21 +124,31 @@ impl ProcessManager {
         // Bind ports before spawning
         self.port_manager.bind_ports()?;
 
-        // Prepare environment variables using systemd socket activation
-        let mut env_vars = Environment::from(std::env::vars().collect::<HashMap<_, _>>());
+        let overrides = self.child_env_overrides();
+        let mut command = self.build_command(&overrides);
+        // The mask reset must run before the socket-activation exec
+        reset_signal_mask_on_exec(&mut command);
+        self.install_socket_activation(&mut command, overrides)?;
 
-        // Add systemd socket activation environment variables
-        let socket_env = self.port_manager.socket_activation_env();
-        env_vars.extend(socket_env.clone());
+        let child = command.spawn()
+            .map_err(|e| eyre!("Failed to spawn process '{}': {}", self.config.command, e))?;
+        self.track_child(child)
+    }
 
-        // Add custom environment variables
-        env_vars.extend(self.config.environment.clone());
+    /// Variables the child gets on top of scinit's environment: systemd
+    /// socket activation's, then the configured ones
+    fn child_env_overrides(&self) -> Environment {
+        let mut overrides = self.port_manager.socket_activation_env();
+        overrides.extend(self.config.environment.clone());
+        overrides
+    }
 
-        // Create command
+    /// The child's command, in its own process group, with scinit's stdio
+    /// and environment plus `overrides`
+    fn build_command(&self, overrides: &Environment) -> Command {
         let mut command = Command::new(&self.config.command);
         command.args(&self.config.args);
 
-        // Set up process group and inheritance
         // process_group(0) creates a new process group with child as leader
         // This isolates the child from scinit's process group for proper signal handling
         command.process_group(0);
@@ -145,49 +157,33 @@ impl ProcessManager {
         command.stdout(Stdio::inherit());
         command.stderr(Stdio::inherit());
 
-        // CRITICAL: Reset signal mask for child process
-        // Child processes inherit the parent's signal mask, but we want them to handle signals normally
-        // This is essential for terminal signals like Ctrl+C to work in child processes
-        unsafe {
-            command.pre_exec(|| {
-                use nix::sys::signal::{pthread_sigmask, SigmaskHow, SigSet};
-
-                // Create empty signal mask (unblock all signals)
-                let empty_mask = SigSet::empty();
-
-                // Reset signal mask to default state for child process
-                pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&empty_mask), None)
-                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-
-                Ok(())
-            });
-        }
-
-        // With sockets to pass, the child execs itself so it can move them to
-        // fds 3.. and set LISTEN_PID to its own pid (see socket_activation)
-        let listen_fds = self.port_manager.listen_fds();
-        if !listen_fds.is_empty() {
-            let mut exec = SocketActivationExec::new(
-                &self.config.command,
-                &self.config.args,
-                listen_fds,
-                socket_env,
-                self.config.environment.clone(),
-            )?;
-            unsafe {
-                command.pre_exec(move || Err(exec.exec_in_child()));
-            }
-        }
-
-        // Set environment variables
+        let mut env_vars = Environment::from(std::env::vars().collect::<HashMap<_, _>>());
+        env_vars.extend(overrides.clone());
         command.env_clear();
-        for (key, value) in env_vars.into_inner() {
-            command.env(key, value);
-        }
+        command.envs(env_vars.into_inner());
+        command
+    }
 
-        // Spawn the process
-        let child = command.spawn()
-            .map_err(|e| eyre!("Failed to spawn process '{}': {}", self.config.command, e))?;
+    /// With sockets to pass, makes the child exec itself so it can move them
+    /// to fds 3.. and set LISTEN_PID to its own pid (see socket_activation)
+    fn install_socket_activation(&self, command: &mut Command, overrides: Environment) -> Result<()> {
+        let listen_fds = self.port_manager.listen_fds();
+        if listen_fds.is_empty() {
+            return Ok(());
+        }
+        let mut exec = SocketActivationExec::new(
+            &self.config.command,
+            &self.config.args,
+            listen_fds,
+            overrides,
+        )?;
+        unsafe {
+            command.pre_exec(move || Err(exec.exec_in_child()));
+        }
+        Ok(())
+    }
+
+    fn track_child(&mut self, child: Child) -> Result<()> {
         let child = ManagedChild::new(child)?;
         let pid = child.pid;
         self.state = ChildState::Running(child);
@@ -334,6 +330,19 @@ impl ProcessManager {
     }
 }
 
+/// Unblocks all signals in the child: it inherits scinit's mask, but must
+/// handle signals normally (e.g. Ctrl+C)
+fn reset_signal_mask_on_exec(command: &mut Command) {
+    unsafe {
+        command.pre_exec(|| {
+            use nix::sys::signal::{pthread_sigmask, SigmaskHow, SigSet};
+
+            pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None)
+                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+        });
+    }
+}
+
 impl Drop for ProcessManager {
     fn drop(&mut self) {
         // Emergency cleanup when dropped with a child still running (e.g. on
@@ -413,33 +422,12 @@ pub fn reap_zombies() {
     let mut reaped_count = 0;
 
     while let Some(pid) = peek_exited_child() {
-        if pid.as_raw() == MANAGED_CHILD.load(Ordering::SeqCst) {
+        if is_managed_child(pid) {
             break;
         }
-        match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::Exited(pid, status)) => {
-                debug!("reaped zombie process {} with exit status {}", pid, status);
-                reaped_count += 1;
-            }
-            Ok(WaitStatus::Signaled(pid, signal, _)) => {
-                debug!(
-                    "reaped zombie process {} killed by signal {:?}",
-                    pid, signal
-                );
-                reaped_count += 1;
-            }
-            Ok(WaitStatus::StillAlive) => break,
-            Ok(other) => {
-                debug!("ignoring wait status {:?}", other);
-            }
-            Err(nix::Error::ECHILD) => {
-                // Reaped concurrently (e.g. by tokio)
-                continue;
-            }
-            Err(e) => {
-                warn!("error reaping zombies: {}", e);
-                break;
-            }
+        match reap_one(pid) {
+            ControlFlow::Continue(reaped) => reaped_count += usize::from(reaped),
+            ControlFlow::Break(()) => break,
         }
     }
 
@@ -448,10 +436,42 @@ pub fn reap_zombies() {
     }
 }
 
+fn is_managed_child(pid: Pid) -> bool {
+    pid.as_raw() == MANAGED_CHILD.load(Ordering::SeqCst)
+}
+
+/// Reaps exited child `pid`. Continues with whether it was reaped, or
+/// breaks when the pass should stop.
+fn reap_one(pid: Pid) -> ControlFlow<(), bool> {
+    match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+        Ok(WaitStatus::Exited(pid, status)) => {
+            debug!("reaped zombie process {} with exit status {}", pid, status);
+            ControlFlow::Continue(true)
+        }
+        Ok(WaitStatus::Signaled(pid, signal, _)) => {
+            debug!(
+                "reaped zombie process {} killed by signal {:?}",
+                pid, signal
+            );
+            ControlFlow::Continue(true)
+        }
+        Ok(WaitStatus::StillAlive) => ControlFlow::Break(()),
+        Ok(other) => {
+            debug!("ignoring wait status {:?}", other);
+            ControlFlow::Continue(false)
+        }
+        // Reaped concurrently (e.g. by tokio)
+        Err(nix::Error::ECHILD) => ControlFlow::Continue(false),
+        Err(e) => {
+            warn!("error reaping zombies: {}", e);
+            ControlFlow::Break(())
+        }
+    }
+}
+
 /// Shell-style exit code for a child's status: its exit code, or 128 + the
 /// signal number if it was killed by a signal
 pub fn exit_code(status: ExitStatus) -> i32 {
-    use std::os::unix::process::ExitStatusExt;
     status
         .code()
         .or_else(|| status.signal().map(|sig| 128 + sig))
@@ -464,33 +484,26 @@ pub fn exit_code(status: ExitStatus) -> i32 {
 /// so scinit exits with the child's exit code (see [`exit_code`]) and
 /// orchestrators can tell a crash from a clean shutdown.
 pub fn handle_child_exit(status: ExitStatus) -> i32 {
-    if status.success() {
-        info!("Child process exited successfully, scinit exiting cleanly");
-    } else if let Some(code) = status.code() {
-        info!("Child process exited with error code {}, scinit exiting", code);
-    } else {
-        // Extract signal information from status
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            if let Some(signal) = status.signal() {
-                info!("Child process terminated by signal {} ({}), scinit exiting",
-                      signal, signal_name(signal));
-            } else {
-                info!("Child process terminated by signal, scinit exiting");
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            info!("Child process terminated by signal, scinit exiting");
-        }
-    }
+    log_child_exit(status);
 
     // Reap any remaining zombies before exiting
     debug!("Reaping any remaining zombie processes before exit");
     spawn_zombie_reap();
 
     exit_code(status)
+}
+
+fn log_child_exit(status: ExitStatus) {
+    if status.success() {
+        info!("Child process exited successfully, scinit exiting cleanly");
+    } else if let Some(code) = status.code() {
+        info!("Child process exited with error code {}, scinit exiting", code);
+    } else if let Some(signal) = status.signal() {
+        info!("Child process terminated by signal {} ({}), scinit exiting",
+              signal, signal_name(signal));
+    } else {
+        info!("Child process terminated by signal, scinit exiting");
+    }
 }
 
 /// Starts a zombie reap pass on a blocking thread, without waiting for it

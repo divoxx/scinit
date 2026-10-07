@@ -10,6 +10,7 @@ mod socket_activation;
 
 use clap::Parser;
 use environment::Environment;
+use nix::unistd::getpgid;
 use std::time::Duration;
 use tokio::select;
 use tokio::signal::unix::{signal, SignalKind};
@@ -24,7 +25,7 @@ use process_manager::{
     exit_code, handle_child_exit, process_group_to_foreground, spawn_zombie_reap, ProcessConfig,
     ProcessManager,
 };
-use signals::{SignalAction, SignalHandler};
+use signals::{Signal, SignalAction, SignalHandler};
 
 fn main() -> Result<()> {
     // Initialize error handling and logging
@@ -83,7 +84,7 @@ async fn app_main(signal_handler: &mut SignalHandler) -> Result<i32> {
     let mut process_manager = ProcessManager::new(process_config, port_manager);
 
     // Run the main event loop
-    let code = run_main_loop(config, &mut process_manager, signal_handler).await?;
+    let code = run_main_loop(&config, &mut process_manager, signal_handler).await?;
 
     info!("scinit exiting with code {}", code);
     Ok(code)
@@ -91,7 +92,7 @@ async fn app_main(signal_handler: &mut SignalHandler) -> Result<i32> {
 
 /// Main event loop orchestration
 async fn run_main_loop(
-    config: Config,
+    config: &Config,
     process_manager: &mut ProcessManager,
     signal_handler: &mut SignalHandler,
 ) -> Result<i32> {
@@ -115,12 +116,7 @@ async fn run_main_loop(
     // Spawn initial process
     process_manager.spawn_process().await?;
 
-    // Setup process group
-    if let Some(pid) = process_manager.pid() {
-        use nix::unistd::getpgid;
-        let pgid = getpgid(Some(pid))?;
-        tokio::task::spawn_blocking(move || process_group_to_foreground(pgid)).await??;
-    }
+    foreground_child(process_manager).await?;
 
     loop {
         select! {
@@ -134,14 +130,7 @@ async fn run_main_loop(
             signal = signal_handler.wait_for_signal() => {
                 let signal = signal?;
                 match signal_handler.process_signal(signal, process_manager, config.graceful_timeout_secs).await? {
-                    SignalAction::Exit => {
-                        // The child's status if it was observed; otherwise
-                        // report death by the signal that stopped us
-                        return Ok(process_manager
-                            .exit_status()
-                            .map(exit_code)
-                            .unwrap_or(128 + signal as i32));
-                    }
+                    SignalAction::Exit => return Ok(exit_code_after_signal(process_manager, signal)),
                     SignalAction::Continue => {},
                 }
             }
@@ -163,6 +152,24 @@ async fn run_main_loop(
             }
         }
     }
+}
+
+/// Hands the terminal (if any) to the child's process group
+async fn foreground_child(process_manager: &ProcessManager) -> Result<()> {
+    let Some(pid) = process_manager.pid() else {
+        return Ok(());
+    };
+    let pgid = getpgid(Some(pid))?;
+    tokio::task::spawn_blocking(move || process_group_to_foreground(pgid)).await?
+}
+
+/// The child's exit code if its exit was observed; otherwise death by the
+/// signal that stopped scinit
+fn exit_code_after_signal(process_manager: &ProcessManager, signal: Signal) -> i32 {
+    process_manager
+        .exit_status()
+        .map(exit_code)
+        .unwrap_or(128 + signal as i32)
 }
 
 /// Next file watcher event, or never if live-reload is disabled

@@ -52,38 +52,21 @@ unsafe impl Sync for SocketActivationExec {}
 
 impl SocketActivationExec {
     /// Prepares the exec of `command args` with `listen_fds` passed as the
-    /// activated sockets and `socket_env` (`LISTEN_FDS`) plus `extra_env`
-    /// added to scinit's own environment
+    /// activated sockets and `overrides` (`LISTEN_FDS` and the configured
+    /// variables) added to scinit's own environment
     pub fn new(
         command: &str,
         args: &[String],
         listen_fds: Vec<RawFd>,
-        socket_env: Environment,
-        extra_env: Environment,
+        overrides: Environment,
     ) -> Result<Self> {
         let program = c_string(resolve_program(command)?.as_os_str().as_bytes())?;
-
-        let mut argv = vec![c_string(command.as_bytes())?];
-        for arg in args {
-            argv.push(c_string(arg.as_bytes())?);
-        }
-
-        // Inherited LISTEN_* describe someone else's sockets; replace them
-        let mut env: Vec<(Vec<u8>, Vec<u8>)> = std::env::vars_os()
-            .filter(|(k, _)| !k.as_bytes().starts_with(b"LISTEN_"))
-            .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
-            .collect();
-        for (key, value) in socket_env.into_inner().into_iter().chain(extra_env.into_inner()) {
-            env.retain(|(k, _)| k != key.as_bytes());
-            env.push((key.into_bytes(), value.into_bytes()));
-        }
-        let mut envp = Vec::with_capacity(env.len());
-        for (key, value) in env {
-            let mut entry = key;
-            entry.push(b'=');
-            entry.extend(value);
-            envp.push(c_string(&entry)?);
-        }
+        let argv = c_strings(std::iter::once(command).chain(args.iter().map(String::as_str)))?;
+        let envp = c_strings(
+            child_env(overrides)
+                .into_iter()
+                .map(|(key, value)| env_entry(&key, &value)),
+        )?;
 
         let mut pid_slot = LISTEN_PID_PREFIX.to_vec();
         pid_slot.resize(LISTEN_PID_PREFIX.len() + PID_DIGITS, 0);
@@ -147,6 +130,29 @@ impl SocketActivationExec {
 
 fn c_string(bytes: &[u8]) -> Result<CString> {
     CString::new(bytes).map_err(|_| eyre!("argument or environment contains a NUL byte"))
+}
+
+fn c_strings<T: AsRef<[u8]>>(items: impl IntoIterator<Item = T>) -> Result<Vec<CString>> {
+    items.into_iter().map(|item| c_string(item.as_ref())).collect()
+}
+
+/// scinit's environment with `overrides` applied. Inherited `LISTEN_*`
+/// describe someone else's sockets, so they are dropped.
+fn child_env(overrides: Environment) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut env: Vec<(Vec<u8>, Vec<u8>)> = std::env::vars_os()
+        .filter(|(k, _)| !k.as_bytes().starts_with(b"LISTEN_"))
+        .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+        .collect();
+    for (key, value) in overrides.into_inner() {
+        env.retain(|(k, _)| k != key.as_bytes());
+        env.push((key.into_bytes(), value.into_bytes()));
+    }
+    env
+}
+
+/// `key=value`, as `execve` expects it
+fn env_entry(key: &[u8], value: &[u8]) -> Vec<u8> {
+    [key, b"=", value].concat()
 }
 
 fn null_terminated(ptrs: impl Iterator<Item = *const libc::c_char>) -> Vec<*const libc::c_char> {

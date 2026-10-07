@@ -5,7 +5,7 @@ pub use nix::sys::signal::Signal;
 
 use eyre::eyre;
 use nix::sys::signal::{pthread_sigmask, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, error, info};
 
 /// Converts signal number to human-readable name
@@ -51,46 +51,12 @@ impl SignalHandler {
     /// Critical synchronous signals (SIGFPE, SIGILL, SIGSEGV, ...) are never
     /// blocked.
     pub fn install() -> Result<Self> {
-        // Signals that init should handle synchronously:
-        // - SIGTERM, SIGINT, SIGQUIT: Termination signals for graceful shutdown
-        // - SIGUSR1, SIGUSR2: User-defined signals to forward
-        // - SIGHUP: Hangup signal to forward
-        let handled_signals: SigSet = [
-            Signal::SIGTERM,
-            Signal::SIGINT,
-            Signal::SIGQUIT,
-            Signal::SIGUSR1,
-            Signal::SIGUSR2,
-            Signal::SIGHUP,
-        ]
-        .into_iter()
-        .collect();
-
+        let handled_signals = handled_signals();
         pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&handled_signals), None)?;
-
-        // Ignore SIGTTIN and SIGTTOU to prevent blocking on terminal operations
-        // This is critical for init systems running in containers
-        let ignore_action = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
-        unsafe {
-            nix::sys::signal::sigaction(Signal::SIGTTIN, &ignore_action)?;
-            nix::sys::signal::sigaction(Signal::SIGTTOU, &ignore_action)?;
-        }
+        ignore_tty_signals()?;
 
         let (sender, receiver) = unbounded_channel();
-        std::thread::Builder::new()
-            .name("scinit-sigwait".into())
-            .spawn(move || loop {
-                match handled_signals.wait() {
-                    Ok(signal) => {
-                        debug!("Received signal: {:?} (init semantics)", signal);
-                        if sender.send(signal).is_err() {
-                            // Main loop is gone; nothing left to deliver to
-                            break;
-                        }
-                    }
-                    Err(e) => error!("sigwait failed: {}", e),
-                }
-            })?;
+        spawn_sigwait_thread(handled_signals, sender)?;
 
         Ok(SignalHandler {
             handled_signals,
@@ -162,6 +128,54 @@ impl SignalHandler {
 
         info!("scinit exiting due to termination signal {:?}", signal);
     }
+}
+
+/// Signals that init should handle synchronously:
+/// - SIGTERM, SIGINT, SIGQUIT: Termination signals for graceful shutdown
+/// - SIGUSR1, SIGUSR2: User-defined signals to forward
+/// - SIGHUP: Hangup signal to forward
+fn handled_signals() -> SigSet {
+    [
+        Signal::SIGTERM,
+        Signal::SIGINT,
+        Signal::SIGQUIT,
+        Signal::SIGUSR1,
+        Signal::SIGUSR2,
+        Signal::SIGHUP,
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// Ignores SIGTTIN and SIGTTOU, so terminal operations can't stop scinit.
+/// This is critical for init systems running in containers.
+fn ignore_tty_signals() -> Result<()> {
+    let ignore_action = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+    unsafe {
+        nix::sys::signal::sigaction(Signal::SIGTTIN, &ignore_action)?;
+        nix::sys::signal::sigaction(Signal::SIGTTOU, &ignore_action)?;
+    }
+    Ok(())
+}
+
+/// Starts the thread that consumes `set` with `sigwait` and sends each
+/// signal to `sender`, until the receiver is gone
+fn spawn_sigwait_thread(set: SigSet, sender: UnboundedSender<Signal>) -> Result<()> {
+    std::thread::Builder::new()
+        .name("scinit-sigwait".into())
+        .spawn(move || loop {
+            match set.wait() {
+                Ok(signal) => {
+                    debug!("Received signal: {:?} (init semantics)", signal);
+                    if sender.send(signal).is_err() {
+                        // Main loop is gone; nothing left to deliver to
+                        break;
+                    }
+                }
+                Err(e) => error!("sigwait failed: {}", e),
+            }
+        })?;
+    Ok(())
 }
 
 /// Actions that signal processing can return
