@@ -79,13 +79,26 @@ Smaller issues, not (yet) covered by `#[ignore]` tests:
 
 ## Design decisions to make
 
+The listening socket options are decided together: `bind_single_port`
+(`src/port_manager.rs`) currently sets `SO_REUSEPORT` and nothing else.
+
 - **`SO_REUSEPORT` is always on.** It lets several sockets bind the same port
   at once. Zero-downtime restarts no longer need it: scinit binds each port
   once and passes the same socket to every child, so connections queue in its
-  backlog between children. Keeping it on lets any other process silently
-  bind the same port and take a share of the connections. It is only needed
+  backlog between children (`restart_drops_no_connections`). Keeping it on
+  lets any other process silently bind the same port and take a share of the
+  connections, instead of failing with "address in use". It is only needed
   for running old and new children side by side, handing over between two
-  scinit instances, or deliberate multi-process load balancing. Proposal:
-  default to `SO_REUSEADDR` only (so a restarted container can rebind while
-  old connections sit in TIME_WAIT), and add an opt-in flag for
-  `SO_REUSEPORT`.
+  scinit instances, or deliberate multi-process load balancing.
+  **Proposal:** off by default, behind an opt-in flag (e.g. `--reuse-port`).
+- **`SO_REUSEADDR` is not set.** It allows binding a port that still has
+  connections in TIME_WAIT from a previous listener, without letting two live
+  listeners share the port. Today `SO_REUSEPORT` happens to cover this, so
+  turning `SO_REUSEPORT` off without adding `SO_REUSEADDR` would regress:
+  restarting scinit itself (e.g. a container restart) right after it served
+  connections could fail with "address in use" for up to the TIME_WAIT period
+  (60s on Linux). **Proposal:** always set `SO_REUSEADDR` on listening
+  sockets, the standard setting for servers. Change both options in the same
+  commit, with a test that rebinds a port immediately after a scinit that
+  served connections exits, and keep `port_in_use_exits_1` passing (a live
+  listener without `SO_REUSEPORT` must still block the bind).
