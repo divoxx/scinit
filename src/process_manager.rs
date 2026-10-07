@@ -1,4 +1,5 @@
 use crate::environment::Environment;
+use crate::fds;
 use crate::port_manager::PortManager;
 use crate::reaper::{clear_managed_child, set_managed_child};
 use crate::terminal;
@@ -104,8 +105,9 @@ impl ProcessManager {
 
         let overrides = self.child_env_overrides();
         let mut command = self.build_command(&overrides);
-        // The mask reset must run before the socket-activation exec
+        // These hooks must run before the socket-activation exec
         reset_signal_mask_on_exec(&mut command);
+        close_stray_fds_on_exec(&mut command);
         self.install_socket_activation(&mut command, overrides)?;
 
         let child = command.spawn()
@@ -345,6 +347,19 @@ fn reset_signal_mask_on_exec(command: &mut Command) {
 
             pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None)
                 .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+        });
+    }
+}
+
+/// Keeps fds scinit inherited (other than stdio) from reaching the child.
+/// The activated sockets are moved to fds 3.. after this, which clears the
+/// flag on them.
+fn close_stray_fds_on_exec(command: &mut Command) {
+    let limit = fds::open_fd_limit();
+    unsafe {
+        command.pre_exec(move || {
+            fds::mark_non_stdio_cloexec(limit);
+            Ok(())
         });
     }
 }

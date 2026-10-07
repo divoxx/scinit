@@ -6,6 +6,7 @@ type Result<T> = eyre::Result<T>;
 mod cli;
 mod environment;
 mod exit_status;
+mod fds;
 mod file_watcher;
 mod logging;
 mod port_manager;

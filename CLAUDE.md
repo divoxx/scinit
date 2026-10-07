@@ -60,6 +60,7 @@ cargo run -- --live-reload --debounce-ms 1000 --restart-delay-ms 500 my-app
 - **`reaper`** (`src/reaper.rs`): Zombie reaping, leaving the managed child to tokio's `Child::wait()`
 - **`exit_status`** (`src/exit_status.rs`): Maps the child's status to scinit's exit code (code, or 128 + signal)
 - **`PortManager`** (`src/port_manager.rs`): Socket inheritance system for zero-downtime restarts, binding each port once and keeping it for scinit's lifetime
+- **`fds`** (`src/fds.rs`): Marks the fds scinit inherited (other than stdio) close-on-exec in the child, so it only gets stdio and the activated sockets
 - **`SocketActivationExec`** (`src/socket_activation.rs`): Execs a child with sockets from a `pre_exec` hook, so it can move them to fds 3.. and set `LISTEN_PID` to the child's own pid
 
 ### Key Architecture Principles
@@ -117,6 +118,7 @@ The `listen` fixture mode verifies socket inheritance end to end:
 - Always use process groups for proper signal forwarding
 - Listening sockets always set `SO_REUSEADDR` (rebinding over TIME_WAIT after a scinit restart); `SO_REUSEPORT` only with `--reuse-port`, since restarts reuse the same sockets and don't need it
 - Bound sockets stay close-on-exec; the child gets `dup2` copies at fds 3.. (which clears the flag), so only those are inherited
+- The child marks every fd above stdio close-on-exec before exec (`src/fds.rs`, before the socket remap), so stray fds scinit itself inherited never reach it
 - Code in the child between fork and exec (`pre_exec`) must be async-signal-safe: build everything before forking, never allocate there
 - **Signal masking**: Block handled signals on the main thread before any other thread exists; never block critical/synchronous signals or SIGCHLD
 - **Signal handling**: Consume handled signals only on the dedicated sigwait thread; never call `sigwait` from per-iteration tasks (cancelled waits leave threads that swallow signals)

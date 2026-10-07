@@ -9,6 +9,7 @@ use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use std::ffi::OsString;
 use std::io::Read;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -134,7 +135,12 @@ pub struct ScinitBuilder {
     scinit_args: Vec<OsString>,
     command: Vec<OsString>,
     env: Vec<(OsString, OsString)>,
+    leak_fd: bool,
 }
+
+/// fd at which `ScinitBuilder::leak_fd` leaks a socket into scinit, above
+/// the activated sockets' range
+pub const LEAKED_FD: i32 = 50;
 
 impl ScinitBuilder {
     /// Per-test temp directory (cwd of scinit, watch paths, ...)
@@ -195,6 +201,13 @@ impl ScinitBuilder {
         self
     }
 
+    /// Start scinit with an inheritable socket at `LEAKED_FD`, like the
+    /// stray fds some hosts leak into every process
+    pub fn leak_fd(mut self) -> Self {
+        self.leak_fd = true;
+        self
+    }
+
     pub fn spawn(self) -> Result<Scinit> {
         let dir = canonical(self.dir.path());
         let report = self.report_dir.path().join("report.log");
@@ -218,19 +231,34 @@ impl ScinitBuilder {
         }
         // Start scinit with only stdio open, as in a container. Some hosts
         // (e.g. GitHub's macOS runners) leak non-close-on-exec fds into every
-        // process, which would otherwise reach the child as stray sockets.
+        // process; scinit keeps them from its child, but tests shouldn't
+        // depend on the host.
         let max_fd = open_fd_limit();
+        // Close-on-exec itself; only the dup2 copy below is inherited
+        let leaked = self
+            .leak_fd
+            .then(|| std::net::UdpSocket::bind("127.0.0.1:0"))
+            .transpose()
+            .context("failed to open the socket to leak")?;
+        let leaked_raw = leaked.as_ref().map(AsRawFd::as_raw_fd);
         unsafe {
             cmd.pre_exec(move || {
                 for fd in 3..max_fd {
                     // fcntl is async-signal-safe; unopened fds just fail
                     libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
                 }
+                // dup2 leaves the copy without close-on-exec
+                if let Some(fd) = leaked_raw {
+                    if libc::dup2(fd, LEAKED_FD) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 Ok(())
             });
         }
 
         let mut child = cmd.spawn().context("failed to spawn scinit")?;
+        drop(leaked);
         let stdout = Arc::new(Mutex::new(String::new()));
         let stderr = Arc::new(Mutex::new(String::new()));
         let readers = vec![
@@ -332,6 +360,7 @@ impl Scinit {
             scinit_args: Vec::new(),
             command: Vec::new(),
             env: Vec::new(),
+            leak_fd: false,
         }
     }
 
@@ -641,8 +670,18 @@ pub fn env_value(events: &[Event], key: &str) -> Option<String> {
 
 /// The child's socket fds from the `dump` `fds` event
 pub fn socket_fds(events: &[Event]) -> Vec<i32> {
+    dumped_fds(events, "sockets")
+}
+
+/// Every fd the child had open, from the `dump` `fds` event
+pub fn open_fds(events: &[Event]) -> Vec<i32> {
+    dumped_fds(events, "open")
+}
+
+/// fd list `key` of the `dump` `fds` event
+fn dumped_fds(events: &[Event], key: &str) -> Vec<i32> {
     let fds = events.iter().find(|e| e.is("fds")).expect("no fds event");
-    fds.get("sockets")
+    fds.get(key)
         .unwrap_or("")
         .split(',')
         .filter(|s| !s.is_empty())
