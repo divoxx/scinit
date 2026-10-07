@@ -46,8 +46,6 @@ Smaller issues, not (yet) covered by `#[ignore]` tests:
   systemd closes everything except the passed fds. The test harness starts
   scinit with a clean fd table. Consider marking all fds above 2 (other than
   the activated sockets) close-on-exec in the child's `pre_exec`.
-- **`--zombie-reap-interval-ms 0` (probably) panics.** `tokio::time::interval`
-  panics on a zero period. Reject 0 during argument parsing.
 - **FSEvents replays writes made just before the watcher starts (macOS).**
   On macOS, a file written shortly before scinit starts watching can be
   reported as a change right after startup, causing one spurious restart.

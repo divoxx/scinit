@@ -222,3 +222,20 @@ fn no_color_disables_color_on_a_terminal() {
     assert!(out.contains("INFO scinit: scinit starting"), "{:?}", out);
     assert!(!out.contains('\x1b'), "escape codes despite NO_COLOR:\n{:?}", out);
 }
+
+/// A zero `--zombie-reap-interval-ms` is a usage error (exit 2), not a panic, and the child never starts
+#[test]
+fn zero_zombie_reap_interval_exits_two() {
+    let (scinit, status) = Scinit::builder()
+        .args(["--zombie-reap-interval-ms", "0"])
+        .child(["exit", "0"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 2);
+    scinit.assert_start_count(0, "child must not start with an invalid config");
+    assert!(
+        scinit.stderr().contains("--zombie-reap-interval-ms"),
+        "{}",
+        scinit.diagnostics()
+    );
+}
