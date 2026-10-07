@@ -1,1 +1,9 @@
 /target
+
+# Claude Code: agent worktrees and personal settings. Shared config
+# (.claude/settings.json, agents/, commands/) can still be committed.
+/.claude/worktrees/
+/.claude/settings.local.json
+
+# macOS
+.DS_Store
