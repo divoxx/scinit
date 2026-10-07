@@ -119,7 +119,7 @@ scripts/test-linux.sh --test integration_test sockets::   # args go to cargo tes
 - **Harness** (`tests/integration/harness.rs`): spawns scinit with the fixture, captures its output, polls the report instead of sleeping, and cleans up every process group on drop.
 - **Scenarios** (`tests/integration/scenarios/`): `cli`, `exit_codes`, `signals`, `sockets`, `live_reload`, and the Linux-only `linux` (`/proc` signal masks, scinit as PID 1 in a new PID namespace).
 - **Linux runner** (`scripts/test-linux.sh`, `tests/container/Containerfile`): builds a test image and runs `cargo test` in rootless podman, with the permissions the PID-1 tests need. Requires podman.
-- **CI** (`.github/workflows/ci.yml`): runs `cargo test` on macOS and `scripts/test-linux.sh` on Linux for every pull request and push to `main`.
+- **CI** (`.github/workflows/ci.yml`): runs `cargo clippy --all-targets -- -D warnings` on macOS and Linux, `cargo test` on macOS and `scripts/test-linux.sh` on Linux for every pull request and push to `main`.
 
 Known issues and open design decisions are tracked in [KNOWN-ISSUES.md](KNOWN-ISSUES.md). Tests for a known bug are marked `#[ignore = "bug: <anchor> (KNOWN-ISSUES.md)"]` and can be run with `cargo test -- --ignored`.
 
