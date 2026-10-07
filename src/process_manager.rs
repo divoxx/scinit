@@ -242,22 +242,26 @@ impl ProcessManager {
         }
     }
 
-    /// Performs a graceful shutdown of the current process
+    /// Performs a graceful shutdown of the current process with SIGTERM
     ///
-    /// This method sends SIGTERM to the process and waits for it to exit
-    /// gracefully. If the process doesn't exit within the timeout,
-    /// it sends SIGKILL.
+    /// See [`ProcessManager::shutdown_with_signal`].
+    pub async fn graceful_shutdown(&mut self) -> Result<()> {
+        self.shutdown_with_signal(Signal::SIGTERM).await
+    }
+
+    /// Stops the current process: sends `signal` to its process group and
+    /// waits for it to exit. If it doesn't exit within the graceful shutdown
+    /// timeout, it sends SIGKILL.
     ///
     /// # Returns
     /// * `Result<()>` - Success or error
-    pub async fn graceful_shutdown(&mut self) -> Result<()> {
+    pub async fn shutdown_with_signal(&mut self, signal: Signal) -> Result<()> {
         if let Some(pid) = self.process_info.pid {
             self.process_info.state = ProcessState::Stopping;
-            info!("Initiating graceful shutdown of process {}", pid);
+            info!("Initiating graceful shutdown of process {} with {:?}", pid, signal);
 
-            // Send SIGTERM
-            if let Err(e) = self.forward_signal(Signal::SIGTERM) {
-                warn!("Failed to send SIGTERM: {}", e);
+            if let Err(e) = self.forward_signal(signal) {
+                warn!("Failed to send {:?}: {}", signal, e);
             }
 
             // Wait for graceful shutdown
@@ -406,6 +410,7 @@ impl ProcessManager {
     ///
     /// # Returns
     /// * `bool` - True if the process is running
+    #[cfg(test)]
     pub fn is_running(&self) -> bool {
         self.process_info.state == ProcessState::Running
     }

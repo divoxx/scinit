@@ -5,7 +5,6 @@ pub use nix::sys::signal::Signal;
 
 use nix::sys::signal::{pthread_sigmask, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow};
 use eyre::eyre;
-use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tracing::{debug, error, info, warn};
 
@@ -164,47 +163,14 @@ impl SignalHandler {
         process_manager: &mut ProcessManager,
         graceful_timeout_secs: u64,
     ) -> Result<()> {
+        // Forward the signal itself, then escalate to SIGKILL if the child
+        // outlives the graceful timeout
         info!(
-            "Termination signal {:?} received, forwarding to child process",
-            signal
+            "Termination signal {:?} received, forwarding to child process (timeout: {}s)",
+            signal, graceful_timeout_secs
         );
-
-        // Forward the signal to child process
-        if let Err(e) = process_manager.forward_signal(signal) {
-            warn!("Failed to forward signal {:?} to child: {}", signal, e);
-        }
-
-        match signal {
-            Signal::SIGTERM => {
-                // SIGTERM gets graceful shutdown with timeout
-                info!(
-                    "Waiting for child process to exit gracefully (timeout: {}s)",
-                    graceful_timeout_secs
-                );
-
-                if (process_manager.graceful_shutdown().await).is_err() {
-                    warn!("Graceful shutdown timed out, child process may have been force-killed");
-                }
-            }
-            Signal::SIGINT | Signal::SIGQUIT => {
-                // SIGINT/SIGQUIT get shorter timeout or immediate cleanup
-                info!("Waiting for child process to exit (signal: {:?})", signal);
-
-                // Wait a bit for child to exit, but don't use full graceful timeout
-                tokio::time::sleep(Duration::from_secs(2)).await;
-
-                // Force kill if still running
-                if process_manager.is_running() {
-                    warn!(
-                        "Child process didn't exit after {:?}, forcing termination",
-                        signal
-                    );
-                    if let Err(e) = process_manager.force_kill().await {
-                        error!("Failed to force kill child process: {}", e);
-                    }
-                }
-            }
-            _ => unreachable!(),
+        if (process_manager.shutdown_with_signal(signal).await).is_err() {
+            warn!("Graceful shutdown failed, child process may have been force-killed");
         }
 
         info!("scinit exiting due to termination signal {:?}", signal);

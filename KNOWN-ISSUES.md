@@ -96,29 +96,6 @@ grep '^fds' $SCINIT_TEST_REPORT   # sockets=9,10 (for example), expected 3,4
 order and clear CLOEXEC on the targets. Sort the listeners by port so
 `LISTEN_FDNAMES` and the fd order are deterministic.
 
-### sigint-fixed-delay
-
-**Description:** On SIGINT or SIGQUIT scinit forwards the signal, then always
-sleeps 2 seconds before force-killing, even if the child exited immediately,
-and ignores `--graceful-timeout-secs`. Shutdown is slower than necessary, and a
-child that needs longer than 2s to clean up is killed early. The prompt-exit
-tests measured 2.11s and 2.12s.
-
-**Location:** `src/signals.rs` `handle_termination_signal`, the
-`Signal::SIGINT | Signal::SIGQUIT` arm (`tokio::time::sleep(Duration::from_secs(2))`).
-
-**Reproduction:**
-```bash
-$SCINIT --graceful-timeout-secs 10 $CHILD run & pid=$!; sleep 1
-time (kill -INT $pid; wait $pid)   # ~2s even though the child exits at once
-```
-
-**Affected tests:** see `#[ignore]` tests tagged with this anchor:
-`grep -rn 'bug: sigint-fixed-delay' tests/`
-
-**Fix sketch:** send SIGINT/SIGQUIT through the same graceful path as SIGTERM:
-wait for the child to exit, up to `--graceful-timeout-secs`, then SIGKILL.
-
 ### metadata-modify-restart
 
 **Platform:** macOS only (FSEvents). Linux inotify reports no metadata change

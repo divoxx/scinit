@@ -170,26 +170,44 @@ fn sigterm_forwarded_then_scinit_exits() {
     );
 }
 
-/// A child that ignores SIGTERM is SIGKILLed after --graceful-timeout-secs
-#[test]
-fn sigterm_escalates_to_sigkill() {
-    let (mut scinit, pid) = start_run(&["--graceful-timeout-secs", "1"], &["--ignore", "TERM"]);
+/// A child that ignores the termination signal is SIGKILLed once
+/// --graceful-timeout-secs expires, not before. The 3s timeout is longer than
+/// the fixed 2s SIGINT/SIGQUIT delay scinit used to apply.
+fn assert_escalates_to_sigkill(sig: Signal) {
+    let (mut scinit, pid) = start_run(&["--graceful-timeout-secs", "3"], &["--ignore", short(sig)]);
     let start = Instant::now();
-    scinit.signal(Signal::SIGTERM).unwrap();
+    scinit.signal(sig).unwrap();
     scinit.wait_exit(EXIT_BOUND).unwrap();
     let elapsed = start.elapsed();
     assert!(
         wait_for_pid_gone(pid, Duration::from_secs(3)),
-        "child {} survived SIGTERM escalation\n{}",
+        "child {} survived {:?} escalation\n{}",
         pid,
+        sig,
         scinit.diagnostics()
     );
     assert!(
-        elapsed >= Duration::from_millis(900) && elapsed <= Duration::from_secs(4),
-        "escalation took {:?}, expected ~1s graceful timeout",
+        elapsed >= Duration::from_millis(2900) && elapsed <= Duration::from_secs(6),
+        "{:?} escalation took {:?}, expected ~3s graceful timeout",
+        sig,
         elapsed
     );
     assert!(scinit.events_named("exit").is_empty(), "child should not exit by itself");
+}
+
+#[test]
+fn sigterm_escalates_to_sigkill() {
+    assert_escalates_to_sigkill(Signal::SIGTERM);
+}
+
+#[test]
+fn sigint_escalates_to_sigkill() {
+    assert_escalates_to_sigkill(Signal::SIGINT);
+}
+
+#[test]
+fn sigquit_escalates_to_sigkill() {
+    assert_escalates_to_sigkill(Signal::SIGQUIT);
 }
 
 fn assert_termination_forwarded(sig: Signal) {
@@ -226,15 +244,13 @@ fn assert_prompt_exit(sig: Signal) {
     );
 }
 
-// scinit currently waits a fixed 2s after SIGINT/SIGQUIT (measured ~2.1s)
+// scinit must not linger once the child has exited (it used to wait a fixed 2s)
 #[test]
-#[ignore = "bug: sigint-fixed-delay (KNOWN-ISSUES.md)"]
 fn sigint_exits_promptly_when_child_exits() {
     assert_prompt_exit(Signal::SIGINT);
 }
 
 #[test]
-#[ignore = "bug: sigint-fixed-delay (KNOWN-ISSUES.md)"]
 fn sigquit_exits_promptly_when_child_exits() {
     assert_prompt_exit(Signal::SIGQUIT);
 }
