@@ -559,11 +559,22 @@ pub fn reap_zombies() -> Result<()> {
     Ok(())
 }
 
+/// Shell-style exit code for a child's status: its exit code, or 128 + the
+/// signal number if it was killed by a signal
+pub fn exit_code(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .code()
+        .or_else(|| status.signal().map(|sig| 128 + sig))
+        .unwrap_or(1)
+}
+
 /// Handles child process exit (Scenario A)
 ///
 /// In container environments, scinit's lifecycle is tied to the child process.
-/// When the child exits, scinit should exit with appropriate logging and status.
-pub async fn handle_child_exit(status: std::process::ExitStatus) -> Result<()> {
+/// When the child exits, scinit exits too, with the child's exit code (see
+/// [`exit_code`]) so orchestrators can tell a crash from a clean shutdown.
+pub async fn handle_child_exit(status: std::process::ExitStatus) -> Result<i32> {
     if status.success() {
         info!("Child process exited successfully, scinit exiting cleanly");
     } else if let Some(code) = status.code() {
@@ -590,7 +601,7 @@ pub async fn handle_child_exit(status: std::process::ExitStatus) -> Result<()> {
     debug!("Reaping any remaining zombie processes before exit");
     reap_zombies_async().await;
 
-    Ok(())
+    Ok(exit_code(status))
 }
 
 /// Reaps zombie processes asynchronously to avoid blocking the main loop

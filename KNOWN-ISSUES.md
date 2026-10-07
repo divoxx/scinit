@@ -7,7 +7,7 @@ the default run but are easy to find and run:
 
 ```bash
 # Every test tagged with a given bug
-grep -rn 'bug: exit-code-propagation' tests/
+grep -rn 'bug: fd-remap' tests/
 
 # Run only the known-bug tests (they are expected to fail until fixed)
 cargo test -- --ignored
@@ -25,29 +25,6 @@ export SCINIT_TEST_REPORT=/tmp/scinit-report.log   # the child logs events here
 ```
 
 ## Bugs
-
-### exit-code-propagation
-
-**Description:** scinit always exits 0, whatever happened to its child. A child
-that exits 42 or dies from SIGKILL still produces a successful exit, so
-container orchestrators can't tell a crash from a clean shutdown.
-
-**Location:** `src/process_manager.rs` `handle_child_exit` only logs the status
-and returns `Ok(())`; `src/main.rs` `app_main` / `main` then return `Ok(())`
-unconditionally. The SIGTERM path (`SignalAction::Exit`) does the same.
-
-**Reproduction:**
-```bash
-$SCINIT $CHILD exit 42; echo "exit=$?"        # expected 42, prints 0
-$SCINIT $CHILD kill-self KILL; echo "exit=$?" # expected 137, prints 0
-```
-
-**Affected tests:** see `#[ignore]` tests tagged with this anchor:
-`grep -rn 'bug: exit-code-propagation' tests/`
-
-**Fix sketch:** have `handle_child_exit` return the code (or 128 + signal
-number) and call `std::process::exit` with it from `main` after the runtime is
-shut down. The termination-signal path should return the child's status too.
 
 ### listen-pid-zero
 

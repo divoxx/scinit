@@ -311,7 +311,7 @@ fn modifying_file_in_subdirectory_does_not_restart() {
 fn child_exit_is_not_restarted() {
     let b = Scinit::builder();
     let dir = watched_dir(&b);
-    let (scinit, _status) = live_reload_default_reap(b, &dir)
+    let (scinit, status) = live_reload_default_reap(b, &dir)
         .child(["exit", "3"])
         .run(TIMEOUT)
         .unwrap();
@@ -322,6 +322,7 @@ fn child_exit_is_not_restarted() {
         "an exited child must not be restarted\n{}",
         scinit.diagnostics()
     );
+    crate::integration::harness::assert_exit_code(&scinit, status, 3);
 }
 
 /// A child killed by a signal under live-reload is not restarted either
@@ -329,7 +330,7 @@ fn child_exit_is_not_restarted() {
 fn child_crash_is_not_restarted() {
     let b = Scinit::builder();
     let dir = watched_dir(&b);
-    let (scinit, _status) = live_reload_default_reap(b, &dir)
+    let (scinit, status) = live_reload_default_reap(b, &dir)
         .child(["kill-self", "SEGV"])
         .run(TIMEOUT)
         .unwrap();
@@ -340,6 +341,7 @@ fn child_crash_is_not_restarted() {
         "a crashed child must not be restarted\n{}",
         scinit.diagnostics()
     );
+    crate::integration::harness::assert_exit_code(&scinit, status, 139);
 }
 
 /// scinit still exits (without restarting) when its zombie reaper wins the

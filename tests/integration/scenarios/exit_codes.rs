@@ -14,7 +14,6 @@ fn child_exit_zero() {
 
 /// Child exits 42 → scinit exits 42
 #[test]
-#[ignore = "bug: exit-code-propagation (KNOWN-ISSUES.md)"]
 fn child_exit_code_propagates() {
     let (scinit, status) = Scinit::builder().child(["exit", "42"]).run(TIMEOUT).unwrap();
     scinit.child_pid().unwrap();
@@ -23,7 +22,6 @@ fn child_exit_code_propagates() {
 
 /// Child killed externally by SIGKILL → scinit exits 128 + 9
 #[test]
-#[ignore = "bug: exit-code-propagation (KNOWN-ISSUES.md)"]
 fn child_killed_by_signal_exits_128_plus_signo() {
     let mut scinit = Scinit::builder().child(["run"]).spawn().unwrap();
     let pid = scinit.child_pid().unwrap();
@@ -34,7 +32,6 @@ fn child_killed_by_signal_exits_128_plus_signo() {
 
 /// Child that raises SIGTERM on itself → scinit exits 128 + 15
 #[test]
-#[ignore = "bug: exit-code-propagation (KNOWN-ISSUES.md)"]
 fn child_self_signal_exits_128_plus_signo() {
     let (scinit, status) = Scinit::builder()
         .child(["kill-self", "TERM"])
@@ -59,4 +56,42 @@ fn repeated_clean_exits_stay_zero() {
             scinit.diagnostics()
         );
     }
+}
+
+/// SIGTERM to scinit, child handles it and exits 0 → scinit exits 0
+#[test]
+fn sigterm_with_clean_child_exit_exits_zero() {
+    let mut scinit = Scinit::builder().child(["run"]).spawn().unwrap();
+    let pid = scinit.child_pid().unwrap();
+    scinit.signal(Signal::SIGTERM).unwrap();
+    scinit.wait_for_signal(pid, "TERM", TIMEOUT).unwrap();
+    let status = scinit.wait_exit(TIMEOUT).unwrap();
+    assert_exit_code(&scinit, status, 0);
+}
+
+/// SIGTERM to scinit, child dies from it (default action) → 128 + 15
+#[test]
+fn sigterm_killing_child_exits_143() {
+    let mut scinit = Scinit::builder()
+        .child(["run", "--trap", "USR1"])
+        .spawn()
+        .unwrap();
+    scinit.child_pid().unwrap();
+    scinit.signal(Signal::SIGTERM).unwrap();
+    let status = scinit.wait_exit(TIMEOUT).unwrap();
+    assert_exit_code(&scinit, status, 143);
+}
+
+/// Child ignores SIGTERM and is SIGKILLed after the graceful timeout → 128 + 9
+#[test]
+fn sigterm_escalation_exits_137() {
+    let mut scinit = Scinit::builder()
+        .args(["--graceful-timeout-secs", "1"])
+        .child(["run", "--ignore", "TERM"])
+        .spawn()
+        .unwrap();
+    scinit.child_pid().unwrap();
+    scinit.signal(Signal::SIGTERM).unwrap();
+    let status = scinit.wait_exit(TIMEOUT).unwrap();
+    assert_exit_code(&scinit, status, 137);
 }

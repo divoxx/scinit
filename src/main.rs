@@ -20,8 +20,8 @@ use cli::{Cli, Config};
 use file_watcher::{handle_file_events, FileWatcher};
 use port_manager::PortManager;
 use process_manager::{
-    handle_child_exit, process_group_to_foreground, reap_zombies_async, ProcessConfig,
-    ProcessManager,
+    exit_code, handle_child_exit, process_group_to_foreground, reap_zombies_async,
+    ProcessConfig, ProcessManager,
 };
 use signals::{SignalAction, SignalHandler};
 
@@ -50,10 +50,12 @@ fn main() -> Result<()> {
     // sigwait never finish, so dropping the runtime would block forever
     rt.shutdown_timeout(Duration::from_millis(100));
 
-    result
+    // Mirror the child's exit status, like other container inits do
+    std::process::exit(result?)
 }
 
-async fn app_main(signal_handler: &mut SignalHandler) -> Result<()> {
+/// Returns the exit code scinit should exit with
+async fn app_main(signal_handler: &mut SignalHandler) -> Result<i32> {
     // Parse CLI arguments
     let cli = Cli::parse();
 
@@ -82,7 +84,7 @@ async fn app_main(signal_handler: &mut SignalHandler) -> Result<()> {
     };
 
     // Run the main event loop
-    run_main_loop(
+    let code = run_main_loop(
         config,
         &mut process_manager,
         signal_handler,
@@ -90,8 +92,8 @@ async fn app_main(signal_handler: &mut SignalHandler) -> Result<()> {
     )
     .await?;
 
-    info!("scinit exiting");
-    Ok(())
+    info!("scinit exiting with code {}", code);
+    Ok(code)
 }
 
 /// Main event loop orchestration
@@ -100,7 +102,7 @@ async fn run_main_loop(
     process_manager: &mut ProcessManager,
     signal_handler: &mut SignalHandler,
     file_watcher: &mut Option<FileWatcher>,
-) -> Result<()> {
+) -> Result<i32> {
     let mut zombie_reap_interval = interval(config.zombie_reap_interval);
     // Shares tokio's SIGCHLD handler, which also drives `Child::wait()`
     let mut sigchld = signal(SignalKind::child())?;
@@ -131,7 +133,7 @@ async fn run_main_loop(
     loop {
         // Check for file events first (if enabled)
         if file_watcher.is_some() && handle_file_events(file_watcher, process_manager).await? {
-            return Ok(()); // Exit requested
+            return Ok(1); // Restart limit exceeded
         }
 
         select! {
@@ -140,8 +142,7 @@ async fn run_main_loop(
                 match exit_status {
                     Ok(Some(status)) => {
                         // Scenario A: Child process exit handling
-                        handle_child_exit(status).await?;
-                        return Ok(());
+                        return handle_child_exit(status).await;
                     }
                     Ok(None) => {
                         // No process to wait for, continue
@@ -156,8 +157,17 @@ async fn run_main_loop(
 
             // Synchronous signal handling - proper for init systems
             signal = signal_handler.wait_for_signal() => {
-                match signal_handler.process_signal(signal?, process_manager, config.live_reload.graceful_timeout_secs).await? {
-                    SignalAction::Exit => return Ok(()),
+                let signal = signal?;
+                match signal_handler.process_signal(signal, process_manager, config.live_reload.graceful_timeout_secs).await? {
+                    SignalAction::Exit => {
+                        // The child's status if it was observed; otherwise
+                        // report death by the signal that stopped us
+                        return Ok(process_manager
+                            .process_info()
+                            .exit_status
+                            .map(exit_code)
+                            .unwrap_or(128 + signal as i32));
+                    }
                     SignalAction::Continue => {},
                 }
             }
