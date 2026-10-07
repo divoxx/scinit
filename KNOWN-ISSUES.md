@@ -34,11 +34,6 @@ sketch), with their failing tests marked `#[ignore]`.
 
 Smaller issues, not (yet) covered by `#[ignore]` tests:
 
-- **`LISTEN_*` leaks without `--ports`.** A `LISTEN_FDS`/`LISTEN_PID` already in
-  scinit's environment is passed to the child unchanged even when scinit
-  binds nothing, so the child may treat unrelated fds 3.. as listeners. The
-  `--ports` path already replaces them. Strip them when no ports are
-  configured, and flip `inherited_listen_fds_leaks_without_ports`.
 - **Stray inherited fds reach the child.** Any non-close-on-exec fd that
   scinit itself inherited (e.g. sockets leaked by GitHub's macOS runner) is
   passed on to the child, next to the activated sockets at 3... Container
@@ -46,8 +41,6 @@ Smaller issues, not (yet) covered by `#[ignore]` tests:
   systemd closes everything except the passed fds. The test harness starts
   scinit with a clean fd table. Consider marking all fds above 2 (other than
   the activated sockets) close-on-exec in the child's `pre_exec`.
-- **`--zombie-reap-interval-ms 0` (probably) panics.** `tokio::time::interval`
-  panics on a zero period. Reject 0 during argument parsing.
 - **FSEvents replays writes made just before the watcher starts (macOS).**
   On macOS, a file written shortly before scinit starts watching can be
   reported as a change right after startup, causing one spurious restart.

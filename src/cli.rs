@@ -64,8 +64,8 @@ pub struct Cli {
     #[arg(long, default_value = "30")]
     pub graceful_timeout_secs: u64,
 
-    /// Zombie reaping interval (ms)
-    #[arg(long, default_value = "5000")]
+    /// Zombie reaping interval (ms, at least 1)
+    #[arg(long, default_value = "5000", value_parser = clap::value_parser!(u64).range(1..))]
     pub zombie_reap_interval_ms: u64,
 
     /// Command to execute
