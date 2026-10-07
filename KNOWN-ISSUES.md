@@ -55,11 +55,6 @@ Smaller issues, not (yet) covered by `#[ignore]` tests:
   logged as `UNKNOWN`, and signals outside the table (e.g. SIGSEGV) are
   `UNKNOWN` everywhere. Logs only; exit codes are correct. Use
   `Signal::try_from(n).map(Signal::as_str)`.
-- **The terminal is handed to the child only once.** `foreground_child`
-  (`src/main.rs`) makes the first child's process group the terminal's
-  foreground group, but it isn't called again after a live-reload restart, so
-  later children don't get Ctrl-C or terminal input when run interactively.
-  No effect in containers without a TTY. Call it after every spawn.
 - **Stray inherited fds reach the child.** Any non-close-on-exec fd that
   scinit itself inherited (e.g. sockets leaked by GitHub's macOS runner) is
   passed on to the child, next to the activated sockets at 3... Container

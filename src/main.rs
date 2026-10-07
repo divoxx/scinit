@@ -9,11 +9,9 @@ mod process_manager;
 mod reaper;
 mod signals;
 mod socket_activation;
+mod terminal;
 
 use clap::Parser;
-use nix::unistd::{getpgid, tcsetpgrp, Pid};
-use std::fs::File;
-use std::io::IsTerminal;
 use std::time::Duration;
 use tokio::select;
 use tokio::signal::unix::{signal, SignalKind};
@@ -93,17 +91,20 @@ async fn run_main_loop(
     );
 
     // Start file watching if enabled
-    let mut file_watcher = config.file_watch_config().map(FileWatcher::start).transpose()?;
-    if file_watcher.is_some() {
-        info!("File watching started for live-reload");
-    } else {
-        debug!("Live-reload disabled, no file watching");
-    }
+    let mut file_watcher = match config.file_watch_config() {
+        Some(watch_config) => {
+            let watcher = FileWatcher::start(watch_config)?;
+            info!("File watching started for live-reload");
+            Some(watcher)
+        }
+        None => {
+            debug!("Live-reload disabled, no file watching");
+            None
+        }
+    };
 
     // Spawn initial process
     process_manager.spawn_process().await?;
-
-    foreground_child(process_manager).await?;
 
     loop {
         select! {
@@ -195,39 +196,6 @@ async fn on_file_event(event: FileChangeEvent, process_manager: &mut ProcessMana
         FileChangeEvent::WatchError(error) => {
             warn!("File watching error: {}", error);
         }
-    }
-    Ok(())
-}
-
-/// Hands the terminal (if any) to the child's process group
-async fn foreground_child(process_manager: &ProcessManager) -> Result<()> {
-    let Some(pid) = process_manager.pid() else {
-        return Ok(());
-    };
-    let pgid = getpgid(Some(pid))?;
-    tokio::task::spawn_blocking(move || process_group_to_foreground(pgid)).await?
-}
-
-/// Sets the process group as the foreground process group if a terminal is available
-fn process_group_to_foreground(pgid: Pid) -> Result<()> {
-    let tty = match File::open("/dev/tty") {
-        Ok(tty) => tty,
-        Err(e) => {
-            debug!(
-                "Cannot open /dev/tty ({}), skipping foreground process group setup",
-                e
-            );
-            return Ok(());
-        }
-    };
-    if !tty.is_terminal() {
-        debug!("Not a terminal, skipping foreground process group setup");
-        return Ok(());
-    }
-    debug!("Setting process group {} as foreground", &pgid);
-    if let Err(e) = tcsetpgrp(tty, pgid) {
-        error!("Failed to set process group {} as foreground: {}", &pgid, e);
-        return Err(e.into());
     }
     Ok(())
 }

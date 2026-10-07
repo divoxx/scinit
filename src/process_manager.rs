@@ -1,6 +1,7 @@
 use crate::environment::Environment;
 use crate::port_manager::PortManager;
 use crate::reaper::{clear_managed_child, set_managed_child};
+use crate::terminal;
 use crate::signals::Signal;
 use crate::socket_activation::SocketActivationExec;
 use crate::Result;
@@ -109,7 +110,20 @@ impl ProcessManager {
 
         let child = command.spawn()
             .map_err(|e| eyre!("Failed to spawn process '{}': {}", self.config.command, e))?;
-        self.track_child(child)
+        self.track_child(child)?;
+        self.hand_terminal_to_child().await
+    }
+
+    /// Makes the child's process group the terminal's foreground group, if
+    /// scinit has a terminal, so the child gets Ctrl-C and terminal input.
+    /// Runs on every spawn, including live-reload restarts.
+    async fn hand_terminal_to_child(&self) -> Result<()> {
+        let Some(pid) = self.pid() else {
+            return Ok(());
+        };
+        // The child leads its own process group (process_group(0)), so its
+        // pid is the group id
+        tokio::task::spawn_blocking(move || terminal::make_foreground(pid)).await?
     }
 
     /// Variables the child gets on top of scinit's environment: systemd
