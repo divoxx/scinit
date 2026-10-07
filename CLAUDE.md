@@ -58,13 +58,14 @@ cargo run -- --live-reload --debounce-ms 1000 --restart-delay-ms 500 my-app
 - **`SignalHandler`** (`src/signals.rs`): Synchronous `sigwait`-based signal handling, with proper signal masking excluding critical signals (SIGFPE, SIGILL, SIGSEGV, etc.)
 - **`FileWatcher`** (`src/file_watcher.rs`): Live-reload functionality using the `notify` crate with debouncing to prevent excessive restarts
 - **`PortManager`** (`src/port_manager.rs`): Socket inheritance system for zero-downtime restarts, supporting SO_REUSEPORT and multiple ports
+- **`SocketActivationExec`** (`src/socket_activation.rs`): Execs a child with sockets from a `pre_exec` hook, so it can move them to fds 3.. and set `LISTEN_PID` to the child's own pid
 
 ### Key Architecture Principles
 
 1. **Async-First Design**: Uses tokio's async runtime throughout, with event-driven signal handling instead of polling
 2. **Container-Optimized**: Only allows file-change restarts, not crash restarts (crashes exit the container)
 3. **Process Group Management**: Creates isolated process groups and handles terminal control properly
-4. **Socket Inheritance**: Supports binding ports before process spawn and passing them to the child using systemd-style socket activation (`LISTEN_FDS`/`LISTEN_PID`)
+4. **Socket Inheritance**: Supports binding ports before process spawn and passing them to the child using systemd socket activation: fds 3, 4, ... in `--ports` order, `LISTEN_FDS`, and `LISTEN_PID` set to the child's pid
 5. **Graceful Shutdown**: Implements proper SIGTERM → SIGKILL escalation with configurable timeouts
 
 ### Signal Flow Architecture
@@ -117,7 +118,8 @@ The `listen` fixture mode verifies socket inheritance end to end:
 
 - Never allow crash-based restarts in container environments
 - Always use process groups for proper signal forwarding
-- File descriptors must have FD_CLOEXEC cleared for inheritance
+- Bound sockets stay close-on-exec; the child gets `dup2` copies at fds 3.. (which clears the flag), so only those are inherited
+- Code in the child between fork and exec (`pre_exec`) must be async-signal-safe: build everything before forking, never allocate there
 - **Signal masking**: Block handled signals on the main thread before any other thread exists; never block critical/synchronous signals or SIGCHLD
 - **Signal handling**: Consume handled signals only on the dedicated sigwait thread; never call `sigwait` from per-iteration tasks (cancelled waits leave threads that swallow signals)
 - Zombie reaping runs in background tasks to avoid blocking main loop

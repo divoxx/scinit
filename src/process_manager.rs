@@ -2,6 +2,7 @@ use super::Result;
 use crate::environment::Environment;
 use crate::port_manager::PortManager;
 use crate::signals::signal_name;
+use crate::socket_activation::SocketActivationExec;
 use eyre::eyre;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{getpgid, tcsetpgrp, Pid};
@@ -139,10 +140,8 @@ impl ProcessManager {
         let mut env_vars = Environment::from(std::env::vars().collect::<HashMap<_, _>>());
 
         // Add systemd socket activation environment variables
-        // Note: We use a placeholder PID here; in real systemd socket activation,
-        // the service manager would set the correct PID after fork/exec
-        let socket_env = self.port_manager.get_socket_activation_env(0);
-        env_vars.extend(socket_env);
+        let socket_env = self.port_manager.get_socket_activation_env();
+        env_vars.extend(socket_env.clone());
 
         // Add custom environment variables
         env_vars.extend(self.config.environment.clone());
@@ -176,6 +175,22 @@ impl ProcessManager {
 
                 Ok(())
             });
+        }
+
+        // With sockets to pass, the child execs itself so it can move them to
+        // fds 3.. and set LISTEN_PID to its own pid (see socket_activation)
+        let listen_fds = self.port_manager.listen_fds();
+        if !listen_fds.is_empty() {
+            let mut exec = SocketActivationExec::new(
+                &self.config.command,
+                &self.config.args,
+                listen_fds,
+                socket_env,
+                self.config.environment.clone(),
+            )?;
+            unsafe {
+                command.pre_exec(move || Err(exec.exec_in_child()));
+            }
         }
 
         // Set working directory if specified

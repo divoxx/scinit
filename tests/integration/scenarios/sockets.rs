@@ -52,7 +52,6 @@ fn listen_fds_three_ports() {
 
 /// `LISTEN_PID` must be the child's own pid, or sd_listen_fds() ignores the fds
 #[test]
-#[ignore = "bug: listen-pid-zero (KNOWN-ISSUES.md)"]
 fn listen_pid_is_child_pid() {
     let (scinit, events) = dump_with_ports(&free_ports(1));
     let pid = scinit.child_pid().unwrap();
@@ -66,12 +65,80 @@ fn listen_pid_is_child_pid() {
 
 /// Inherited sockets occupy exactly fds 3..3+n, as the systemd protocol requires
 #[test]
-#[ignore = "bug: fd-remap (KNOWN-ISSUES.md)"]
 fn inherited_fds_start_at_3_and_are_contiguous() {
     let n = 3;
     let (scinit, events) = dump_with_ports(&free_ports(n));
     let expected: Vec<i32> = (3..3 + n as i32).collect();
     assert_eq!(socket_fds(&events), expected, "{}", scinit.diagnostics());
+}
+
+/// Sockets are passed in `--ports` order: fd 3 is the first port listed
+#[test]
+fn fds_follow_ports_order() {
+    let mut ports = free_ports(3);
+    // Descending, so port order can't be mistaken for sorted order
+    ports.sort_unstable_by(|a, b| b.cmp(a));
+    let scinit = Scinit::builder()
+        .args(["--ports", &ports_arg(&ports)])
+        .child(["listen"])
+        .spawn()
+        .unwrap();
+    scinit.wait_for_event("ready", TIMEOUT).unwrap();
+    for (i, port) in ports.iter().enumerate() {
+        let fd = 3 + i;
+        assert!(
+            scinit.events_named("listening").iter().any(|e| {
+                e.get("fd") == Some(fd.to_string().as_str())
+                    && e.get("port") == Some(port.to_string().as_str())
+            }),
+            "expected fd {} to be port {}\n{}",
+            fd,
+            port,
+            scinit.diagnostics()
+        );
+    }
+}
+
+/// With `--ports`, socket activation variables inherited by scinit describe
+/// someone else's sockets and are replaced, not passed through
+#[test]
+fn inherited_listen_vars_replaced_with_ports() {
+    let ports = free_ports(1);
+    let scinit = Scinit::builder()
+        .env("LISTEN_FDS", "7")
+        .env("LISTEN_PID", "1")
+        .env("LISTEN_FDNAMES", "stale")
+        .args(["--ports", &ports_arg(&ports)])
+        .child(["dump"])
+        .spawn()
+        .unwrap();
+    let events = scinit
+        .wait_for("dump-done", TIMEOUT, |evs| evs.iter().any(|e| e.name == "dump-done"))
+        .unwrap();
+    let pid = scinit.child_pid().unwrap();
+    assert_eq!(env_value(&events, "LISTEN_FDS"), Some("1".to_string()));
+    assert_eq!(env_value(&events, "LISTEN_PID"), Some(pid.to_string()));
+    assert_eq!(env_value(&events, "LISTEN_FDNAMES"), None, "{}", scinit.diagnostics());
+}
+
+/// A bare command name is resolved through PATH, and the child sees its own
+/// pid in LISTEN_PID (checked here by a shell against `$$`)
+#[test]
+fn listen_pid_matches_shell_pid_via_path_lookup() {
+    let ports = free_ports(1);
+    let (scinit, status) = Scinit::builder()
+        .args(["--ports", &ports_arg(&ports)])
+        .command(["sh", "-c", "echo \"listen_pid=$LISTEN_PID self=$$\""])
+        .run(TIMEOUT)
+        .unwrap();
+    assert_exit_code(&scinit, status, 0);
+    let stdout = scinit.stdout();
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("listen_pid="))
+        .unwrap_or_else(|| panic!("no output\n{}", scinit.diagnostics()));
+    let (listen_pid, own_pid) = line["listen_pid=".len()..].split_once(" self=").unwrap();
+    assert_eq!(listen_pid, own_pid, "{}", scinit.diagnostics());
 }
 
 /// The child (not scinit's own listen backlog) accepts on every port

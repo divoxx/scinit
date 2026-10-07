@@ -7,7 +7,7 @@ the default run but are easy to find and run:
 
 ```bash
 # Every test tagged with a given bug
-grep -rn 'bug: fd-remap' tests/
+grep -rn 'bug: debounce-drops-trailing-change' tests/
 
 # Run only the known-bug tests (they are expected to fail until fixed)
 cargo test -- --ignored
@@ -25,53 +25,6 @@ export SCINIT_TEST_REPORT=/tmp/scinit-report.log   # the child logs events here
 ```
 
 ## Bugs
-
-### listen-pid-zero
-
-**Description:** With `--ports`, the child receives `LISTEN_PID=0`. Under the
-systemd socket-activation protocol a process must ignore `LISTEN_FDS` unless
-`LISTEN_PID` equals its own pid, so libraries such as `sd_listen_fds` refuse
-the sockets.
-
-**Location:** `src/process_manager.rs` `spawn_process` calls
-`get_socket_activation_env(0)` (around line 137); the real pid is not known
-until after fork.
-
-**Reproduction:**
-```bash
-$SCINIT --ports 18080 $CHILD dump --then-exit
-grep LISTEN_PID $SCINIT_TEST_REPORT   # value=0, expected the child's pid
-```
-
-**Affected tests:** see `#[ignore]` tests tagged with this anchor:
-`grep -rn 'bug: listen-pid-zero' tests/`
-
-**Fix sketch:** set `LISTEN_PID` in `pre_exec` with `getpid()` (via `setenv`
-just before exec), or exec through a tiny wrapper that sets it.
-
-### fd-remap
-
-**Description:** Inherited listening sockets are not moved to fd 3 onwards.
-They arrive at whatever fd numbers scinit happened to get (9 and 10 observed
-on macOS), while `LISTEN_FDS=n` tells the child to use 3..3+n. Their order is
-also nondeterministic, because the listeners are kept in a `HashMap`.
-
-**Location:** `src/process_manager.rs` `spawn_process` / `pre_exec` (CLOEXEC is
-cleared but no `dup2`), `src/port_manager.rs` (listener storage and
-`get_socket_activation_env`).
-
-**Reproduction:**
-```bash
-$SCINIT --ports 18080,18081 $CHILD dump --then-exit
-grep '^fds' $SCINIT_TEST_REPORT   # sockets=9,10 (for example), expected 3,4
-```
-
-**Affected tests:** see `#[ignore]` tests tagged with this anchor:
-`grep -rn 'bug: fd-remap' tests/`
-
-**Fix sketch:** in `pre_exec`, `dup2` the listeners to 3..3+n in sorted port
-order and clear CLOEXEC on the targets. Sort the listeners by port so
-`LISTEN_FDNAMES` and the fd order are deterministic.
 
 ### metadata-modify-restart
 

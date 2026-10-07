@@ -404,8 +404,8 @@ fn listener_survives_restart() {
         )
     });
     assert!(
-        reply.starts_with(&format!("pid={} ", new)),
-        "after restart, reply {:?} should come from new pid {}\n{}",
+        reply.starts_with(&format!("pid={} fd=3 ", new)),
+        "after restart, reply {:?} should come from new pid {} on fd 3\n{}",
         reply,
         new,
         scinit.diagnostics()

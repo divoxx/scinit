@@ -6,6 +6,7 @@ mod file_watcher;
 mod port_manager;
 mod process_manager;
 mod signals;
+mod socket_activation;
 
 use clap::Parser;
 use environment::Environment;

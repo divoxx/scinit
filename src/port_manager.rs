@@ -1,15 +1,11 @@
 use super::Result;
 use crate::environment::Environment;
-use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::sys::socket::{setsockopt, sockopt::ReusePort};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr};
-use std::os::unix::io::{AsRawFd, BorrowedFd};
+use std::os::unix::io::{AsRawFd, RawFd};
 use tracing::{debug, info};
-
-/// Standard systemd socket activation start file descriptor
-const SD_LISTEN_FDS_START: i32 = 3;
 
 /// Configuration for port binding behavior
 #[derive(Debug, Clone)]
@@ -118,12 +114,8 @@ impl PortManager {
         socket.bind(&socket_addr.into())?;
         socket.listen(128)?; // Set backlog
 
-        // Mark socket as inheritable by clearing close-on-exec flag initially
-        let fd = socket.as_raw_fd();
-        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
-        let mut flags = FdFlag::from_bits_truncate(fcntl(borrowed_fd, FcntlArg::F_GETFD)?);
-        flags.remove(FdFlag::FD_CLOEXEC);
-        fcntl(borrowed_fd, FcntlArg::F_SETFD(flags))?;
+        // The socket stays close-on-exec (socket2's default): the child gets
+        // a copy at its systemd fd number instead, see socket_activation
 
         // Store the bound socket and address
         self.bound_ports.insert(port, socket_addr);
@@ -133,77 +125,38 @@ impl PortManager {
         Ok(())
     }
 
-    /// Gets the file descriptors for inherited ports
-    ///
-    /// This method returns the file descriptors of bound sockets
-    /// that should be inherited by child processes.
-    ///
-    /// # Returns
-    /// * `Vec<i32>` - List of file descriptors
-    pub fn get_inherited_fds(&self) -> Vec<i32> {
-        self.sockets
-            .values()
+    /// File descriptors of the bound sockets, in `--ports` order. This is the
+    /// order they are passed to the child in (fd 3, 4, ...), matching
+    /// `LISTEN_FDNAMES`.
+    pub fn listen_fds(&self) -> Vec<RawFd> {
+        let mut seen = Vec::new();
+        self.config
+            .ports
+            .iter()
+            .filter(|port| {
+                let first = !seen.contains(*port);
+                seen.push(**port);
+                first
+            })
+            .filter_map(|port| self.sockets.get(port))
             .map(|socket| socket.as_raw_fd())
             .collect()
-    }
-
-    /// Gets the number of inherited file descriptors for LISTEN_FDS environment variable
-    ///
-    /// # Returns
-    /// * `String` - Number of file descriptors as string
-    pub fn get_listen_fds_count(&self) -> String {
-        self.sockets.len().to_string()
-    }
-
-    /// Gets the socket names for LISTEN_FDNAMES environment variable
-    ///
-    /// # Returns
-    /// * `Option<String>` - Colon-separated socket names, if configured
-    pub fn get_listen_fdnames(&self) -> Option<String> {
-        self.config
-            .socket_names
-            .as_ref()
-            .map(|names| names.join(":"))
-    }
-
-    /// Prepares file descriptors for systemd socket activation
-    ///
-    /// This method ensures that file descriptors start at SD_LISTEN_FDS_START (3)
-    /// and sets the FD_CLOEXEC flag as required by systemd socket activation.
-    ///
-    /// # Arguments
-    /// * `child_pid` - Process ID of the child process for validation
-    ///
-    /// # Returns
-    /// * `Result<()>` - Success or error
-    pub fn prepare_systemd_fds(&self, _child_pid: nix::unistd::Pid) -> Result<()> {
-        // For systemd socket activation, we need to set FD_CLOEXEC on inherited FDs
-        // This is the opposite of what we did during binding
-        for socket in self.sockets.values() {
-            let fd = socket.as_raw_fd();
-            let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
-            let mut flags = FdFlag::from_bits_truncate(fcntl(borrowed_fd, FcntlArg::F_GETFD)?);
-            flags.insert(FdFlag::FD_CLOEXEC);
-            fcntl(borrowed_fd, FcntlArg::F_SETFD(flags))?;
-        }
-        Ok(())
     }
 
     /// Gets the systemd socket activation environment variables for the child process.
     ///
     /// Returns an Environment containing the standard systemd socket activation variables:
     /// - `LISTEN_FDS`: Number of file descriptors being passed (as string)
-    /// - `LISTEN_PID`: Process ID for validation (set to child PID)
     /// - `LISTEN_FDNAMES`: Optional colon-separated socket names
+    ///
+    /// `LISTEN_PID` is not included: only the forked child knows its pid, so
+    /// `socket_activation` fills it in there.
     ///
     /// If no sockets are bound, returns an empty Environment.
     ///
-    /// # Arguments
-    /// * `child_pid` - The process ID of the child process
-    ///
     /// # Returns
     /// * `Environment` - Environment variables for systemd socket activation
-    pub fn get_socket_activation_env(&self, child_pid: u32) -> Environment {
+    pub fn get_socket_activation_env(&self) -> Environment {
         if self.sockets.is_empty() {
             return Environment::new();
         }
@@ -212,9 +165,6 @@ impl PortManager {
 
         // LISTEN_FDS: Number of file descriptors
         env.set("LISTEN_FDS", self.sockets.len().to_string());
-
-        // LISTEN_PID: Child process PID for validation
-        env.set("LISTEN_PID", child_pid.to_string());
 
         // LISTEN_FDNAMES: Optional socket names
         if let Some(ref names) = self.config.socket_names {
@@ -298,7 +248,7 @@ mod tests {
         let mut manager = PortManager::new(config);
         manager.bind_ports().await.unwrap();
 
-        let fds = manager.get_inherited_fds();
+        let fds = manager.listen_fds();
         assert_eq!(fds.len(), 1);
         assert!(fds[0] > 0); // File descriptor should be positive
 
