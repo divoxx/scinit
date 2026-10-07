@@ -83,8 +83,9 @@ The signal handling follows proper init system semantics:
 ### Live-Reload Architecture
 
 The live-reload system integrates:
-- File system monitoring with debouncing
-- Socket inheritance for zero-downtime restarts
+- File system monitoring (non-recursive) with a trailing-edge debounce: each content change or rename re-arms a `--debounce-ms` timer, and the restart fires once changes go quiet. Metadata-only changes and creating empty files are ignored
+- File events are a branch of the main loop's `select!`, so a change is acted on as soon as the debounce fires
+- Socket inheritance for zero-downtime restarts: listeners are bound once and the same sockets are passed to every child, so connections queue in the backlog while no child is running
 - Process lifecycle management
 - Only file-change triggers are allowed (not crashes)
 

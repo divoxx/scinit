@@ -203,7 +203,6 @@ fn burst_of_writes_restarts_once() {
 /// be picked up once the window ends; otherwise the app keeps running with
 /// the stale file
 #[test]
-#[ignore = "bug: debounce-drops-trailing-change (KNOWN-ISSUES.md)"]
 fn change_within_debounce_window_is_not_lost() {
     let b = Scinit::builder();
     let dir = watched_dir(&b);
@@ -256,10 +255,6 @@ fn writes_outside_debounce_window_each_restart() {
 /// On macOS creation also emits `Modify(Metadata(Extended))` (xattrs), which
 /// `is_relevant_change` accepts like a content change.
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "bug: metadata-modify-restart (KNOWN-ISSUES.md)"
-)]
 fn creating_file_does_not_restart() {
     let b = Scinit::builder();
     let dir = watched_dir(&b);
@@ -471,7 +466,6 @@ fn listener_survives_restart() {
 
 /// A file change is acted on promptly, without waiting for the zombie-reap timer
 #[test]
-#[ignore = "bug: file-event-latency (KNOWN-ISSUES.md)"]
 fn restart_is_prompt_with_default_reap_interval() {
     let b = Scinit::builder();
     let dir = watched_dir(&b);

@@ -18,7 +18,7 @@ use tracing::{debug, error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use cli::{Cli, Config};
-use file_watcher::{handle_file_events, FileWatcher};
+use file_watcher::{handle_file_event, FileChangeEvent, FileWatcher};
 use port_manager::PortManager;
 use process_manager::{
     exit_code, handle_child_exit, process_group_to_foreground, reap_zombies_async,
@@ -132,11 +132,6 @@ async fn run_main_loop(
     }
 
     loop {
-        // Check for file events first (if enabled)
-        if file_watcher.is_some() && handle_file_events(file_watcher, process_manager).await? {
-            return Ok(1); // Restart limit exceeded
-        }
-
         select! {
             // Check if subprocess has exited
             exit_status = process_manager.wait_for_exit() => {
@@ -173,6 +168,13 @@ async fn run_main_loop(
                 }
             }
 
+            // Live-reload: restart as soon as a (debounced) change arrives
+            Some(event) = next_file_event(file_watcher) => {
+                if handle_file_event(event, process_manager).await? {
+                    return Ok(1); // Restart not allowed
+                }
+            }
+
             // Reap orphans as soon as they exit (matters when scinit is PID 1)
             _ = sigchld.recv() => {
                 debug!("received SIGCHLD, reaping zombie processes");
@@ -187,3 +189,10 @@ async fn run_main_loop(
     }
 }
 
+/// Next file watcher event, or never if live-reload is disabled
+async fn next_file_event(file_watcher: &mut Option<FileWatcher>) -> Option<FileChangeEvent> {
+    match file_watcher {
+        Some(watcher) => watcher.next_event().await,
+        None => std::future::pending().await,
+    }
+}
