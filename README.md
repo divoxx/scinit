@@ -87,7 +87,7 @@ With `--ports`, scinit binds the listening sockets itself and passes them to the
 - The sockets are at fds **3, 4, ...** in `--ports` order.
 - `LISTEN_FDS` is the number of sockets, and `LISTEN_PID` is the child's own pid. Any `LISTEN_*` variables scinit itself inherited are replaced.
 - Each port is bound **once** and the same sockets are passed to every child. During a live-reload restart, connections wait in the socket's backlog and the new child serves them, so restarts don't drop or refuse connections.
-- Sockets are bound with `SO_REUSEADDR`, so a restarted scinit (e.g. after a container restart) can bind its ports again right away, even while connections it served are in TIME_WAIT. A port another process is listening on still fails with "Address already in use".
+- Sockets are bound with `SO_REUSEADDR`, so a restarted scinit (e.g. after a container restart) can bind its ports again right away, even while connections it served are in TIME_WAIT. On Linux, a port another process is listening on still fails with "Address already in use". On macOS (BSD socket semantics), binding a specific address such as the default `127.0.0.1` succeeds even if another process listens on the wildcard address (`0.0.0.0`) for that port, and loopback connections then go to scinit's child; the same exact address still fails.
 - `SO_REUSEPORT` is only set with `--reuse-port`. Live-reload restarts don't need it; it is for sharing ports with other processes on purpose, such as handing over between two scinit instances or load balancing across several.
 
 ## Platforms
