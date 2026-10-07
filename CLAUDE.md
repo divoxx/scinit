@@ -98,7 +98,7 @@ The live-reload system integrates:
 - **Harness** (`tests/integration/harness.rs`): `Scinit::builder()` spawns the real scinit binary with the fixture as child (with only stdio open), captures stdout/stderr, and offers builder shortcuts (`start`, `spawn_dump`, `ports`, `watch`), polling helpers (`wait_for`, `wait_for_nth_match`, `wait_exit`, `poll_until`) and assertions (`assert_exit_code`, `assert_start_count`, `assert_reply_from`) instead of fixed sleeps. Plain `#[test]`, no tokio
 - **Scenarios** (`tests/integration/scenarios/`): `cli`, `exit_codes`, `signals`, `sockets`, `live_reload`, and `linux` (Linux only: `/proc` checks and scinit as PID 1 via `unshare`). All compile into the single `integration_test` target
 - **Linux runner** (`scripts/test-linux.sh`, `tests/container/Containerfile`): builds a test image and runs `cargo test` in rootless podman (args pass through), with the permissions the `linux` PID-1 tests need; `SCINIT_REQUIRE_PID1=1` makes them fail rather than skip
-- **CI** (`.github/workflows/ci.yml`): on every PR and push to `main`, runs `cargo test` on a macOS runner and `scripts/test-linux.sh` on an Ubuntu runner
+- **CI** (`.github/workflows/ci.yml`): on every PR and push to `main`, runs `cargo clippy --all-targets -- -D warnings` on macOS and Linux, `cargo test` on a macOS runner and `scripts/test-linux.sh` on an Ubuntu runner
 
 ### Known Bugs
 
