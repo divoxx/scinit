@@ -6,8 +6,8 @@
 #   scripts/test-linux.sh -- --ignored          # known-bug tests
 #
 # Arguments are passed through to `cargo test`. Builds the test image
-# (tests/container/Containerfile) first; dependencies are compiled in their own
-# layer, so source edits only rebuild scinit itself.
+# (tests/container/Containerfile) first; the crate registry and target dir live
+# in build cache mounts, so only what changed recompiles.
 #
 # Environment:
 #   SCINIT_TEST_IMAGE       image tag (default: scinit-test:latest)
