@@ -34,12 +34,6 @@ sketch), with their failing tests marked `#[ignore]`.
 
 Smaller issues, not (yet) covered by `#[ignore]` tests:
 
-- **Non-UTF-8 environment variables crash scinit (without `--ports`).**
-  `spawn_process` builds the child environment with `std::env::vars()`
-  (`src/process_manager.rs`), which panics on a variable that isn't valid
-  UTF-8, so scinit dies before starting the child. The `--ports` path uses
-  `vars_os()` and is unaffected. Use `vars_os()` (or `Command::envs` on top
-  of the inherited environment) on both paths.
 - **`LISTEN_*` leaks without `--ports`.** A `LISTEN_FDS`/`LISTEN_PID` already in
   scinit's environment is passed to the child unchanged even when scinit
   binds nothing, so the child may treat unrelated fds 3.. as listeners. The
