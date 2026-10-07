@@ -1,4 +1,4 @@
-type Result<T> = color_eyre::eyre::Result<T>;
+type Result<T> = eyre::Result<T>;
 
 mod cli;
 mod environment;
@@ -21,8 +21,8 @@ use cli::{Cli, Config};
 use file_watcher::{handle_file_event, FileChangeEvent, FileWatcher};
 use port_manager::PortManager;
 use process_manager::{
-    exit_code, handle_child_exit, process_group_to_foreground, reap_zombies_async,
-    ProcessConfig, ProcessManager,
+    exit_code, handle_child_exit, process_group_to_foreground, spawn_zombie_reap, ProcessConfig,
+    ProcessManager,
 };
 use signals::{SignalAction, SignalHandler};
 
@@ -71,18 +71,13 @@ async fn app_main(signal_handler: &mut SignalHandler) -> Result<i32> {
         args: config.args.clone(),
         restart_delay: Duration::from_millis(config.live_reload.restart_delay_ms),
         graceful_shutdown_timeout: Duration::from_secs(config.live_reload.graceful_timeout_secs),
-        working_directory: None,
         environment: Environment::new(),
     };
 
     let mut process_manager = ProcessManager::new(process_config, port_manager);
 
     // Create file watcher if live-reload is enabled
-    let mut file_watcher = if let Some(watch_config) = config.file_watch_config() {
-        Some(FileWatcher::new(watch_config)?)
-    } else {
-        None
-    };
+    let mut file_watcher = config.file_watch_config().map(FileWatcher::new);
 
     // Run the main event loop
     let code = run_main_loop(
@@ -115,7 +110,7 @@ async fn run_main_loop(
 
     // Start file watching if enabled
     if let Some(ref mut file_watcher) = file_watcher {
-        file_watcher.start_watching().await?;
+        file_watcher.start_watching()?;
         info!("File watching started for live-reload");
     } else {
         debug!("Live-reload disabled, no file watching");
@@ -137,8 +132,7 @@ async fn run_main_loop(
             exit_status = process_manager.wait_for_exit() => {
                 match exit_status {
                     Ok(Some(status)) => {
-                        // Scenario A: Child process exit handling
-                        return handle_child_exit(status).await;
+                        return Ok(handle_child_exit(status));
                     }
                     Ok(None) => {
                         // No process to wait for, continue
@@ -170,20 +164,18 @@ async fn run_main_loop(
 
             // Live-reload: restart as soon as a (debounced) change arrives
             Some(event) = next_file_event(file_watcher) => {
-                if handle_file_event(event, process_manager).await? {
-                    return Ok(1); // Restart not allowed
-                }
+                handle_file_event(event, process_manager).await?;
             }
 
             // Reap orphans as soon as they exit (matters when scinit is PID 1)
             _ = sigchld.recv() => {
                 debug!("received SIGCHLD, reaping zombie processes");
-                reap_zombies_async().await;
+                spawn_zombie_reap();
             }
 
             // Periodic zombie reaping (less frequent, non-blocking)
             _ = zombie_reap_interval.tick() => {
-                reap_zombies_async().await;
+                spawn_zombie_reap();
             }
         }
     }

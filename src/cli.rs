@@ -6,8 +6,7 @@ use std::time::Duration;
 
 use crate::file_watcher::FileWatchConfig;
 use crate::port_manager::PortBindingConfig;
-
-type Result<T> = color_eyre::eyre::Result<T>;
+use crate::Result;
 
 /// A live-reloading init system for managing subprocesses
 #[derive(Parser)]
@@ -62,7 +61,7 @@ pub struct Config {
     pub command: String,
     /// Arguments for the command
     pub args: Vec<String>,
-    /// Zombie reaping interval in milliseconds
+    /// Zombie reaping interval
     pub zombie_reap_interval: Duration,
     /// Live-reload configuration
     pub live_reload: LiveReloadConfig,
@@ -111,8 +110,6 @@ impl Config {
             port_binding: PortBindingConfig {
                 ports: cli.ports,
                 bind_address,
-                reuse_port: true,
-                socket_names: None,
             },
         })
     }
@@ -126,11 +123,9 @@ impl Config {
                 .map(|path| FileWatchConfig {
                     watch_path: path.clone(),
                     debounce_ms: self.live_reload.debounce_ms,
-                    recursive: false,
                 })
         } else {
             None
         }
     }
 }
-

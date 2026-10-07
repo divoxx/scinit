@@ -1,15 +1,14 @@
-use super::Result;
 use crate::environment::Environment;
 use crate::port_manager::PortManager;
 use crate::signals::signal_name;
 use crate::socket_activation::SocketActivationExec;
+use crate::Result;
 use eyre::eyre;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{getpgid, tcsetpgrp, Pid};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::IsTerminal;
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
@@ -36,8 +35,6 @@ pub struct ProcessConfig {
     pub restart_delay: Duration,
     /// Timeout for graceful shutdown
     pub graceful_shutdown_timeout: Duration,
-    /// Working directory for the process
-    pub working_directory: Option<PathBuf>,
     /// Environment variables to set
     pub environment: Environment,
 }
@@ -49,7 +46,6 @@ impl Default for ProcessConfig {
             args: Vec::new(),
             restart_delay: Duration::from_millis(1000),
             graceful_shutdown_timeout: Duration::from_secs(30),
-            working_directory: None,
             environment: Environment::new(),
         }
     }
@@ -66,8 +62,6 @@ pub enum ProcessState {
     Stopping,
     /// Process has stopped
     Stopped,
-    /// Process has failed and exceeded restart attempts
-    Failed,
 }
 
 /// Information about a managed process
@@ -77,8 +71,6 @@ pub struct ProcessInfo {
     pub state: ProcessState,
     /// Process ID (if running)
     pub pid: Option<Pid>,
-    /// Start time of the current process
-    pub start_time: std::time::Instant,
     /// Exit status of the last process (if stopped)
     pub exit_status: Option<std::process::ExitStatus>,
 }
@@ -96,51 +88,35 @@ pub struct ProcessManager {
     process_info: ProcessInfo,
     /// Current child process handle
     child: Option<Child>,
-    /// Whether the manager should stop managing processes
-    should_stop: bool,
 }
 
 impl ProcessManager {
-    /// Creates a new process manager with the given configuration
-    ///
-    /// # Arguments
-    /// * `config` - Configuration for process management
-    /// * `port_manager` - Port manager for port inheritance
-    ///
-    /// # Returns
-    /// * `Self` - The process manager instance
     pub fn new(config: ProcessConfig, port_manager: PortManager) -> Self {
         Self {
             process_info: ProcessInfo {
                 state: ProcessState::Stopped,
                 pid: None,
-                start_time: std::time::Instant::now(),
                 exit_status: None,
             },
             config,
             port_manager,
             child: None,
-            should_stop: false,
         }
     }
 
     /// Spawns a new process with port inheritance and proper signal mask reset
     pub async fn spawn_process(&mut self) -> Result<()> {
-        if self.should_stop {
-            return Ok(());
-        }
-
         self.process_info.state = ProcessState::Starting;
         info!("Spawning process: {} {:?}", self.config.command, self.config.args);
 
         // Bind ports before spawning
-        self.port_manager.bind_ports().await?;
+        self.port_manager.bind_ports()?;
 
         // Prepare environment variables using systemd socket activation
         let mut env_vars = Environment::from(std::env::vars().collect::<HashMap<_, _>>());
 
         // Add systemd socket activation environment variables
-        let socket_env = self.port_manager.get_socket_activation_env();
+        let socket_env = self.port_manager.socket_activation_env();
         env_vars.extend(socket_env.clone());
 
         // Add custom environment variables
@@ -193,11 +169,6 @@ impl ProcessManager {
             }
         }
 
-        // Set working directory if specified
-        if let Some(ref work_dir) = self.config.working_directory {
-            command.current_dir(work_dir);
-        }
-
         // Set environment variables
         command.env_clear();
         for (key, value) in env_vars.into_inner() {
@@ -217,7 +188,6 @@ impl ProcessManager {
         // Update process info
         self.process_info.pid = Some(pid);
         self.process_info.state = ProcessState::Running;
-        self.process_info.start_time = std::time::Instant::now();
         self.child = Some(child);
         MANAGED_CHILD.store(pid.as_raw(), Ordering::SeqCst);
 
@@ -225,13 +195,8 @@ impl ProcessManager {
         Ok(())
     }
 
-    /// Waits for the current process to exit
-    ///
-    /// This method waits for the child process to exit and returns
-    /// the exit status.
-    ///
-    /// # Returns
-    /// * `Result<Option<std::process::ExitStatus>>` - Exit status or None if no process
+    /// Waits for the current process to exit and returns its status, or
+    /// `None` if there is no process
     pub async fn wait_for_exit(&mut self) -> Result<Option<std::process::ExitStatus>> {
         if let Some(ref mut child) = self.child {
             match child.wait().await {
@@ -246,7 +211,7 @@ impl ProcessManager {
                 }
                 Err(e) => {
                     error!("Error waiting for process: {}", e);
-                    self.process_info.state = ProcessState::Failed;
+                    self.process_info.state = ProcessState::Stopped;
                     self.child = None;
                     MANAGED_CHILD.store(0, Ordering::SeqCst);
                     Err(e.into())
@@ -260,17 +225,14 @@ impl ProcessManager {
     /// Performs a graceful shutdown of the current process with SIGTERM
     ///
     /// See [`ProcessManager::shutdown_with_signal`].
-    pub async fn graceful_shutdown(&mut self) -> Result<()> {
+    pub async fn graceful_shutdown(&mut self) {
         self.shutdown_with_signal(Signal::SIGTERM).await
     }
 
     /// Stops the current process: sends `signal` to its process group and
     /// waits for it to exit. If it doesn't exit within the graceful shutdown
     /// timeout, it sends SIGKILL.
-    ///
-    /// # Returns
-    /// * `Result<()>` - Success or error
-    pub async fn shutdown_with_signal(&mut self, signal: Signal) -> Result<()> {
+    pub async fn shutdown_with_signal(&mut self, signal: Signal) {
         if let Some(pid) = self.process_info.pid {
             self.process_info.state = ProcessState::Stopping;
             info!("Initiating graceful shutdown of process {} with {:?}", pid, signal);
@@ -283,31 +245,22 @@ impl ProcessManager {
             match timeout(self.config.graceful_shutdown_timeout, self.wait_for_exit()).await {
                 Ok(Ok(_)) => {
                     info!("Process exited gracefully");
-                    Ok(())
                 }
                 Ok(Err(e)) => {
                     warn!("Error during graceful shutdown: {}", e);
-                    self.force_kill().await?;
-                    Ok(())
+                    self.force_kill().await;
                 }
                 Err(_) => {
                     warn!("Graceful shutdown timeout, forcing kill");
-                    self.force_kill().await?;
-                    Ok(())
+                    self.force_kill().await;
                 }
             }
-        } else {
-            Ok(())
         }
     }
 
-    /// Force kills the current process
-    ///
-    /// This method sends SIGKILL to the process to force it to exit immediately.
-    ///
-    /// # Returns
-    /// * `Result<()>` - Success or error
-    pub async fn force_kill(&mut self) -> Result<()> {
+    /// Sends SIGKILL to the current process group and records the exit
+    /// status if the process is gone 100ms later
+    pub async fn force_kill(&mut self) {
         if let Some(pid) = self.process_info.pid {
             info!("Force killing process {}", pid);
 
@@ -330,66 +283,24 @@ impl ProcessManager {
                 }
             }
         }
-
-        Ok(())
     }
 
-
-    /// Restarts the current process with a specific reason
-    ///
-    /// This method performs a graceful shutdown of the current process and
-    /// spawns a new one. Only file-change restarts are allowed in container environments.
-    ///
-    /// # Arguments
-    /// * `reason` - The reason for the restart (for logging and limit checking)
-    ///
-    /// # Returns
-    /// * `Result<bool>` - True if restart was successful, false if restart not allowed
-    pub async fn restart_process_with_reason(&mut self, reason: &str) -> Result<bool> {
-        if self.should_stop {
-            return Ok(false);
-        }
-
-        // Only allow file-change restarts, not crash restarts
-        let is_file_change_restart = reason == "file_change";
-
-        if !is_file_change_restart {
-            error!("Process restart not allowed for reason: {} (only file-change restarts are allowed)", reason);
-            return Ok(false);
-        }
-
+    /// Restarts the process after a file change: graceful shutdown, the
+    /// restart delay, then a new spawn
+    pub async fn restart(&mut self) -> Result<()> {
         info!("Restarting process due to file change");
 
-        // Graceful shutdown current process
-        self.graceful_shutdown().await?;
-
-        // Wait for restart delay
+        self.graceful_shutdown().await;
         sleep(self.config.restart_delay).await;
-
-        // Spawn new process
-        self.spawn_process().await?;
-
-        Ok(true)
+        self.spawn_process().await
     }
 
-    /// Forwards a signal to the current process
-    ///
-    /// # Arguments
-    /// * `signal` - The signal to forward
-    ///
-    /// # Returns
-    /// * `Result<()>` - Success or error
+    /// Forwards a signal to the current process group
     pub fn forward_signal(&self, signal: Signal) -> Result<()> {
         self.send_signal_to_group(signal)
     }
 
-    /// Sends a signal to the process group (synchronous version for Drop)
-    ///
-    /// # Arguments
-    /// * `signal` - The signal to send
-    ///
-    /// # Returns
-    /// * `Result<()>` - Success or error
+    /// Sends a signal to the process group
     pub fn send_signal_to_group(&self, signal: Signal) -> Result<()> {
         if let Some(pid) = self.process_info.pid {
             use nix::sys::signal::kill;
@@ -404,48 +315,25 @@ impl ProcessManager {
         }
     }
 
-    /// Gets the current process information
-    ///
-    /// # Returns
-    /// * `&ProcessInfo` - Current process information
     pub fn process_info(&self) -> &ProcessInfo {
         &self.process_info
     }
 
-    /// Gets the current process state
-    ///
-    /// # Returns
-    /// * `ProcessState` - Current process state
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn state(&self) -> ProcessState {
         self.process_info.state.clone()
     }
 
-    /// Checks if the process is running
-    ///
-    /// # Returns
-    /// * `bool` - True if the process is running
     #[cfg(test)]
     pub fn is_running(&self) -> bool {
         self.process_info.state == ProcessState::Running
     }
-
-    /// Stops the process manager
-    ///
-    /// This method sets the should_stop flag, which will prevent
-    /// further process restarts.
-    #[allow(dead_code)]
-    pub fn stop(&mut self) {
-        self.should_stop = true;
-        info!("Process manager stopped");
-    }
-
 }
 
 impl Drop for ProcessManager {
     fn drop(&mut self) {
-        // Scenario C: Emergency cleanup when ProcessManager is dropped unexpectedly
-        // Only attempt cleanup if we still have a running process
+        // Emergency cleanup when dropped with a child still running (e.g. on
+        // an error return), so the child's process group isn't orphaned
         if let Some(pid) = self.process_info.pid {
             // Check if process is actually still running before emergency cleanup
             if self.process_info.state == ProcessState::Running ||
@@ -471,12 +359,6 @@ impl Drop for ProcessManager {
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
-
-        // Stop the process manager to prevent further operations
-        self.should_stop = true;
-
-        // Note: Child process resources are automatically cleaned up by Rust's Drop
-        // But we've ensured the process group is killed to prevent orphans
     }
 }
 
@@ -533,7 +415,7 @@ fn peek_exited_child() -> Option<Pid> {
 /// is left for tokio's `child.wait()`. While the managed child is the zombie
 /// returned first, other zombies wait for the next pass; tokio reaps the
 /// managed child promptly and `handle_child_exit` runs a final pass.
-pub fn reap_zombies() -> Result<()> {
+pub fn reap_zombies() {
     let mut reaped_count = 0;
 
     while let Some(pid) = peek_exited_child() {
@@ -570,8 +452,6 @@ pub fn reap_zombies() -> Result<()> {
     if reaped_count > 0 {
         debug!("reaped {} zombie processes", reaped_count);
     }
-
-    Ok(())
 }
 
 /// Shell-style exit code for a child's status: its exit code, or 128 + the
@@ -584,12 +464,12 @@ pub fn exit_code(status: std::process::ExitStatus) -> i32 {
         .unwrap_or(1)
 }
 
-/// Handles child process exit (Scenario A)
+/// Handles the child's exit, which ends scinit too.
 ///
-/// In container environments, scinit's lifecycle is tied to the child process.
-/// When the child exits, scinit exits too, with the child's exit code (see
-/// [`exit_code`]) so orchestrators can tell a crash from a clean shutdown.
-pub async fn handle_child_exit(status: std::process::ExitStatus) -> Result<i32> {
+/// In container environments, scinit's lifecycle is tied to the child process,
+/// so scinit exits with the child's exit code (see [`exit_code`]) and
+/// orchestrators can tell a crash from a clean shutdown.
+pub fn handle_child_exit(status: std::process::ExitStatus) -> i32 {
     if status.success() {
         info!("Child process exited successfully, scinit exiting cleanly");
     } else if let Some(code) = status.code() {
@@ -614,19 +494,14 @@ pub async fn handle_child_exit(status: std::process::ExitStatus) -> Result<i32> 
 
     // Reap any remaining zombies before exiting
     debug!("Reaping any remaining zombie processes before exit");
-    reap_zombies_async().await;
+    spawn_zombie_reap();
 
-    Ok(exit_code(status))
+    exit_code(status)
 }
 
-/// Reaps zombie processes asynchronously to avoid blocking the main loop
-pub async fn reap_zombies_async() {
-    // Spawn zombie reaping in a blocking task to avoid blocking the main loop
-    tokio::task::spawn_blocking(|| {
-        if let Err(e) = reap_zombies() {
-            warn!("error reaping zombies: {}", e);
-        }
-    });
+/// Starts a zombie reap pass on a blocking thread, without waiting for it
+pub fn spawn_zombie_reap() {
+    tokio::task::spawn_blocking(reap_zombies);
 }
 
 #[cfg(test)]
@@ -634,28 +509,24 @@ mod tests {
     use super::*;
     use crate::port_manager::PortBindingConfig;
 
+    fn manager(config: ProcessConfig) -> ProcessManager {
+        ProcessManager::new(config, PortManager::new(PortBindingConfig::default()))
+    }
+
     #[tokio::test]
     async fn test_process_manager_creation() {
-        let config = ProcessConfig::default();
-        let port_config = PortBindingConfig::default();
-        let port_manager = PortManager::new(port_config);
-
-        let manager = ProcessManager::new(config, port_manager);
+        let manager = manager(ProcessConfig::default());
         assert_eq!(manager.state(), ProcessState::Stopped);
         assert!(!manager.is_running());
     }
 
     #[tokio::test]
     async fn test_process_spawn() {
-        let config = ProcessConfig {
+        let mut manager = manager(ProcessConfig {
             command: "echo".to_string(),
             args: vec!["hello".to_string()],
             ..Default::default()
-        };
-        let port_config = PortBindingConfig::default();
-        let port_manager = PortManager::new(port_config);
-
-        let mut manager = ProcessManager::new(config, port_manager);
+        });
         assert!(manager.spawn_process().await.is_ok());
 
         // Wait for process to exit
@@ -666,57 +537,39 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_restart() {
-        let config = ProcessConfig {
+        let mut manager = manager(ProcessConfig {
             command: "echo".to_string(),
             args: vec!["hello".to_string()],
             restart_delay: Duration::from_millis(100),
             ..Default::default()
-        };
-        let port_config = PortBindingConfig::default();
-        let port_manager = PortManager::new(port_config);
+        });
 
-        let mut manager = ProcessManager::new(config, port_manager);
-
-        // Test file-change restart (should work)
-        let restart_result = manager.restart_process_with_reason("file_change").await.unwrap();
-        assert!(restart_result);
-
-        // Test crash restart (should fail)
-        let restart_result = manager.restart_process_with_reason("crash").await.unwrap();
-        assert!(!restart_result);
+        assert!(manager.restart().await.is_ok());
+        assert!(manager.is_running());
     }
 
     #[tokio::test]
     async fn test_graceful_shutdown() {
-        let config = ProcessConfig {
+        let mut manager = manager(ProcessConfig {
             command: "sleep".to_string(),
             args: vec!["10".to_string()],
             graceful_shutdown_timeout: Duration::from_millis(500),
             ..Default::default()
-        };
-        let port_config = PortBindingConfig::default();
-        let port_manager = PortManager::new(port_config);
-
-        let mut manager = ProcessManager::new(config, port_manager);
+        });
         assert!(manager.spawn_process().await.is_ok());
         assert!(manager.is_running());
 
-        // Graceful shutdown should work
-        assert!(manager.graceful_shutdown().await.is_ok());
+        manager.graceful_shutdown().await;
         assert_eq!(manager.state(), ProcessState::Stopped);
     }
 
     #[tokio::test]
     async fn test_process_info() {
-        let config = ProcessConfig {
+        let mut manager = manager(ProcessConfig {
             command: "echo".to_string(),
             args: vec!["hello".to_string()],
             ..Default::default()
-        };
-        let port_config = PortBindingConfig::default();
-        let port_manager = PortManager::new(port_config);
-
-        let mut manager = ProcessManager::new(config, port_manager);
+        });
         let info = manager.process_info();
 
         assert_eq!(info.state, ProcessState::Stopped);
@@ -739,40 +592,15 @@ mod tests {
         let mut env = Environment::new();
         env.set("TEST_VAR", "test_value");
 
-        let config = ProcessConfig {
+        let mut manager = manager(ProcessConfig {
             command: "sh".to_string(),
             args: vec!["-c".to_string(), "echo $TEST_VAR".to_string()],
             environment: env,
             ..Default::default()
-        };
-        let port_config = PortBindingConfig::default();
-        let port_manager = PortManager::new(port_config);
-
-        let mut manager = ProcessManager::new(config, port_manager);
+        });
         assert!(manager.spawn_process().await.is_ok());
 
         let exit_status = manager.wait_for_exit().await.unwrap();
         assert!(exit_status.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_stop_management() {
-        let config = ProcessConfig {
-            command: "sleep".to_string(),
-            args: vec!["10".to_string()],
-            ..Default::default()
-        };
-        let port_config = PortBindingConfig::default();
-        let port_manager = PortManager::new(port_config);
-
-        let mut manager = ProcessManager::new(config, port_manager);
-
-        assert!(!manager.should_stop);
-        manager.stop();
-        assert!(manager.should_stop);
-
-        // Should not restart after stop
-        let restart_result = manager.restart_process_with_reason("manual").await.unwrap();
-        assert!(!restart_result);
     }
 }

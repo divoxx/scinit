@@ -10,8 +10,8 @@
 //! async-signal-safe operations: `fcntl`, `dup2`, `getpid`, writing digits
 //! into a preallocated buffer, and `execve`.
 
-use super::Result;
 use crate::environment::Environment;
+use crate::Result;
 use eyre::eyre;
 use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
@@ -52,8 +52,8 @@ unsafe impl Sync for SocketActivationExec {}
 
 impl SocketActivationExec {
     /// Prepares the exec of `command args` with `listen_fds` passed as the
-    /// activated sockets and `socket_env` (`LISTEN_FDS`, `LISTEN_FDNAMES`)
-    /// plus `extra_env` added to scinit's own environment
+    /// activated sockets and `socket_env` (`LISTEN_FDS`) plus `extra_env`
+    /// added to scinit's own environment
     pub fn new(
         command: &str,
         args: &[String],

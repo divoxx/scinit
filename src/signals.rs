@@ -1,10 +1,10 @@
-use super::Result;
 use crate::process_manager::ProcessManager;
+use crate::Result;
 
 pub use nix::sys::signal::Signal;
 
-use nix::sys::signal::{pthread_sigmask, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow};
 use eyre::eyre;
+use nix::sys::signal::{pthread_sigmask, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tracing::{debug, error, info, warn};
 
@@ -116,9 +116,7 @@ impl SignalHandler {
             .await
             .ok_or_else(|| eyre!("signal thread exited"))
     }
-}
 
-impl SignalHandler {
     /// Processes a specific signal according to init system semantics
     pub async fn process_signal(
         &self,
@@ -128,13 +126,12 @@ impl SignalHandler {
     ) -> Result<SignalAction> {
         match signal {
             Signal::SIGTERM | Signal::SIGINT | Signal::SIGQUIT => {
-                // Scenario B: Signal forwarding with graceful shutdown and timeout
                 info!(
                     "received termination signal {:?}, initiating graceful shutdown",
                     signal
                 );
                 self.handle_termination_signal(signal, process_manager, graceful_timeout_secs)
-                    .await?;
+                    .await;
                 Ok(SignalAction::Exit)
             }
             Signal::SIGUSR1 | Signal::SIGUSR2 | Signal::SIGHUP => {
@@ -156,30 +153,26 @@ impl SignalHandler {
         }
     }
 
-    /// Handles termination signals with proper timeout and escalation (Scenario B)
+    /// Forwards a termination signal to the child, escalating to SIGKILL if
+    /// it outlives the graceful timeout
     async fn handle_termination_signal(
         &self,
         signal: Signal,
         process_manager: &mut ProcessManager,
         graceful_timeout_secs: u64,
-    ) -> Result<()> {
-        // Forward the signal itself, then escalate to SIGKILL if the child
-        // outlives the graceful timeout
+    ) {
         info!(
             "Termination signal {:?} received, forwarding to child process (timeout: {}s)",
             signal, graceful_timeout_secs
         );
-        if (process_manager.shutdown_with_signal(signal).await).is_err() {
-            warn!("Graceful shutdown failed, child process may have been force-killed");
-        }
+        process_manager.shutdown_with_signal(signal).await;
 
         info!("scinit exiting due to termination signal {:?}", signal);
-        Ok(())
     }
 }
 
 /// Actions that signal processing can return
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum SignalAction {
     /// Continue normal operation
     Continue,
