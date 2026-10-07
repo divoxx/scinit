@@ -40,6 +40,21 @@ fn child_self_signal_exits_128_plus_signo() {
     scinit.assert_exit_code(status, 143);
 }
 
+/// The exit log names the child's signal by its platform number (SIGUSR1 is
+/// 10 on Linux, 30 on macOS)
+#[test]
+fn child_signal_is_logged_by_name() {
+    let (scinit, status) = Scinit::builder()
+        .env("RUST_LOG", "info")
+        .child(["kill-self", "USR1"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 128 + Signal::SIGUSR1 as i32);
+    let expected = format!("terminated by signal {} (SIGUSR1)", Signal::SIGUSR1 as i32);
+    let logs = scinit.stdout() + &scinit.stderr();
+    assert!(logs.contains(&expected), "missing {:?}\n{}", expected, scinit.diagnostics());
+}
+
 /// Repeated clean exits never surface as failures (e.g. the background
 /// reaper stealing the child's status from tokio's `wait`)
 #[test]
