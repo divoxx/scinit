@@ -8,6 +8,7 @@ use crate::environment::Environment;
 use crate::file_watcher::FileWatchConfig;
 use crate::port_manager::PortBindingConfig;
 use crate::process_manager::ProcessConfig;
+use crate::program::resolve_program;
 use crate::Result;
 
 /// A live-reloading init system for managing subprocesses
@@ -35,7 +36,7 @@ pub struct Cli {
     #[arg(long)]
     pub live_reload: bool,
 
-    /// Path to watch for changes (default: the command as given, relative to the current directory)
+    /// Path to watch for changes (default: the command's executable, looked up in PATH like exec does)
     #[arg(long)]
     pub watch_path: Option<PathBuf>,
 
@@ -104,14 +105,19 @@ impl Config {
             .parse()
             .map_err(|e| eyre!("Invalid bind address '{}': {}", cli.bind_addr, e))?;
 
-        // The watch path defaults to the command itself
-        let live_reload = cli.live_reload.then(|| LiveReloadConfig {
-            watch_path: cli
-                .watch_path
-                .unwrap_or_else(|| PathBuf::from(&cli.command)),
-            debounce: Duration::from_millis(cli.debounce_ms),
-            restart_delay: Duration::from_millis(cli.restart_delay_ms),
-        });
+        let live_reload = if cli.live_reload {
+            let watch_path = match cli.watch_path {
+                Some(path) => path,
+                None => default_watch_path(&cli.command)?,
+            };
+            Some(LiveReloadConfig {
+                watch_path,
+                debounce: Duration::from_millis(cli.debounce_ms),
+                restart_delay: Duration::from_millis(cli.restart_delay_ms),
+            })
+        } else {
+            None
+        };
 
         Ok(Config {
             command: cli.command,
@@ -148,4 +154,14 @@ impl Config {
             debounce: live_reload.debounce,
         })
     }
+}
+
+/// Watch path without `--watch-path`: the executable `command` runs
+fn default_watch_path(command: &str) -> Result<PathBuf> {
+    resolve_program(command).map_err(|_| {
+        eyre!(
+            "--live-reload: cannot find '{}' in PATH to watch; pass --watch-path",
+            command
+        )
+    })
 }

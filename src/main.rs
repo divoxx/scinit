@@ -10,6 +10,7 @@ mod file_watcher;
 mod logging;
 mod port_manager;
 mod process_manager;
+mod program;
 mod reaper;
 mod signals;
 mod socket_activation;
