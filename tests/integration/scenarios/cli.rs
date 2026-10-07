@@ -20,6 +20,7 @@ fn help_exits_zero() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Usage"), "help output missing usage:\n{}", stdout);
     assert!(stdout.contains("--live-reload"), "help output missing flags:\n{}", stdout);
+    assert!(stdout.contains("SCINIT_LOG"), "help output missing SCINIT_LOG:\n{}", stdout);
 }
 
 /// `--version` prints the crate version and exits 0
@@ -66,13 +67,67 @@ fn invalid_bind_addr_exits_one() {
 #[test]
 fn logs_go_to_stderr() {
     let (scinit, status) = Scinit::builder()
-        .env("RUST_LOG", "info")
+        .env("SCINIT_LOG", "info")
         .command(["echo", "child-output"])
         .run(TIMEOUT)
         .unwrap();
     scinit.assert_exit_code(status, 0);
-    assert!(scinit.stderr().contains("scinit starting"), "{}", scinit.diagnostics());
+    assert!(
+        scinit.stderr().contains("[scinit] INFO scinit starting"),
+        "{}",
+        scinit.diagnostics()
+    );
     assert_eq!(scinit.stdout(), "child-output\n", "{}", scinit.diagnostics());
+}
+
+/// `RUST_LOG` is the child's: it doesn't change scinit's verbosity and
+/// reaches the child unchanged
+#[test]
+fn rust_log_is_left_to_the_child() {
+    let (scinit, status) = Scinit::builder()
+        .env("RUST_LOG", "debug")
+        .command(["sh", "-c", "echo \"child RUST_LOG=$RUST_LOG\""])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 0);
+    assert_eq!(scinit.stdout(), "child RUST_LOG=debug\n", "{}", scinit.diagnostics());
+    // The child writes nothing to stderr, so any output there is scinit's
+    assert!(
+        scinit.stderr().is_empty(),
+        "scinit logged at RUST_LOG's level\n{}",
+        scinit.diagnostics()
+    );
+}
+
+/// Off a terminal, log lines carry no ANSI color codes
+#[test]
+fn logs_have_no_color_when_not_a_terminal() {
+    let (scinit, status) = Scinit::builder()
+        .env("SCINIT_LOG", "debug")
+        .command(["true"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 0);
+    let stderr = scinit.stderr();
+    assert!(stderr.contains("[scinit] DEBUG"), "{}", scinit.diagnostics());
+    assert!(!stderr.contains('\x1b'), "escape codes in logs:\n{:?}", stderr);
+}
+
+/// Fatal errors use the same format as other logs
+#[test]
+fn fatal_errors_are_prefixed() {
+    let (scinit, status) = Scinit::builder()
+        .command(["/nonexistent/scinit-no-such-binary"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 1);
+    let stderr = scinit.stderr();
+    assert!(
+        stderr.starts_with("[scinit] ERROR Failed to spawn process"),
+        "{}",
+        scinit.diagnostics()
+    );
+    assert!(!stderr.contains('\x1b'), "escape codes in error:\n{:?}", stderr);
 }
 
 /// Args after the command, including ones that look like scinit flags, reach the child verbatim
