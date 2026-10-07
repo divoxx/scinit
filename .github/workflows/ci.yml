@@ -13,6 +13,25 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  clippy:
+    name: Clippy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both: some code only compiles on one platform (cfg(target_os))
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Warnings fail the build, including the crate-level lints (e.g. no
+      # print!/eprintln!, since scinit logs through tracing)
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
   macos:
     name: Tests (macOS)
     runs-on: macos-latest

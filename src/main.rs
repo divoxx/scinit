@@ -1,11 +1,16 @@
+// scinit's output goes through tracing events (src/logging.rs), never directly
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 type Result<T> = eyre::Result<T>;
 
 mod cli;
 mod environment;
 mod exit_status;
 mod file_watcher;
+mod logging;
 mod port_manager;
 mod process_manager;
+mod program;
 mod reaper;
 mod signals;
 mod socket_activation;
@@ -17,7 +22,6 @@ use tokio::select;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use cli::{Cli, Config};
 use exit_status::{exit_code, handle_child_exit, signal_exit_code};
@@ -27,15 +31,18 @@ use process_manager::ProcessManager;
 use reaper::spawn_zombie_reap;
 use signals::{Signal, SignalHandler};
 
-fn main() -> Result<()> {
-    // Initialize error handling and logging
-    color_eyre::install()?;
+fn main() {
+    logging::init();
+    // Mirror the child's exit status, like other container inits do. Errors
+    // are logged like everything else scinit says: `ERROR scinit: ...`
+    std::process::exit(run().unwrap_or_else(|e| {
+        error!("{:#}", e);
+        1
+    }))
+}
 
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(EnvFilter::from_default_env())
-        .init();
-
+/// Runs scinit and returns the exit code to exit with
+fn run() -> Result<i32> {
     info!("scinit starting");
 
     // Before any other thread exists, so every thread inherits the mask
@@ -51,9 +58,7 @@ fn main() -> Result<()> {
     // Shut down with a timeout on every path: blocking tasks parked in
     // sigwait never finish, so dropping the runtime would block forever
     rt.shutdown_timeout(Duration::from_millis(100));
-
-    // Mirror the child's exit status, like other container inits do
-    std::process::exit(result?)
+    result
 }
 
 /// Returns the exit code scinit should exit with
