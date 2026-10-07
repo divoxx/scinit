@@ -2,10 +2,19 @@
 name = "scinit"
 version = "0.1.0"
 edition = "2021"
+description = "A small init system for containers: signal forwarding, zombie reaping, live reload and systemd-style socket activation"
+license = "Apache-2.0"
 
 [[bin]]
 name = "scinit"
 path = "src/main.rs"
+
+# Fixture child process used by the integration tests
+[[bin]]
+name = "scinit-test-child"
+path = "tests/fixtures/test_child.rs"
+test = false
+doc = false
 
 [dependencies]
 color-eyre = "0.6.2"
@@ -17,15 +26,12 @@ tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 
 # Live-reloading dependencies
 notify = "8.1"
-tokio-util = { version = "0.7", features = ["codec"] }
 socket2 = "0.6"
 libc = "0.2"
 clap = { version = "4.0", features = ["derive"] }
-uuid = { version = "1.0", features = ["v4"] }
-chrono = "0.4"
 
 [dev-dependencies]
 tempfile = "3.8"
-chrono = "0.4"
+anyhow = "1.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

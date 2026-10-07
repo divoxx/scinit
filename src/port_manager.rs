@@ -1,10 +1,10 @@
-use super::Result;
-use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+use crate::environment::Environment;
+use crate::Result;
 use nix::sys::socket::{setsockopt, sockopt::ReusePort};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, Shutdown};
-use std::os::unix::io::{AsRawFd, BorrowedFd};
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr};
+use std::os::unix::io::{AsRawFd, RawFd};
 use tracing::{debug, info};
 
 /// Configuration for port binding behavior
@@ -14,8 +14,6 @@ pub struct PortBindingConfig {
     pub ports: Vec<u16>,
     /// Address to bind ports to
     pub bind_address: IpAddr,
-    /// Whether to enable SO_REUSEPORT for graceful restarts
-    pub reuse_port: bool,
 }
 
 impl Default for PortBindingConfig {
@@ -23,19 +21,15 @@ impl Default for PortBindingConfig {
         Self {
             ports: Vec::new(),
             bind_address: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            reuse_port: true,
         }
     }
 }
 
-/// Manages port binding and inheritance for child processes
-/// 
-/// This manager handles binding ports before spawning child processes
-/// and provides file descriptors that can be inherited by the child.
-/// It supports SO_REUSEPORT for graceful restarts without port conflicts.
+/// Manages port binding and socket inheritance for zero-downtime restarts.
+///
+/// Binds ports before spawning child processes and provides file descriptors
+/// for inheritance. Uses SO_REUSEPORT for graceful restarts without port conflicts.
 pub struct PortManager {
-    /// Currently bound ports and their socket addresses
-    bound_ports: HashMap<u16, SocketAddr>,
     /// Configuration for port binding
     config: PortBindingConfig,
     /// Bound sockets for inheritance
@@ -43,127 +37,95 @@ pub struct PortManager {
 }
 
 impl PortManager {
-    /// Creates a new port manager with the given configuration
-    /// 
-    /// # Arguments
-    /// * `config` - Configuration for port binding
-    /// 
-    /// # Returns
-    /// * `Self` - The port manager instance
     pub fn new(config: PortBindingConfig) -> Self {
         Self {
-            bound_ports: HashMap::new(),
             config,
             sockets: HashMap::new(),
         }
     }
 
-    /// Binds the configured ports and prepares them for inheritance
-    /// 
-    /// This method binds all configured ports and sets up the sockets
-    /// for inheritance by child processes. It uses SO_REUSEPORT if enabled
-    /// to allow multiple processes to bind to the same port.
-    /// 
-    /// # Returns
-    /// * `Result<()>` - Success or error
-    pub async fn bind_ports(&mut self) -> Result<()> {
+    /// Binds the configured ports that aren't bound yet, with SO_REUSEPORT
+    pub fn bind_ports(&mut self) -> Result<()> {
         if self.config.ports.is_empty() {
             debug!("No ports configured for binding");
             return Ok(());
         }
 
-        info!("Binding {} ports to {}", self.config.ports.len(), self.config.bind_address);
+        info!(
+            "Binding {} ports to {}",
+            self.config.ports.len(),
+            self.config.bind_address
+        );
 
-        let ports = self.config.ports.clone();
-        for &port in &ports {
-            self.bind_single_port(port).await?;
+        // Sockets are bound once and kept for scinit's lifetime, so every
+        // child (including after a live-reload restart) gets the same
+        // listeners and connections queue in their backlog in between
+        let unbound: Vec<u16> = self
+            .unique_ports()
+            .filter(|port| !self.sockets.contains_key(port))
+            .collect();
+        for port in unbound {
+            self.bind_single_port(port)?;
         }
 
-        info!("Successfully bound {} ports", self.bound_ports.len());
+        info!("Successfully bound {} ports", self.sockets.len());
         Ok(())
     }
 
-    /// Binds a single port with proper error handling
-    /// 
-    /// # Arguments
-    /// * `port` - The port number to bind
-    /// 
-    /// # Returns
-    /// * `Result<()>` - Success or error
-    async fn bind_single_port(&mut self, port: u16) -> Result<()> {
+    fn bind_single_port(&mut self, port: u16) -> Result<()> {
         let socket_addr = SocketAddr::new(self.config.bind_address, port);
 
-        // Create socket
-        let socket = match self.config.bind_address {
-            IpAddr::V4(_) => Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?,
-            IpAddr::V6(_) => Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?,
-        };
-
-        // Set SO_REUSEPORT if enabled
-        if self.config.reuse_port {
-            setsockopt(&socket, ReusePort, &true)?;
-        }
-
-        // Bind the socket
+        let socket = Socket::new(
+            Domain::for_address(socket_addr),
+            Type::STREAM,
+            Some(Protocol::TCP),
+        )?;
+        setsockopt(&socket, ReusePort, &true)?;
         socket.bind(&socket_addr.into())?;
-        socket.listen(128)?; // Set backlog
+        socket.listen(128)?;
 
-        // Mark socket as inheritable by clearing close-on-exec flag
-        let fd = socket.as_raw_fd();
-        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
-        let mut flags = FdFlag::from_bits_truncate(fcntl(borrowed_fd, FcntlArg::F_GETFD)?);
-        flags.remove(FdFlag::FD_CLOEXEC);
-        fcntl(borrowed_fd, FcntlArg::F_SETFD(flags))?;
-
-        // Store the bound socket and address
-        self.bound_ports.insert(port, socket_addr);
+        // The socket stays close-on-exec (socket2's default): the child gets
+        // a copy at its systemd fd number instead, see socket_activation
         self.sockets.insert(port, socket);
 
         info!("Bound port {} to {}", port, socket_addr);
         Ok(())
     }
 
-    /// Gets the file descriptors for inherited ports
-    /// 
-    /// This method returns the file descriptors of bound sockets
-    /// that should be inherited by child processes.
-    /// 
-    /// # Returns
-    /// * `Vec<i32>` - List of file descriptors
-    pub fn get_inherited_fds(&self) -> Vec<i32> {
-        self.sockets
-            .values()
+    /// File descriptors of the bound sockets, in `--ports` order. This is the
+    /// order they are passed to the child in (fd 3, 4, ...).
+    pub fn listen_fds(&self) -> Vec<RawFd> {
+        self.unique_ports()
+            .filter_map(|port| self.sockets.get(&port))
             .map(|socket| socket.as_raw_fd())
             .collect()
     }
 
-    /// Gets the inherited file descriptors as a formatted string for environment variables
-    /// 
-    /// # Returns
-    /// * `String` - Comma-separated list of file descriptors
-    pub fn get_inherited_fds_string(&self) -> String {
-        self.get_inherited_fds()
-            .iter()
-            .map(|fd| fd.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
+    /// The configured ports in `--ports` order, without repeats
+    fn unique_ports(&self) -> impl Iterator<Item = u16> + '_ {
+        let mut seen = HashSet::new();
+        self.config.ports.iter().copied().filter(move |&port| seen.insert(port))
     }
 
-
+    /// `LISTEN_FDS` for the child, or nothing if no sockets are bound.
+    ///
+    /// `LISTEN_PID` is not included: only the forked child knows its pid, so
+    /// `socket_activation` fills it in there.
+    pub fn socket_activation_env(&self) -> Environment {
+        let mut env = Environment::new();
+        if !self.sockets.is_empty() {
+            env.set("LISTEN_FDS", self.sockets.len().to_string());
+        }
+        env
+    }
 }
 
 impl Drop for PortManager {
     fn drop(&mut self) {
-        // Ensure we cleanup ports when dropped
-        if !self.sockets.is_empty() {
-            // Don't try to use block_on in a Drop implementation
-            // Just close the sockets directly
-            for (port, socket) in self.sockets.drain() {
-                if let Err(e) = socket.shutdown(Shutdown::Both) {
-                    eprintln!("Failed to shutdown socket for port {}: {}", port, e);
-                }
+        for (port, socket) in self.sockets.drain() {
+            if let Err(e) = socket.shutdown(Shutdown::Both) {
+                eprintln!("Failed to shutdown socket for port {}: {}", port, e);
             }
-            self.bound_ports.clear();
         }
     }
 }
@@ -172,63 +134,43 @@ impl Drop for PortManager {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_port_manager_creation() {
-        let config = PortBindingConfig::default();
-        let manager = PortManager::new(config);
-        assert_eq!(manager.bound_ports.len(), 0);
+    fn ports(ports: Vec<u16>) -> PortBindingConfig {
+        PortBindingConfig {
+            ports,
+            ..Default::default()
+        }
     }
 
-    #[tokio::test]
-    async fn test_port_binding() {
-        let config = PortBindingConfig {
-            ports: vec![0], // Use port 0 to let OS assign a free port
-            bind_address: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            reuse_port: true,
-        };
-
-        let mut manager = PortManager::new(config);
-        assert!(manager.bind_ports().await.is_ok());
-        assert_eq!(manager.bound_ports.len(), 1);
+    #[test]
+    fn test_port_manager_creation() {
+        let manager = PortManager::new(PortBindingConfig::default());
+        assert_eq!(manager.sockets.len(), 0);
     }
 
-    #[tokio::test]
-    async fn test_multiple_port_binding() {
-        // Use different ports to avoid conflicts
-        let config = PortBindingConfig {
-            ports: vec![0, 0], // Use port 0 to let OS assign free ports
-            bind_address: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            reuse_port: true,
-        };
-
-        let mut manager = PortManager::new(config);
-        assert!(manager.bind_ports().await.is_ok());
-        // When using port 0, the OS assigns different ports, so we should have 2 bound ports
-        // However, if the OS assigns the same port, we might only get 1
-        let bound_count = manager.bound_ports.len();
-        assert!(bound_count >= 1 && bound_count <= 2);
+    #[test]
+    fn test_port_binding() {
+        // Port 0 lets the OS assign a free port
+        let mut manager = PortManager::new(ports(vec![0]));
+        assert!(manager.bind_ports().is_ok());
+        assert_eq!(manager.sockets.len(), 1);
     }
 
-    #[tokio::test]
-    async fn test_inherited_fds() {
-        let config = PortBindingConfig {
-            ports: vec![0],
-            bind_address: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            reuse_port: true,
-        };
+    #[test]
+    fn test_multiple_port_binding() {
+        // Both entries are port 0, which is only bound once
+        let mut manager = PortManager::new(ports(vec![0, 0]));
+        assert!(manager.bind_ports().is_ok());
+        let bound_count = manager.sockets.len();
+        assert!((1..=2).contains(&bound_count));
+    }
 
-        let mut manager = PortManager::new(config);
-        manager.bind_ports().await.unwrap();
+    #[test]
+    fn test_inherited_fds() {
+        let mut manager = PortManager::new(ports(vec![0]));
+        manager.bind_ports().unwrap();
 
-        let fds = manager.get_inherited_fds();
+        let fds = manager.listen_fds();
         assert_eq!(fds.len(), 1);
-        assert!(fds[0] > 0); // File descriptor should be positive
-
-        let fd_string = manager.get_inherited_fds_string();
-        assert!(!fd_string.is_empty());
-        
-        // Ports will be cleaned up automatically when dropped
+        assert!(fds[0] > 0);
     }
-
-
-} 
+}

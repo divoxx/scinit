@@ -2,8 +2,16 @@
 
 **RFC Number:** RFC-2025-001  
 **Date:** 2025-07-27  
-**Status:** Draft  
-**Author:** Claude Code  
+**Status:** Superseded  
+**Author:** Rodrigo Kochenburger  
+
+> **Note (superseded):** The performance and lifecycle frameworks described in
+> this RFC (`performance_framework.rs`, `lifecycle_framework.rs`), along with the
+> signal and socket frameworks, were removed. They were superseded by a
+> fixture-based suite: the `scinit-test-child` fixture
+> (`tests/fixtures/test_child.rs`), the harness in `tests/integration/harness.rs`
+> and the scenario modules in `tests/integration/scenarios/`. Bugs that suite
+> exposes are tracked in [KNOWN-ISSUES.md](../../KNOWN-ISSUES.md).
 
 ## Executive Summary
 

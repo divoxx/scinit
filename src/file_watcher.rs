@@ -1,14 +1,12 @@
-use super::Result;
-use crate::process_manager::ProcessManager;
+use crate::Result;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::time::timeout;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Events that can be emitted by the file watcher
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum FileChangeEvent {
     /// A file change was detected
     FileChanged(PathBuf),
@@ -22,66 +20,28 @@ pub struct FileWatchConfig {
     /// Path to watch for changes
     pub watch_path: PathBuf,
     /// Debounce time for file changes (prevents excessive restarts)
-    pub debounce_ms: u64,
-    /// Whether to watch recursively
-    pub recursive: bool,
-}
-
-impl Default for FileWatchConfig {
-    fn default() -> Self {
-        Self {
-            watch_path: PathBuf::from("."),
-            debounce_ms: 500,
-            recursive: false,
-        }
-    }
+    pub debounce: Duration,
 }
 
 /// Async file watcher that monitors files for changes and emits events
-/// 
+///
 /// This watcher uses the `notify` crate for cross-platform file system monitoring
 /// and includes debouncing to prevent excessive restarts when files are being
 /// written or compiled.
 pub struct FileWatcher {
-    /// The underlying notify watcher
-    watcher: Option<RecommendedWatcher>,
-    /// Configuration for the watcher
-    config: FileWatchConfig,
-    /// Channel sender for file change events
-    event_tx: mpsc::UnboundedSender<FileChangeEvent>,
+    /// The underlying notify watcher; dropping it stops watching
+    _watcher: RecommendedWatcher,
     /// Channel receiver for file change events
     event_rx: mpsc::UnboundedReceiver<FileChangeEvent>,
 }
 
 impl FileWatcher {
-    /// Creates a new file watcher with the given configuration
-    /// 
-    /// # Arguments
-    /// * `config` - Configuration for the file watcher
-    /// 
-    /// # Returns
-    /// * `Result<Self>` - The file watcher instance or an error
-    pub fn new(config: FileWatchConfig) -> Result<Self> {
+    /// Starts watching `config.watch_path` (non-recursively), with a
+    /// background task that debounces the changes into events
+    pub fn start(config: FileWatchConfig) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        
-        Ok(FileWatcher {
-            watcher: None,
-            config,
-            event_tx,
-            event_rx,
-        })
-    }
+        let (tx, rx) = mpsc::channel(100);
 
-    /// Starts watching the configured path for file changes
-    /// 
-    /// This method spawns a background task that monitors the file system
-    /// and emits events when changes are detected.
-    /// 
-    /// # Returns
-    /// * `Result<()>` - Success or error
-    pub async fn start_watching(&mut self) -> Result<()> {
-        let (tx, mut rx) = mpsc::channel(100);
-        
         // Create the notify watcher
         let mut watcher = RecommendedWatcher::new(
             move |res: std::result::Result<notify::Event, notify::Error>| {
@@ -93,144 +53,107 @@ impl FileWatcher {
         )?;
 
         // Start watching the configured path
-        let watch_path = self.config.watch_path.clone();
-        let recursive_mode = if self.config.recursive {
-            RecursiveMode::Recursive
-        } else {
-            RecursiveMode::NonRecursive
-        };
-
-        watcher.watch(&watch_path, recursive_mode)?;
+        let watch_path = config.watch_path;
+        watcher.watch(&watch_path, RecursiveMode::NonRecursive)?;
         info!("Started watching path: {:?}", watch_path);
 
-        // Store the watcher
-        self.watcher = Some(watcher);
+        tokio::spawn(debounce_events(rx, event_tx, watch_path, config.debounce));
 
-        // Spawn the event processing task
-        let event_tx = self.event_tx.clone();
-        let debounce_ms = self.config.debounce_ms;
-        
-        tokio::spawn(async move {
-            let mut last_change = None;
-            
-            while let Some(res) = rx.recv().await {
-                match res {
-                    Ok(event) => {
-                        debug!("File system event: {:?}", event);
-                        
-                        // Check if this is a file modification event
-                        if Self::is_relevant_change(&event) {
-                            let now = std::time::Instant::now();
-                            
-                            // Debounce the change
-                            if let Some(last) = last_change {
-                                if now.duration_since(last).as_millis() < debounce_ms as u128 {
-                                    debug!("Debouncing file change");
-                                    continue;
-                                }
-                            }
-                            
-                            last_change = Some(now);
-                            
-                            // Emit the change event with canonicalized path for consistency
-                            let path = event.paths.first().unwrap_or(&watch_path);
-                            let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-                            if let Err(e) = event_tx.send(FileChangeEvent::FileChanged(canonical_path)) {
-                                error!("Failed to send file change event: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("File watching error: {}", e);
-                        if let Err(e) = event_tx.send(FileChangeEvent::WatchError(e.to_string())) {
-                            error!("Failed to send watch error event: {}", e);
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-
-        Ok(())
+        Ok(FileWatcher {
+            _watcher: watcher,
+            event_rx,
+        })
     }
 
-
-    /// Waits for the next file change event
-    /// 
-    /// This method waits for the next file change event with an optional timeout.
-    /// 
-    /// # Arguments
-    /// * `timeout_duration` - Maximum time to wait for an event
-    /// 
-    /// # Returns
-    /// * `Result<Option<FileChangeEvent>>` - The event or None if timeout
+    /// Waits up to `timeout_duration` for the next event
+    #[cfg(test)]
     pub async fn wait_for_event(&mut self, timeout_duration: Duration) -> Result<Option<FileChangeEvent>> {
-        match timeout(timeout_duration, self.event_rx.recv()).await {
+        match tokio::time::timeout(timeout_duration, self.event_rx.recv()).await {
             Ok(Some(event)) => Ok(Some(event)),
             Ok(None) => Ok(None), // Channel closed
             Err(_) => Ok(None),   // Timeout
         }
     }
 
-    /// Checks if a file system event is relevant for triggering a restart
-    /// 
-    /// # Arguments
-    /// * `event` - The file system event to check
-    /// 
-    /// # Returns
-    /// * `bool` - True if the event should trigger a restart
+    /// Waits for the next (debounced) file change event.
+    ///
+    /// Cancel-safe, so it can be a `select!` branch.
+    pub async fn next_event(&mut self) -> Option<FileChangeEvent> {
+        self.event_rx.recv().await
+    }
+
+    /// Whether a file system event should trigger a restart
     fn is_relevant_change(event: &notify::Event) -> bool {
-        // Check if this is a file modification event
-        if !event.kind.is_modify() {
-            return false;
-        }
+        use notify::event::ModifyKind;
 
-        // Check if any of the changed paths are files (not directories)
-        event.paths.iter().any(|path| {
-            if let Ok(metadata) = std::fs::metadata(path) {
-                metadata.is_file()
-            } else {
-                false
-            }
-        })
-    }
+        // Content changes and renames (editors save by renaming over the file)
+        // count; metadata-only changes (permissions, timestamps, xattrs, e.g.
+        // from creating an empty file) don't
+        let content_or_rename = matches!(
+            event.kind,
+            notify::EventKind::Modify(
+                ModifyKind::Data(_) | ModifyKind::Name(_) | ModifyKind::Any | ModifyKind::Other
+            )
+        );
 
-}
-
-impl Drop for FileWatcher {
-    fn drop(&mut self) {
-        // Ensure we stop watching when dropped
-        if self.watcher.is_some() {
-            // Don't try to use block_on in a Drop implementation
-            // Just drop the watcher directly
-            self.watcher.take();
-        }
+        // Only files count, not directories
+        content_or_rename && event.paths.iter().any(|path| path.is_file())
     }
 }
 
-/// Handles file change events and triggers process restarts
-pub async fn handle_file_events(file_watcher: &mut Option<FileWatcher>, process_manager: &mut ProcessManager) -> Result<bool> {
-    if let Some(ref mut file_watcher) = file_watcher {
-        if let Some(event) = file_watcher.wait_for_event(Duration::from_millis(100)).await? {
-            match event {
-                FileChangeEvent::FileChanged(path) => {
-                    info!("File changed: {:?}, triggering restart", path);
-                    let restart_result = process_manager
-                        .restart_process_with_reason("file_change")
-                        .await?;
-                    if !restart_result {
-                        info!("Process restart limit exceeded, exiting");
-                        return Ok(true); // Signal to exit
+/// Turns raw notify events into debounced [`FileChangeEvent`]s.
+///
+/// Trailing-edge debounce: every relevant change (re)arms the deadline, and
+/// the restart fires once changes have been quiet for `debounce`, so the
+/// last change is never dropped.
+async fn debounce_events(
+    mut rx: mpsc::Receiver<notify::Result<notify::Event>>,
+    event_tx: mpsc::UnboundedSender<FileChangeEvent>,
+    watch_path: PathBuf,
+    debounce: Duration,
+) {
+    let mut pending: Option<PathBuf> = None;
+    let deadline = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            res = rx.recv() => {
+                let Some(res) = res else { break };
+                match res {
+                    Ok(event) => {
+                        debug!("File system event: {:?}", event);
+                        if FileWatcher::is_relevant_change(&event) {
+                            if pending.is_some() {
+                                debug!("Debouncing file change");
+                            }
+                            pending = Some(changed_path(&event, &watch_path));
+                            deadline.as_mut().reset(tokio::time::Instant::now() + debounce);
+                        }
+                    }
+                    Err(e) => {
+                        error!("File watching error: {}", e);
+                        if event_tx.send(FileChangeEvent::WatchError(e.to_string())).is_err() {
+                            break;
+                        }
                     }
                 }
-                FileChangeEvent::WatchError(error) => {
-                    warn!("File watching error: {}", error);
+            }
+            _ = &mut deadline, if pending.is_some() => {
+                let path = pending.take().unwrap();
+                if let Err(e) = event_tx.send(FileChangeEvent::FileChanged(path)) {
+                    error!("Failed to send file change event: {}", e);
+                    break;
                 }
             }
         }
     }
-    Ok(false) // Continue normal operation
+}
+
+/// The event's first path (or `fallback`), canonicalized when possible
+fn changed_path(event: &notify::Event, fallback: &Path) -> PathBuf {
+    let path = event.paths.first().map_or(fallback, PathBuf::as_path);
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -240,27 +163,14 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn test_file_watcher_creation() {
-        let config = FileWatchConfig::default();
-        let watcher = FileWatcher::new(config);
-        assert!(watcher.is_ok());
-    }
-
-    #[tokio::test]
     async fn test_file_watcher_start() {
         let temp_dir = tempdir().unwrap();
         let config = FileWatchConfig {
             watch_path: temp_dir.path().to_path_buf(),
-            debounce_ms: 100,
-            recursive: false,
+            debounce: Duration::from_millis(100),
         };
 
-        let mut watcher = FileWatcher::new(config).unwrap();
-        
-        // Start watching
-        assert!(watcher.start_watching().await.is_ok());
-        
-        // Watcher will be dropped automatically
+        assert!(FileWatcher::start(config).is_ok());
     }
 
     #[tokio::test]
@@ -268,12 +178,10 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let config = FileWatchConfig {
             watch_path: temp_dir.path().to_path_buf(),
-            debounce_ms: 100,
-            recursive: false,
+            debounce: Duration::from_millis(100),
         };
 
-        let mut watcher = FileWatcher::new(config).unwrap();
-        watcher.start_watching().await.unwrap();
+        let mut watcher = FileWatcher::start(config).unwrap();
 
         // Create a test file
         let test_file = temp_dir.path().join("test.txt");
@@ -290,8 +198,6 @@ mod tests {
         } else {
             panic!("Expected FileChanged event");
         }
-
-        // Watcher will be dropped automatically
     }
 
     #[tokio::test]
@@ -299,15 +205,13 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let config = FileWatchConfig {
             watch_path: temp_dir.path().to_path_buf(),
-            debounce_ms: 500,
-            recursive: false,
+            debounce: Duration::from_millis(500),
         };
 
-        let mut watcher = FileWatcher::new(config).unwrap();
-        watcher.start_watching().await.unwrap();
+        let mut watcher = FileWatcher::start(config).unwrap();
 
         let test_file = temp_dir.path().join("test.txt");
-        
+
         // Write to file multiple times quickly
         for i in 0..5 {
             fs::write(&test_file, format!("content {}", i)).unwrap();
@@ -321,8 +225,6 @@ mod tests {
         // Should not get more events immediately
         let event2 = watcher.wait_for_event(Duration::from_millis(200)).await.unwrap();
         assert!(event2.is_none());
-
-        // Watcher will be dropped automatically
     }
 
     #[test]
@@ -347,7 +249,7 @@ mod tests {
         // Test directory modification event (should be ignored)
         let test_dir = temp_dir.path().join("test_dir");
         std::fs::create_dir(&test_dir).unwrap();
-        
+
         let event = notify::Event {
             kind: EventKind::Modify(notify::event::ModifyKind::Data(notify::event::DataChange::Content)),
             paths: vec![test_dir],
@@ -357,4 +259,32 @@ mod tests {
         // This should be false because it's a directory
         assert!(!FileWatcher::is_relevant_change(&event));
     }
-} 
+
+    #[test]
+    fn test_metadata_and_create_are_not_relevant() {
+        use notify::event::{CreateKind, MetadataKind, ModifyKind, RenameMode};
+        use notify::EventKind;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file = temp_dir.path().join("app.conf");
+        std::fs::write(&file, "v1").unwrap();
+        let event = |kind| notify::Event {
+            kind,
+            paths: vec![file.clone()],
+            attrs: notify::event::EventAttributes::default(),
+        };
+
+        // Creating an empty file on macOS: Create + Modify(Metadata(Extended))
+        assert!(!FileWatcher::is_relevant_change(&event(EventKind::Create(CreateKind::File))));
+        assert!(!FileWatcher::is_relevant_change(&event(EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Extended)
+        ))));
+        assert!(!FileWatcher::is_relevant_change(&event(EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::WriteTime)
+        ))));
+        // Editors saving by renaming over the file
+        assert!(FileWatcher::is_relevant_change(&event(EventKind::Modify(
+            ModifyKind::Name(RenameMode::To)
+        ))));
+    }
+}

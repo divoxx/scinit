@@ -1,0 +1,33 @@
+# Linux test image for scinit. Build from the repo root:
+#   podman build -f tests/container/Containerfile --ignorefile tests/container/containerignore .
+# Normally driven by scripts/test-linux.sh.
+FROM docker.io/library/rust:1-slim
+
+# procps: ps for zombie inspection; util-linux: unshare for the PID-1 tests
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends procps util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . .
+
+# Build the tests with persistent caches, so only what changed recompiles:
+# - cargo registry: crates are downloaded once
+# - target dir: compiled dependencies survive Cargo.toml/Cargo.lock changes
+#
+# Cache mounts are not part of the image, but `cargo test` runs from the image
+# (offline-capable), so both are copied in:
+# - target: restored into /app/target, built, saved back. It is built in place
+#   at /app/target because the test binaries embed absolute paths via
+#   env!("CARGO_BIN_EXE_*")
+# - registry: copied to /opt and moved into CARGO_HOME by the next step, since
+#   the mount hides that path for the duration of this one
+RUN --mount=type=cache,id=scinit-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=scinit-target,target=/cache/target,sharing=locked \
+    mkdir -p /app/target && cp -a /cache/target/. /app/target/ \
+    && cargo test --no-run \
+    && rm -rf /cache/target/* \
+    && cp -a /app/target/. /cache/target/ \
+    && cp -a /usr/local/cargo/registry /opt/cargo-registry
+RUN rm -rf /usr/local/cargo/registry \
+    && mv /opt/cargo-registry /usr/local/cargo/registry

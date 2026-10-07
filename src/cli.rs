@@ -4,10 +4,11 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::environment::Environment;
 use crate::file_watcher::FileWatchConfig;
 use crate::port_manager::PortBindingConfig;
-
-type Result<T> = color_eyre::eyre::Result<T>;
+use crate::process_manager::ProcessConfig;
+use crate::Result;
 
 /// A live-reloading init system for managing subprocesses
 #[derive(Parser)]
@@ -19,7 +20,7 @@ pub struct Cli {
     #[arg(long)]
     pub live_reload: bool,
 
-    /// Path to watch for changes (default: executable path)
+    /// Path to watch for changes (default: the command as given, relative to the current directory)
     #[arg(long)]
     pub watch_path: Option<PathBuf>,
 
@@ -43,10 +44,6 @@ pub struct Cli {
     #[arg(long, default_value = "30")]
     pub graceful_timeout_secs: u64,
 
-    /// Signal polling interval (ms)
-    #[arg(long, default_value = "100")]
-    pub signal_poll_interval_ms: u64,
-
     /// Zombie reaping interval (ms)
     #[arg(long, default_value = "5000")]
     pub zombie_reap_interval_ms: u64,
@@ -55,6 +52,7 @@ pub struct Cli {
     pub command: String,
 
     /// Arguments for the command
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
 }
 
@@ -65,23 +63,21 @@ pub struct Config {
     pub command: String,
     /// Arguments for the command
     pub args: Vec<String>,
-    /// Signal polling interval in milliseconds (optimized for performance)
-    pub signal_poll_interval: Duration,
-    /// Zombie reaping interval in milliseconds
+    /// Zombie reaping interval
     pub zombie_reap_interval: Duration,
-    /// Live-reload configuration
-    pub live_reload: LiveReloadConfig,
+    /// Graceful shutdown timeout (with or without live reload)
+    pub graceful_timeout: Duration,
+    /// Live-reload configuration, `None` when disabled
+    pub live_reload: Option<LiveReloadConfig>,
     /// Port binding configuration
     pub port_binding: PortBindingConfig,
 }
 
 #[derive(Debug, Clone)]
 pub struct LiveReloadConfig {
-    pub enabled: bool,
-    pub watch_path: Option<PathBuf>,
-    pub debounce_ms: u64,
-    pub restart_delay_ms: u64,
-    pub graceful_timeout_secs: u64,
+    pub watch_path: PathBuf,
+    pub debounce: Duration,
+    pub restart_delay: Duration,
 }
 
 impl Config {
@@ -93,45 +89,48 @@ impl Config {
             .parse()
             .map_err(|e| eyre!("Invalid bind address '{}': {}", cli.bind_addr, e))?;
 
-        // Determine watch path
-        let watch_path = cli.watch_path.or_else(|| {
-            if cli.live_reload {
-                Some(PathBuf::from(&cli.command))
-            } else {
-                None
-            }
+        // The watch path defaults to the command itself
+        let live_reload = cli.live_reload.then(|| LiveReloadConfig {
+            watch_path: cli
+                .watch_path
+                .unwrap_or_else(|| PathBuf::from(&cli.command)),
+            debounce: Duration::from_millis(cli.debounce_ms),
+            restart_delay: Duration::from_millis(cli.restart_delay_ms),
         });
 
         Ok(Config {
             command: cli.command,
             args: cli.args,
-            signal_poll_interval: Duration::from_millis(cli.signal_poll_interval_ms),
             zombie_reap_interval: Duration::from_millis(cli.zombie_reap_interval_ms),
-            live_reload: LiveReloadConfig {
-                enabled: cli.live_reload,
-                watch_path,
-                debounce_ms: cli.debounce_ms,
-                restart_delay_ms: cli.restart_delay_ms,
-                graceful_timeout_secs: cli.graceful_timeout_secs,
-            },
+            graceful_timeout: Duration::from_secs(cli.graceful_timeout_secs),
+            live_reload,
             port_binding: PortBindingConfig {
                 ports: cli.ports,
                 bind_address,
-                reuse_port: true,
             },
         })
     }
 
+    /// Configuration for the managed child
+    pub fn process_config(&self) -> ProcessConfig {
+        ProcessConfig {
+            command: self.command.clone(),
+            args: self.args.clone(),
+            // Restarts only happen with live reload
+            restart_delay: self
+                .live_reload
+                .as_ref()
+                .map_or(Duration::ZERO, |live_reload| live_reload.restart_delay),
+            graceful_shutdown_timeout: self.graceful_timeout,
+            environment: Environment::new(),
+        }
+    }
+
     /// Get file watch configuration if live-reload is enabled
     pub fn file_watch_config(&self) -> Option<FileWatchConfig> {
-        if self.live_reload.enabled {
-            self.live_reload.watch_path.as_ref().map(|path| FileWatchConfig {
-                watch_path: path.clone(),
-                debounce_ms: self.live_reload.debounce_ms,
-                recursive: false,
-            })
-        } else {
-            None
-        }
+        self.live_reload.as_ref().map(|live_reload| FileWatchConfig {
+            watch_path: live_reload.watch_path.clone(),
+            debounce: live_reload.debounce,
+        })
     }
 }
