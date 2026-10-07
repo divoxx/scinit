@@ -23,6 +23,12 @@ const SETTLE: Duration = Duration::from_millis(500);
 /// How long to watch for a restart that must not happen
 const QUIET: Duration = Duration::from_secs(3);
 
+/// FSEvents (macOS) can report writes made just before the watcher starts as
+/// fresh changes. Called right before spawning, after the test set up its files.
+fn let_setup_writes_age() {
+    std::thread::sleep(Duration::from_secs(1));
+}
+
 /// Live-reload flags with short delays so restarts are quick
 fn live_reload(builder: ScinitBuilder, watch: &Path) -> ScinitBuilder {
     live_reload_with(builder, watch, 200, 100)
@@ -34,6 +40,7 @@ fn live_reload_with(
     debounce_ms: u64,
     restart_delay_ms: u64,
 ) -> ScinitBuilder {
+    let_setup_writes_age();
     builder
         .args(["--live-reload", "--watch-path"])
         .args([watch])
@@ -44,6 +51,7 @@ fn live_reload_with(
 
 /// Live-reload with scinit's default zombie-reap interval
 fn live_reload_default_reap(builder: ScinitBuilder, watch: &Path) -> ScinitBuilder {
+    let_setup_writes_age();
     builder
         .args(["--live-reload", "--watch-path"])
         .args([watch])
@@ -189,6 +197,31 @@ fn burst_of_writes_restarts_once() {
         "a burst within the debounce window must restart exactly once\n{}",
         scinit.diagnostics()
     );
+}
+
+/// A change made inside the debounce window that follows a restart must still
+/// be picked up once the window ends; otherwise the app keeps running with
+/// the stale file
+#[test]
+#[ignore = "bug: debounce-drops-trailing-change (KNOWN-ISSUES.md)"]
+fn change_within_debounce_window_is_not_lost() {
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let file = dir.join("app.conf");
+    modify(&file, "v0");
+    let scinit = live_reload_with(b, &dir, 1000, 100)
+        .child(["run"])
+        .spawn()
+        .unwrap();
+
+    start_and_settle(&scinit);
+    modify(&file, "v1");
+    scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
+    // Well inside the 1000ms window opened by the v1 change
+    modify(&file, "v2");
+    scinit
+        .wait_for_nth("started", 3, Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("the v2 change never caused a restart: {}", e));
 }
 
 /// Writes spaced further apart than the debounce window each restart the child

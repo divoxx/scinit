@@ -149,6 +149,35 @@ sleep 2; echo v2 > /tmp/watch/app.conf
 **Fix sketch:** make the watcher's file-event channel a `select!` branch
 instead of polling it before the `select!`.
 
+### debounce-drops-trailing-change
+
+**Description:** The live-reload debounce is leading-edge only: the first
+change fires immediately and every change within `--debounce-ms` of it is
+dropped, with no trailing restart once the window ends. A config edit made
+shortly after a restart (or right after a burst that already fired) is lost,
+and the app keeps running with the stale file until some later change. On
+macOS this also bites at startup: FSEvents can replay writes made just before
+the watcher started, which opens a debounce window that swallows the first
+real edits.
+
+**Location:** `src/file_watcher.rs` `start_watching`, the event task's
+`last_change` check.
+
+**Reproduction:**
+```bash
+mkdir -p /tmp/watch && echo v0 > /tmp/watch/app.conf
+$SCINIT --live-reload --watch-path /tmp/watch --debounce-ms 1000 $CHILD run & pid=$!
+sleep 2; echo v1 > /tmp/watch/app.conf; sleep 0.5; echo v2 > /tmp/watch/app.conf; sleep 3
+grep -c '^started' $SCINIT_TEST_REPORT   # 2: the v2 edit never restarted it
+kill -KILL $pid; pkill -f 'scinit-test-child run'
+```
+
+**Affected tests:** see `#[ignore]` tests tagged with this anchor:
+`grep -rn 'bug: debounce-drops-trailing-change' tests/`
+
+**Fix sketch:** trailing-edge debounce: on each relevant change, (re)arm a
+timer for `--debounce-ms`, and restart when it fires with no newer change.
+
 ## Minor
 
 Smaller issues, not (yet) covered by `#[ignore]` tests:
