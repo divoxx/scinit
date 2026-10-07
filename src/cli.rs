@@ -19,8 +19,8 @@ use crate::Result;
 Environment:
   SCINIT_LOG  scinit's own log filter, in tracing EnvFilter syntax
               (e.g. info, debug, scinit::file_watcher=debug). Default: error.
-              Logs go to stderr as `[scinit] LEVEL message`; stdout is left
-              to the child. RUST_LOG is not read by scinit and is passed to
+              Logs go to stderr as `LEVEL scinit::module: message`; stdout
+              is left to the child. RUST_LOG is not read by scinit and is passed to
               the child unchanged.")]
 pub struct Cli {
     /// Enable live-reload functionality

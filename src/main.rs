@@ -33,7 +33,7 @@ use signals::{Signal, SignalHandler};
 fn main() {
     logging::init();
     // Mirror the child's exit status, like other container inits do. Errors
-    // are logged like everything else scinit says: `[scinit] ERROR ...`
+    // are logged like everything else scinit says: `ERROR scinit: ...`
     std::process::exit(run().unwrap_or_else(|e| {
         error!("{:#}", e);
         1

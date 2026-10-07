@@ -73,7 +73,7 @@ fn logs_go_to_stderr() {
         .unwrap();
     scinit.assert_exit_code(status, 0);
     assert!(
-        scinit.stderr().contains("[scinit] INFO scinit starting"),
+        scinit.stderr().contains("INFO scinit: scinit starting"),
         "{}",
         scinit.diagnostics()
     );
@@ -109,13 +109,13 @@ fn logs_have_no_color_when_not_a_terminal() {
         .unwrap();
     scinit.assert_exit_code(status, 0);
     let stderr = scinit.stderr();
-    assert!(stderr.contains("[scinit] DEBUG"), "{}", scinit.diagnostics());
+    assert!(stderr.contains("DEBUG scinit"), "{}", scinit.diagnostics());
     assert!(!stderr.contains('\x1b'), "escape codes in logs:\n{:?}", stderr);
 }
 
 /// Fatal errors use the same format as other logs
 #[test]
-fn fatal_errors_are_prefixed() {
+fn fatal_errors_are_logged_as_events() {
     let (scinit, status) = Scinit::builder()
         .command(["/nonexistent/scinit-no-such-binary"])
         .run(TIMEOUT)
@@ -123,7 +123,7 @@ fn fatal_errors_are_prefixed() {
     scinit.assert_exit_code(status, 1);
     let stderr = scinit.stderr();
     assert!(
-        stderr.starts_with("[scinit] ERROR Failed to spawn process"),
+        stderr.starts_with("ERROR scinit: Failed to spawn process"),
         "{}",
         scinit.diagnostics()
     );
@@ -180,4 +180,45 @@ fn nonexistent_command_exits_one() {
         .run(TIMEOUT)
         .unwrap();
     scinit.assert_exit_code(status, 1);
+}
+
+/// Run scinit with stderr on a pseudo-terminal and return what it wrote there
+fn stderr_on_terminal(envs: &[(&str, &str)]) -> String {
+    use std::io::Read;
+    let pty = nix::pty::openpty(None, None).expect("openpty");
+    let mut cmd = Command::new(SCINIT);
+    cmd.args(["true"])
+        .env("SCINIT_LOG", "info")
+        .env_remove("NO_COLOR")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(pty.slave));
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("failed to run scinit");
+    // The command holds our copy of the slave; drop it so reading the master
+    // ends once scinit (and its child) exit
+    drop(cmd);
+    let mut out = Vec::new();
+    let mut master = std::fs::File::from(pty.master);
+    // Linux reports the closed slave as EIO rather than EOF
+    let _ = master.read_to_end(&mut out);
+    child.wait().unwrap();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// On a terminal, log lines are colored (here: the green INFO level)
+#[test]
+fn logs_are_colored_on_a_terminal() {
+    let out = stderr_on_terminal(&[]);
+    assert!(out.contains("\x1b[32m INFO\x1b[0m"), "no colored level in:\n{:?}", out);
+}
+
+/// `NO_COLOR` turns color off even on a terminal
+#[test]
+fn no_color_disables_color_on_a_terminal() {
+    let out = stderr_on_terminal(&[("NO_COLOR", "1")]);
+    assert!(out.contains("INFO scinit: scinit starting"), "{:?}", out);
+    assert!(!out.contains('\x1b'), "escape codes despite NO_COLOR:\n{:?}", out);
 }

@@ -46,10 +46,11 @@ CMD ["my-server"]
 
 ### Logging
 
-scinit writes its own messages to **stderr** only, so stdout carries nothing but the child's output (`docker run img cmd | jq` stays clean). Each line looks like:
+scinit writes its own messages to **stderr** only, so stdout carries nothing but the child's output (`docker run img cmd | jq` stays clean). Lines use tracing's standard format, with the level and the `scinit` module that logged them:
 
 ```
-[scinit] ERROR Failed to spawn process 'my-app': No such file or directory (os error 2)
+ERROR scinit: Failed to spawn process 'my-app': No such file or directory (os error 2)
+ INFO scinit::process_manager: Spawning process: my-app ["--port", "8080"]
 ```
 
 Lines carry no timestamp: container log drivers (Docker's `json-file`, Kubernetes' CRI log files, journald) record one per line, shown with `docker logs -t` or `kubectl logs --timestamps`. Attached runs (`docker run` without `-d`) and runs outside a container get none. Color is used only when stderr is a terminal (`NO_COLOR` turns it off).

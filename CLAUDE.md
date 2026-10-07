@@ -121,4 +121,4 @@ The `listen` fixture mode verifies socket inheritance end to end:
 - **Signal handling**: Consume handled signals only on the dedicated sigwait thread; never call `sigwait` from per-iteration tasks (cancelled waits leave threads that swallow signals)
 - Zombie reaping runs in background tasks to avoid blocking main loop
 - Terminal signals (SIGTTIN, SIGTTOU) are ignored to prevent blocking in containers
-- scinit's own logs (`src/logging.rs`) go to stderr only, as `[scinit] LEVEL message`, filtered by `SCINIT_LOG` (default `error`); never read `RUST_LOG`, which belongs to the child. Fatal errors are logged the same way
+- scinit's own logs (`src/logging.rs`) go to stderr only, in tracing's standard format without timestamps (`LEVEL scinit::module: message`; color only on a terminal), filtered by `SCINIT_LOG` (default `error`); never read `RUST_LOG`, which belongs to the child. Fatal errors are logged the same way
