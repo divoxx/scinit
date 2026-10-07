@@ -20,7 +20,7 @@ pub struct Cli {
     #[arg(long)]
     pub live_reload: bool,
 
-    /// Path to watch for changes (default: executable path)
+    /// Path to watch for changes (default: the command as given, relative to the current directory)
     #[arg(long)]
     pub watch_path: Option<PathBuf>,
 

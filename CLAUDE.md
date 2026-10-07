@@ -28,7 +28,7 @@ cargo test --test integration_test sockets::
 # Run the known-bug tests (expected to fail, see KNOWN-ISSUES.md)
 cargo test -- --ignored
 
-# Run the suite on Linux in rootless podman, plus the PID 1 checks
+# Run the suite on Linux in rootless podman, including the scinit-as-PID-1 tests
 scripts/test-linux.sh
 ```
 
@@ -54,7 +54,7 @@ cargo run -- --live-reload --debounce-ms 1000 --restart-delay-ms 500 my-app
 **scinit** is a lightweight async init system designed for container environments, built around several key modules:
 
 - **`main` / `run_main_loop`** (`src/main.rs`): Builds the tokio runtime and runs the event loop; dispatches signals (`on_signal`) and file events (`on_file_event`) to the `ProcessManager`
-- **`ProcessManager`** (`src/process_manager.rs`): Spawns, monitors, restarts and stops the child, and forwards signals to its process group. The child's lifecycle is a `ChildState` enum (`NotStarted` / `Running(ManagedChild)` / `Exited { pid, status }`)
+- **`ProcessManager`** (`src/process_manager.rs`): Spawns, monitors, restarts and stops the child, and forwards signals to its process group. The child's lifecycle is a `ChildState` enum (`NotStarted` / `Running(ManagedChild)` / `Exited { pid, status }`). Every spawn hands the terminal to the new child (`src/terminal.rs`)
 - **`SignalHandler`** (`src/signals.rs`): Receives signals only: masks the handled signals on all threads and consumes them on a dedicated `sigwait` thread, never blocking critical signals (SIGFPE, SIGILL, SIGSEGV, etc.)
 - **`FileWatcher`** (`src/file_watcher.rs`): Live-reload file watching using the `notify` crate, with a trailing-edge debounce
 - **`reaper`** (`src/reaper.rs`): Zombie reaping, leaving the managed child to tokio's `Child::wait()`
@@ -95,7 +95,7 @@ The live-reload system integrates:
 
 - **Unit Tests**: Individual component testing in each module
 - **Fixture child** (`tests/fixtures/test_child.rs`, bin `scinit-test-child`): purpose-built child that scinit runs in tests. It appends events (`started`, `signal`, `env`, `fds`, `sigmask`, `exit`, ...) to the file in `$SCINIT_TEST_REPORT`. Subcommands: `run` (trap/ignore signals), `exit <code>`, `kill-self <SIG>`, `dump` (argv, `LISTEN_*` env, fds, signal mask), `listen` (answers on inherited sockets), `spawn-orphan` (PID 1 reaping check)
-- **Harness** (`tests/integration/harness.rs`): `Scinit::builder()` spawns the real scinit binary with the fixture as child, captures stdout/stderr, and offers polling helpers (`wait_for`, `child_pid`, `wait_exit`) instead of fixed sleeps. Plain `#[test]`, no tokio
+- **Harness** (`tests/integration/harness.rs`): `Scinit::builder()` spawns the real scinit binary with the fixture as child (with only stdio open), captures stdout/stderr, and offers builder shortcuts (`start`, `spawn_dump`, `ports`, `watch`), polling helpers (`wait_for`, `wait_for_nth_match`, `wait_exit`, `poll_until`) and assertions (`assert_exit_code`, `assert_start_count`, `assert_reply_from`) instead of fixed sleeps. Plain `#[test]`, no tokio
 - **Scenarios** (`tests/integration/scenarios/`): `cli`, `exit_codes`, `signals`, `sockets`, `live_reload`, and `linux` (Linux only: `/proc` checks and scinit as PID 1 via `unshare`). All compile into the single `integration_test` target
 - **Linux runner** (`scripts/test-linux.sh`, `tests/container/Containerfile`): builds a test image and runs `cargo test` in rootless podman (args pass through), with the permissions the `linux` PID-1 tests need; `SCINIT_REQUIRE_PID1=1` makes them fail rather than skip
 - **CI** (`.github/workflows/ci.yml`): on every PR and push to `main`, runs `cargo test` on a macOS runner and `scripts/test-linux.sh` on an Ubuntu runner
@@ -110,13 +110,6 @@ The `listen` fixture mode verifies socket inheritance end to end:
 1. Reads `LISTEN_FDS`/`LISTEN_PID` and scans its open fds for inherited listeners
 2. Accepts on each one
 3. Replies with `pid=<pid> fd=<n> port=<port>`, so tests can tell which process answered
-
-## Performance Characteristics
-
-- **Signal Response**: ~100ms (vs ~1000ms with polling)
-- **CPU Usage**: Event-driven (vs constant polling overhead)
-- **Memory**: Optimized with async streams
-- **Blocking**: Fully non-blocking operations
 
 ## Critical Implementation Notes
 
