@@ -6,6 +6,7 @@ mod exit_status;
 mod file_watcher;
 mod port_manager;
 mod process_manager;
+mod program;
 mod reaper;
 mod signals;
 mod socket_activation;

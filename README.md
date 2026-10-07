@@ -38,7 +38,7 @@ CMD ["my-server"]
 | `--graceful-timeout-secs <N>` | `30` | How long to wait for the child to exit after a termination signal before sending SIGKILL |
 | `--zombie-reap-interval-ms <N>` | `5000` | Interval for the periodic zombie reaper (orphans are also reaped on SIGCHLD) |
 | `--live-reload` | off | Restart the child when the watched path changes |
-| `--watch-path <PATH>` | the command as given | File or directory to watch (non-recursive) |
+| `--watch-path <PATH>` | the command's executable | File or directory to watch (non-recursive). By default, a bare command name is looked up in `PATH` like exec does; scinit exits with an error if it isn't found |
 | `--debounce-ms <N>` | `500` | Wait this long after the last change before restarting |
 | `--restart-delay-ms <N>` | `1000` | Pause between the old child exiting and the new one starting |
 | `--ports <P1,P2,...>` | none | Ports to bind and pass to the child |

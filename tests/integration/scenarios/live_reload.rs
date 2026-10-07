@@ -451,22 +451,47 @@ fn default_watch_path_is_absolute_command() {
     scinit.assert_start_count(1, "the child must keep running");
 }
 
-/// Current behaviour: without `--watch-path`, a bare command name (resolved via
-/// PATH for spawning) is used verbatim as the watch path, relative to the cwd.
-/// It does not exist there, so scinit fails at startup with exit 1 before
-/// spawning anything.
+/// Without `--watch-path`, a bare command name is looked up in PATH, like
+/// exec does, and the executable found there is watched.
 #[test]
-fn default_watch_path_bare_command_exits_1() {
+fn default_watch_path_bare_command_is_resolved_via_path() {
     let path = path_with(Path::new(TEST_CHILD).parent().unwrap());
-    let (scinit, status) = Scinit::builder()
+    let (mut scinit, _) = Scinit::builder()
         .env("PATH", path.to_str().unwrap())
-        .args(["--live-reload"])
+        .env("RUST_LOG", "info")
+        .args(["--live-reload", "--zombie-reap-interval-ms", "100"])
         .command(["scinit-test-child", "run"])
+        .start();
+
+    scinit.assert_running_for(Duration::from_secs(1));
+    scinit.assert_start_count(1, "the child must keep running");
+    let watched = format!("Started watching path: {:?}", Path::new(TEST_CHILD));
+    assert!(
+        scinit.stdout().contains(&watched) || scinit.stderr().contains(&watched),
+        "expected log line {:?}\n{}",
+        watched,
+        scinit.diagnostics()
+    );
+}
+
+/// A bare command that isn't in PATH can't be watched: scinit fails at
+/// startup with exit 1, naming the command and pointing at `--watch-path`.
+#[test]
+fn default_watch_path_unresolvable_command_exits_1() {
+    let (scinit, status) = Scinit::builder()
+        .args(["--live-reload"])
+        .command(["scinit-definitely-not-a-command"])
         .run(TIMEOUT)
         .unwrap();
 
     scinit.assert_exit_code(status, 1);
-    scinit.assert_start_count(0, "a bare command can't be watched");
+    scinit.assert_start_count(0, "nothing can be spawned");
+    let stderr = scinit.stderr();
+    assert!(
+        stderr.contains("scinit-definitely-not-a-command") && stderr.contains("--watch-path"),
+        "expected an error naming the command and --watch-path\n{}",
+        scinit.diagnostics()
+    );
 }
 
 /// `$PATH` with `dir` prepended

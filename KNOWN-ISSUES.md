@@ -70,11 +70,6 @@ Smaller issues, not (yet) covered by `#[ignore]` tests:
   `fmt::layer().with_writer(std::io::stderr)`.
 - **`--zombie-reap-interval-ms 0` (probably) panics.** `tokio::time::interval`
   panics on a zero period. Reject 0 during argument parsing.
-- **`--live-reload` without `--watch-path` watches the command string.** The
-  default watch path is `PathBuf::from(command)` (`src/cli.rs`), which only
-  works when the command is a path; `--live-reload my-app` watches `./my-app`
-  relative to the cwd and fails to start if it doesn't exist. Resolve the
-  command via `PATH`, or error clearly.
 - **FSEvents replays writes made just before the watcher starts (macOS).**
   On macOS, a file written shortly before scinit starts watching can be
   reported as a change right after startup, causing one spurious restart.
