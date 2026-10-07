@@ -84,6 +84,7 @@ With `--live-reload`, scinit watches `--watch-path` (one file, or the entries of
 With `--ports`, scinit binds the listening sockets itself and passes them to the child following the [systemd socket-activation protocol](https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds.html), so any server that supports `sd_listen_fds()` (or a library like `listenfd`) can use them:
 
 - The sockets are at fds **3, 4, ...** in `--ports` order.
+- The child gets no other fds besides stdio, with or without `--ports`: anything else scinit itself inherited is closed on exec, as systemd does.
 - `LISTEN_FDS` is the number of sockets, and `LISTEN_PID` is the child's own pid. Any `LISTEN_*` variables scinit itself inherited are replaced.
 - Each port is bound **once** and the same sockets are passed to every child. During a live-reload restart, connections wait in the socket's backlog and the new child serves them, so restarts don't drop or refuse connections.
 - Sockets are bound with `SO_REUSEPORT`.

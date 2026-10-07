@@ -2,7 +2,7 @@
 //! passes them via the systemd protocol (`LISTEN_FDS`, `LISTEN_PID`, fds 3..).
 
 use crate::integration::harness::{
-    env_value, free_ports, loopback, socket_fds, Event, Scinit, TIMEOUT,
+    env_value, free_ports, loopback, open_fds, socket_fds, Event, Scinit, TIMEOUT,
 };
 use std::net::TcpListener;
 
@@ -185,6 +185,25 @@ fn no_ports_no_listen_vars() {
         .collect();
     assert!(listen.is_empty(), "unexpected LISTEN_* vars: {:?}", listen);
     assert!(socket_fds(&events).is_empty(), "{}", scinit.diagnostics());
+}
+
+/// An inheritable fd scinit itself inherited doesn't reach the child: it
+/// gets stdio only
+#[test]
+fn stray_inherited_fd_not_passed_without_ports() {
+    let (scinit, events) = Scinit::builder().leak_fd().spawn_dump(&["--then-exit"]);
+    assert_eq!(open_fds(&events), [0, 1, 2], "{}", scinit.diagnostics());
+}
+
+/// With `--ports`, the child gets stdio and the activated sockets only, not
+/// the stray fd scinit inherited
+#[test]
+fn stray_inherited_fd_not_passed_with_ports() {
+    let (scinit, events) = Scinit::builder()
+        .leak_fd()
+        .ports(&free_ports(2))
+        .spawn_dump(&["--then-exit"]);
+    assert_eq!(open_fds(&events), [0, 1, 2, 3, 4], "{}", scinit.diagnostics());
 }
 
 /// A port held by a listener without SO_REUSEPORT cannot be bound: scinit

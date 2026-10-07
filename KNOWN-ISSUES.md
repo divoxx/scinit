@@ -55,13 +55,6 @@ Smaller issues, not (yet) covered by `#[ignore]` tests:
   logged as `UNKNOWN`, and signals outside the table (e.g. SIGSEGV) are
   `UNKNOWN` everywhere. Logs only; exit codes are correct. Use
   `Signal::try_from(n).map(Signal::as_str)`.
-- **Stray inherited fds reach the child.** Any non-close-on-exec fd that
-  scinit itself inherited (e.g. sockets leaked by GitHub's macOS runner) is
-  passed on to the child, next to the activated sockets at 3... Container
-  runtimes start scinit with only stdio open, so this rarely matters there;
-  systemd closes everything except the passed fds. The test harness starts
-  scinit with a clean fd table. Consider marking all fds above 2 (other than
-  the activated sockets) close-on-exec in the child's `pre_exec`.
 - **scinit logs to stdout.** The `tracing` subscriber in `src/main.rs` uses
   the default writer, so scinit's log lines are interleaved with the child's
   stdout, which the child shares. Container log collectors can't separate
