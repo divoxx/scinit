@@ -120,6 +120,6 @@ The `listen` fixture mode verifies socket inheritance end to end:
 - Code in the child between fork and exec (`pre_exec`) must be async-signal-safe: build everything before forking, never allocate there
 - **Signal masking**: Block handled signals on the main thread before any other thread exists; never block critical/synchronous signals or SIGCHLD
 - **Signal handling**: Consume handled signals only on the dedicated sigwait thread; never call `sigwait` from per-iteration tasks (cancelled waits leave threads that swallow signals)
-- Zombie reaping runs in background tasks to avoid blocking main loop
+- Zombie reaping runs in background tasks to avoid blocking main loop, except the final pass on child exit, which runs inline so it completes before the runtime shuts down
 - Terminal signals (SIGTTIN, SIGTTOU) are ignored to prevent blocking in containers
 - scinit's own logs (`src/logging.rs`) go to stderr only, in tracing's standard format without timestamps (`LEVEL scinit::module: message`; color only on a terminal), filtered by `SCINIT_LOG` (default `error`); never read `RUST_LOG`, which belongs to the child. Fatal errors are logged the same way

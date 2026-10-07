@@ -34,11 +34,6 @@ sketch), with their failing tests marked `#[ignore]`.
 
 Smaller issues, not (yet) covered by `#[ignore]` tests:
 
-- **The final zombie reap isn't awaited.** On child exit, `handle_child_exit`
-  (`src/exit_status.rs`) calls `spawn_zombie_reap()`, which starts a
-  `spawn_blocking` reap without waiting for it; scinit then shuts the runtime
-  down within 100ms and exits. Orphans that exited just before the child may
-  be left unreaped. Await the reap before returning the exit code.
 - **Stray inherited fds reach the child.** Any non-close-on-exec fd that
   scinit itself inherited (e.g. sockets leaked by GitHub's macOS runner) is
   passed on to the child, next to the activated sockets at 3... Container
