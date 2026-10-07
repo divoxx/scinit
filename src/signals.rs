@@ -6,7 +6,7 @@ pub use nix::sys::signal::Signal;
 use eyre::eyre;
 use nix::sys::signal::{pthread_sigmask, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Converts signal number to human-readable name
 pub fn signal_name(signal: i32) -> &'static str {
@@ -55,19 +55,16 @@ impl SignalHandler {
         // - SIGTERM, SIGINT, SIGQUIT: Termination signals for graceful shutdown
         // - SIGUSR1, SIGUSR2: User-defined signals to forward
         // - SIGHUP: Hangup signal to forward
-        let signals_to_handle = [
+        let handled_signals: SigSet = [
             Signal::SIGTERM,
             Signal::SIGINT,
             Signal::SIGQUIT,
             Signal::SIGUSR1,
             Signal::SIGUSR2,
             Signal::SIGHUP,
-        ];
-
-        let mut handled_signals = SigSet::empty();
-        for &sig in &signals_to_handle {
-            handled_signals.add(sig);
-        }
+        ]
+        .into_iter()
+        .collect();
 
         pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&handled_signals), None)?;
 
@@ -137,17 +134,13 @@ impl SignalHandler {
             Signal::SIGUSR1 | Signal::SIGUSR2 | Signal::SIGHUP => {
                 // These signals should be forwarded to the child process only
                 info!("forwarding signal {:?} to child process", signal);
-                if let Err(e) = process_manager.forward_signal(signal) {
-                    warn!("failed to forward signal {:?} to child: {}", signal, e);
-                }
+                process_manager.try_signal_group(signal);
                 Ok(SignalAction::Continue)
             }
             _ => {
                 // Any other signals we somehow receive should be forwarded
                 debug!("forwarding unexpected signal {:?} to child process", signal);
-                if let Err(e) = process_manager.forward_signal(signal) {
-                    warn!("failed to forward signal {:?} to child: {}", signal, e);
-                }
+                process_manager.try_signal_group(signal);
                 Ok(SignalAction::Continue)
             }
         }

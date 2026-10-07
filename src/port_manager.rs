@@ -2,7 +2,7 @@ use crate::environment::Environment;
 use crate::Result;
 use nix::sys::socket::{setsockopt, sockopt::ReusePort};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr};
 use std::os::unix::io::{AsRawFd, RawFd};
 use tracing::{debug, info};
@@ -60,11 +60,11 @@ impl PortManager {
         // Sockets are bound once and kept for scinit's lifetime, so every
         // child (including after a live-reload restart) gets the same
         // listeners and connections queue in their backlog in between
-        let ports = self.config.ports.clone();
-        for &port in &ports {
-            if self.sockets.contains_key(&port) {
-                continue;
-            }
+        let unbound: Vec<u16> = self
+            .unique_ports()
+            .filter(|port| !self.sockets.contains_key(port))
+            .collect();
+        for port in unbound {
             self.bind_single_port(port)?;
         }
 
@@ -95,18 +95,16 @@ impl PortManager {
     /// File descriptors of the bound sockets, in `--ports` order. This is the
     /// order they are passed to the child in (fd 3, 4, ...).
     pub fn listen_fds(&self) -> Vec<RawFd> {
-        let mut seen = Vec::new();
-        self.config
-            .ports
-            .iter()
-            .filter(|port| {
-                let first = !seen.contains(*port);
-                seen.push(**port);
-                first
-            })
-            .filter_map(|port| self.sockets.get(port))
+        self.unique_ports()
+            .filter_map(|port| self.sockets.get(&port))
             .map(|socket| socket.as_raw_fd())
             .collect()
+    }
+
+    /// The configured ports in `--ports` order, without repeats
+    fn unique_ports(&self) -> impl Iterator<Item = u16> + '_ {
+        let mut seen = HashSet::new();
+        self.config.ports.iter().copied().filter(move |&port| seen.insert(port))
     }
 
     /// `LISTEN_FDS` for the child, or nothing if no sockets are bound.

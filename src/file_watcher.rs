@@ -24,47 +24,23 @@ pub struct FileWatchConfig {
     pub debounce_ms: u64,
 }
 
-impl Default for FileWatchConfig {
-    fn default() -> Self {
-        Self {
-            watch_path: PathBuf::from("."),
-            debounce_ms: 500,
-        }
-    }
-}
-
 /// Async file watcher that monitors files for changes and emits events
 ///
 /// This watcher uses the `notify` crate for cross-platform file system monitoring
 /// and includes debouncing to prevent excessive restarts when files are being
 /// written or compiled.
 pub struct FileWatcher {
-    /// The underlying notify watcher
-    watcher: Option<RecommendedWatcher>,
-    /// Configuration for the watcher
-    config: FileWatchConfig,
-    /// Channel sender for file change events
-    event_tx: mpsc::UnboundedSender<FileChangeEvent>,
+    /// The underlying notify watcher; dropping it stops watching
+    _watcher: RecommendedWatcher,
     /// Channel receiver for file change events
     event_rx: mpsc::UnboundedReceiver<FileChangeEvent>,
 }
 
 impl FileWatcher {
-    /// Creates a file watcher that isn't watching yet
-    pub fn new(config: FileWatchConfig) -> Self {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-
-        FileWatcher {
-            watcher: None,
-            config,
-            event_tx,
-            event_rx,
-        }
-    }
-
-    /// Starts watching the configured path (non-recursively), with a
+    /// Starts watching `config.watch_path` (non-recursively), with a
     /// background task that debounces the changes into events
-    pub fn start_watching(&mut self) -> Result<()> {
+    pub fn start(config: FileWatchConfig) -> Result<Self> {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (tx, mut rx) = mpsc::channel(100);
 
         // Create the notify watcher
@@ -78,16 +54,12 @@ impl FileWatcher {
         )?;
 
         // Start watching the configured path
-        let watch_path = self.config.watch_path.clone();
+        let watch_path = config.watch_path;
         watcher.watch(&watch_path, RecursiveMode::NonRecursive)?;
         info!("Started watching path: {:?}", watch_path);
 
-        // Store the watcher
-        self.watcher = Some(watcher);
-
         // Spawn the event processing task
-        let event_tx = self.event_tx.clone();
-        let debounce = Duration::from_millis(self.config.debounce_ms);
+        let debounce = Duration::from_millis(config.debounce_ms);
 
         tokio::spawn(async move {
             // Trailing-edge debounce: every relevant change (re)arms the
@@ -132,7 +104,10 @@ impl FileWatcher {
             }
         });
 
-        Ok(())
+        Ok(FileWatcher {
+            _watcher: watcher,
+            event_rx,
+        })
     }
 
     /// Waits up to `timeout_duration` for the next event
@@ -159,22 +134,15 @@ impl FileWatcher {
         // Content changes and renames (editors save by renaming over the file)
         // count; metadata-only changes (permissions, timestamps, xattrs, e.g.
         // from creating an empty file) don't
-        match event.kind {
-            notify::EventKind::Modify(ModifyKind::Data(_))
-            | notify::EventKind::Modify(ModifyKind::Name(_))
-            | notify::EventKind::Modify(ModifyKind::Any)
-            | notify::EventKind::Modify(ModifyKind::Other) => {}
-            _ => return false,
-        }
+        let content_or_rename = matches!(
+            event.kind,
+            notify::EventKind::Modify(
+                ModifyKind::Data(_) | ModifyKind::Name(_) | ModifyKind::Any | ModifyKind::Other
+            )
+        );
 
-        // Check if any of the changed paths are files (not directories)
-        event.paths.iter().any(|path| {
-            if let Ok(metadata) = std::fs::metadata(path) {
-                metadata.is_file()
-            } else {
-                false
-            }
-        })
+        // Only files count, not directories
+        content_or_rename && event.paths.iter().any(|path| path.is_file())
     }
 }
 
@@ -202,12 +170,6 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn test_file_watcher_creation() {
-        let watcher = FileWatcher::new(FileWatchConfig::default());
-        assert!(watcher.watcher.is_none());
-    }
-
-    #[tokio::test]
     async fn test_file_watcher_start() {
         let temp_dir = tempdir().unwrap();
         let config = FileWatchConfig {
@@ -215,8 +177,7 @@ mod tests {
             debounce_ms: 100,
         };
 
-        let mut watcher = FileWatcher::new(config);
-        assert!(watcher.start_watching().is_ok());
+        assert!(FileWatcher::start(config).is_ok());
     }
 
     #[tokio::test]
@@ -227,8 +188,7 @@ mod tests {
             debounce_ms: 100,
         };
 
-        let mut watcher = FileWatcher::new(config);
-        watcher.start_watching().unwrap();
+        let mut watcher = FileWatcher::start(config).unwrap();
 
         // Create a test file
         let test_file = temp_dir.path().join("test.txt");
@@ -255,8 +215,7 @@ mod tests {
             debounce_ms: 500,
         };
 
-        let mut watcher = FileWatcher::new(config);
-        watcher.start_watching().unwrap();
+        let mut watcher = FileWatcher::start(config).unwrap();
 
         let test_file = temp_dir.path().join("test.txt");
 

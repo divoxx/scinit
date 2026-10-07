@@ -4,12 +4,13 @@ use crate::signals::signal_name;
 use crate::socket_activation::SocketActivationExec;
 use crate::Result;
 use eyre::eyre;
+use nix::sys::signal::kill;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{getpgid, tcsetpgrp, Pid};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::IsTerminal;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 use tokio::process::{Child, Command};
@@ -23,6 +24,16 @@ use super::signals::Signal;
 /// The zombie reaper must leave this process alone: its exit status belongs to
 /// tokio's `child.wait()`, which fails with ECHILD if the reaper takes it first.
 static MANAGED_CHILD: AtomicI32 = AtomicI32::new(0);
+
+/// Marks `pid` as the managed child
+fn set_managed_child(pid: Pid) {
+    MANAGED_CHILD.store(pid.as_raw(), Ordering::SeqCst);
+}
+
+/// Clears the managed child mark, unless another child has replaced `pid`
+fn clear_managed_child(pid: Pid) {
+    let _ = MANAGED_CHILD.compare_exchange(pid.as_raw(), 0, Ordering::SeqCst, Ordering::SeqCst);
+}
 
 /// Configuration for process management behavior
 #[derive(Debug, Clone)]
@@ -51,28 +62,36 @@ impl Default for ProcessConfig {
     }
 }
 
-/// State of a managed process
-#[derive(Debug, Clone, PartialEq)]
-pub enum ProcessState {
-    /// Process is starting
-    Starting,
-    /// Process is running
-    Running,
-    /// Process is stopping (graceful shutdown)
-    Stopping,
-    /// Process has stopped
-    Stopped,
+/// Lifecycle of the managed child; each state carries only the data valid in it
+enum ChildState {
+    NotStarted,
+    Running(ManagedChild),
+    Exited { pid: Pid, status: ExitStatus },
 }
 
-/// Information about a managed process
-#[derive(Debug)]
-pub struct ProcessInfo {
-    /// Current state of the process
-    pub state: ProcessState,
-    /// Process ID (if running)
-    pub pid: Option<Pid>,
-    /// Exit status of the last process (if stopped)
-    pub exit_status: Option<std::process::ExitStatus>,
+/// A running child the zombie reaper must leave alone. Creating one marks
+/// its pid as managed and dropping it clears the mark, so the reaper's
+/// view can't go stale.
+struct ManagedChild {
+    child: Child,
+    pid: Pid,
+}
+
+impl ManagedChild {
+    fn new(child: Child) -> Result<Self> {
+        let pid = match child.id() {
+            Some(pid) => Pid::from_raw(pid.try_into()?),
+            None => return Err(eyre!("Failed to get process ID")),
+        };
+        set_managed_child(pid);
+        Ok(Self { child, pid })
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        clear_managed_child(self.pid);
+    }
 }
 
 /// Manages the lifecycle of child processes with graceful shutdown and port inheritance.
@@ -84,29 +103,20 @@ pub struct ProcessManager {
     config: ProcessConfig,
     /// Port manager for port inheritance
     port_manager: PortManager,
-    /// Current process information
-    process_info: ProcessInfo,
-    /// Current child process handle
-    child: Option<Child>,
+    state: ChildState,
 }
 
 impl ProcessManager {
     pub fn new(config: ProcessConfig, port_manager: PortManager) -> Self {
         Self {
-            process_info: ProcessInfo {
-                state: ProcessState::Stopped,
-                pid: None,
-                exit_status: None,
-            },
             config,
             port_manager,
-            child: None,
+            state: ChildState::NotStarted,
         }
     }
 
     /// Spawns a new process with port inheritance and proper signal mask reset
     pub async fn spawn_process(&mut self) -> Result<()> {
-        self.process_info.state = ProcessState::Starting;
         info!("Spawning process: {} {:?}", self.config.command, self.config.args);
 
         // Bind ports before spawning
@@ -178,47 +188,42 @@ impl ProcessManager {
         // Spawn the process
         let child = command.spawn()
             .map_err(|e| eyre!("Failed to spawn process '{}': {}", self.config.command, e))?;
-
-        // Get the PID
-        let pid = match child.id() {
-            Some(pid) => Pid::from_raw(pid.try_into()?),
-            None => return Err(eyre!("Failed to get process ID")),
-        };
-
-        // Update process info
-        self.process_info.pid = Some(pid);
-        self.process_info.state = ProcessState::Running;
-        self.child = Some(child);
-        MANAGED_CHILD.store(pid.as_raw(), Ordering::SeqCst);
+        let child = ManagedChild::new(child)?;
+        let pid = child.pid;
+        self.state = ChildState::Running(child);
 
         info!("Process spawned with PID: {}", pid);
         Ok(())
     }
 
-    /// Waits for the current process to exit and returns its status, or
-    /// `None` if there is no process
-    pub async fn wait_for_exit(&mut self) -> Result<Option<std::process::ExitStatus>> {
-        if let Some(ref mut child) = self.child {
-            match child.wait().await {
-                Ok(status) => {
-                    self.process_info.exit_status = Some(status);
-                    self.process_info.state = ProcessState::Stopped;
-                    self.child = None;
-                    MANAGED_CHILD.store(0, Ordering::SeqCst);
-
-                    debug!("Process exited with status: {:?}", status);
-                    Ok(Some(status))
-                }
-                Err(e) => {
-                    error!("Error waiting for process: {}", e);
-                    self.process_info.state = ProcessState::Stopped;
-                    self.child = None;
-                    MANAGED_CHILD.store(0, Ordering::SeqCst);
-                    Err(e.into())
-                }
+    /// Waits for the running child to exit and returns its status. Never
+    /// resolves when no child is running.
+    pub async fn wait_for_exit(&mut self) -> Result<ExitStatus> {
+        let ChildState::Running(running) = &mut self.state else {
+            return std::future::pending().await;
+        };
+        match running.child.wait().await {
+            Ok(status) => {
+                self.record_exit(status);
+                debug!("Process exited with status: {:?}", status);
+                Ok(status)
             }
-        } else {
-            Ok(None)
+            Err(e) => {
+                error!("Error waiting for process: {}", e);
+                // Its status is lost, so there is no child left to manage
+                self.state = ChildState::NotStarted;
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Moves a running child to `Exited`, which clears the reaper's mark
+    fn record_exit(&mut self, status: ExitStatus) {
+        if let ChildState::Running(child) = &self.state {
+            self.state = ChildState::Exited {
+                pid: child.pid,
+                status,
+            };
         }
     }
 
@@ -229,59 +234,45 @@ impl ProcessManager {
         self.shutdown_with_signal(Signal::SIGTERM).await
     }
 
-    /// Stops the current process: sends `signal` to its process group and
+    /// Stops the running child: sends `signal` to its process group and
     /// waits for it to exit. If it doesn't exit within the graceful shutdown
     /// timeout, it sends SIGKILL.
     pub async fn shutdown_with_signal(&mut self, signal: Signal) {
-        if let Some(pid) = self.process_info.pid {
-            self.process_info.state = ProcessState::Stopping;
-            info!("Initiating graceful shutdown of process {} with {:?}", pid, signal);
+        let Some(pid) = self.running_pid() else {
+            return;
+        };
+        info!("Initiating graceful shutdown of process {} with {:?}", pid, signal);
+        self.try_signal_group(signal);
 
-            if let Err(e) = self.forward_signal(signal) {
-                warn!("Failed to send {:?}: {}", signal, e);
+        match timeout(self.config.graceful_shutdown_timeout, self.wait_for_exit()).await {
+            Ok(Ok(_)) => {
+                info!("Process exited gracefully");
+                return;
             }
-
-            // Wait for graceful shutdown
-            match timeout(self.config.graceful_shutdown_timeout, self.wait_for_exit()).await {
-                Ok(Ok(_)) => {
-                    info!("Process exited gracefully");
-                }
-                Ok(Err(e)) => {
-                    warn!("Error during graceful shutdown: {}", e);
-                    self.force_kill().await;
-                }
-                Err(_) => {
-                    warn!("Graceful shutdown timeout, forcing kill");
-                    self.force_kill().await;
-                }
-            }
+            Ok(Err(e)) => warn!("Error during graceful shutdown: {}", e),
+            Err(_) => warn!("Graceful shutdown timeout, forcing kill"),
         }
+        self.force_kill().await;
     }
 
-    /// Sends SIGKILL to the current process group and records the exit
-    /// status if the process is gone 100ms later
-    pub async fn force_kill(&mut self) {
-        if let Some(pid) = self.process_info.pid {
-            info!("Force killing process {}", pid);
+    /// Sends SIGKILL to the running child's process group and records the
+    /// exit status if the child is gone 100ms later
+    async fn force_kill(&mut self) {
+        let Some(pid) = self.running_pid() else {
+            return;
+        };
+        info!("Force killing process {}", pid);
+        self.try_signal_group(Signal::SIGKILL);
 
-            // Send SIGKILL
-            if let Err(e) = self.forward_signal(Signal::SIGKILL) {
-                warn!("Failed to send SIGKILL: {}", e);
-            }
+        // Wait a bit for the process to exit
+        sleep(Duration::from_millis(100)).await;
 
-            // Wait a bit for the process to exit
-            sleep(Duration::from_millis(100)).await;
-
-            // Check if process is still running
-            if let Some(ref mut child) = self.child {
-                if let Ok(Some(status)) = child.try_wait() {
-                    self.process_info.exit_status = Some(status);
-                    self.process_info.state = ProcessState::Stopped;
-                    self.child = None;
-                    MANAGED_CHILD.store(0, Ordering::SeqCst);
-                    info!("Process killed, exit status: {:?}", status);
-                }
-            }
+        let ChildState::Running(running) = &mut self.state else {
+            return;
+        };
+        if let Ok(Some(status)) = running.child.try_wait() {
+            self.record_exit(status);
+            info!("Process killed, exit status: {:?}", status);
         }
     }
 
@@ -295,93 +286,96 @@ impl ProcessManager {
         self.spawn_process().await
     }
 
-    /// Forwards a signal to the current process group
-    pub fn forward_signal(&self, signal: Signal) -> Result<()> {
-        self.send_signal_to_group(signal)
+    /// Sends a signal to the running child's process group
+    pub fn signal_group(&self, signal: Signal) -> Result<()> {
+        let Some(pid) = self.running_pid() else {
+            return Err(eyre!("No process to send signal to"));
+        };
+        let pgid = getpgid(Some(pid))?;
+        debug!("Sending signal {:?} to process group {}", signal, pgid);
+        kill(Pid::from_raw(-pgid.as_raw()), signal)?;
+        Ok(())
     }
 
-    /// Sends a signal to the process group
-    pub fn send_signal_to_group(&self, signal: Signal) -> Result<()> {
-        if let Some(pid) = self.process_info.pid {
-            use nix::sys::signal::kill;
-            let pgid = getpgid(Some(pid))?;
-            debug!("Sending signal {:?} to process group {}", signal, pgid);
-
-            // Send signal to the entire process group
-            kill(Pid::from_raw(-pgid.as_raw()), signal)?;
-            Ok(())
-        } else {
-            Err(eyre!("No process to send signal to"))
+    /// Like [`Self::signal_group`], but only logs a failure
+    pub fn try_signal_group(&self, signal: Signal) {
+        if let Err(e) = self.signal_group(signal) {
+            warn!("failed to forward signal {:?} to child: {}", signal, e);
         }
     }
 
-    pub fn process_info(&self) -> &ProcessInfo {
-        &self.process_info
+    /// PID of the running or last exited child
+    pub fn pid(&self) -> Option<Pid> {
+        match &self.state {
+            ChildState::NotStarted => None,
+            ChildState::Running(child) => Some(child.pid),
+            ChildState::Exited { pid, .. } => Some(*pid),
+        }
     }
 
-    #[cfg(test)]
-    pub fn state(&self) -> ProcessState {
-        self.process_info.state.clone()
+    /// Exit status of the child, once its exit was observed
+    pub fn exit_status(&self) -> Option<ExitStatus> {
+        match self.state {
+            ChildState::Exited { status, .. } => Some(status),
+            _ => None,
+        }
+    }
+
+    fn running_pid(&self) -> Option<Pid> {
+        match &self.state {
+            ChildState::Running(child) => Some(child.pid),
+            _ => None,
+        }
     }
 
     #[cfg(test)]
     pub fn is_running(&self) -> bool {
-        self.process_info.state == ProcessState::Running
+        matches!(self.state, ChildState::Running(_))
     }
 }
 
 impl Drop for ProcessManager {
     fn drop(&mut self) {
         // Emergency cleanup when dropped with a child still running (e.g. on
-        // an error return), so the child's process group isn't orphaned
-        if let Some(pid) = self.process_info.pid {
-            // Check if process is actually still running before emergency cleanup
-            if self.process_info.state == ProcessState::Running ||
-               self.process_info.state == ProcessState::Starting {
-                eprintln!("ProcessManager dropped with running child (PID: {}), emergency cleanup", pid);
+        // an error return or mid-shutdown), so its process group isn't orphaned
+        let Some(pid) = self.running_pid() else {
+            return;
+        };
+        eprintln!("ProcessManager dropped with running child (PID: {}), emergency cleanup", pid);
 
-                // Emergency SIGKILL to process group - no graceful shutdown in Drop
-                if let Err(e) = self.send_signal_to_group(Signal::SIGKILL) {
-                    // Only log SIGKILL errors if they're not "process already dead" errors
-                    match e.downcast_ref::<nix::Error>() {
-                        Some(nix::Error::ESRCH) => {
-                            // Process already dead - this is fine, no cleanup needed
-                        }
-                        _ => {
-                            eprintln!("Failed to send SIGKILL to process group during emergency cleanup: {}", e);
-                        }
-                    }
-                } else {
-                    eprintln!("Sent SIGKILL to process group {} during emergency cleanup", pid);
-                }
-
-                // Brief pause to let SIGKILL take effect
-                std::thread::sleep(Duration::from_millis(100));
-            }
+        // Emergency SIGKILL to process group - no graceful shutdown in Drop
+        match self.signal_group(Signal::SIGKILL) {
+            Ok(()) => eprintln!("Sent SIGKILL to process group {} during emergency cleanup", pid),
+            // Process already dead - this is fine, no cleanup needed
+            Err(e) if matches!(e.downcast_ref::<nix::Error>(), Some(nix::Error::ESRCH)) => {}
+            Err(e) => eprintln!("Failed to send SIGKILL to process group during emergency cleanup: {}", e),
         }
+
+        // Brief pause to let SIGKILL take effect
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
 /// Sets the process group as the foreground process group if a terminal is available
 pub fn process_group_to_foreground(pgid: Pid) -> Result<()> {
-    match File::open("/dev/tty") {
-        Ok(tty) => {
-            if tty.is_terminal() {
-                debug!("Setting process group {} as foreground", &pgid);
-                if let Err(e) = tcsetpgrp(tty, pgid) {
-                    error!("Failed to set process group {} as foreground: {}", &pgid, e);
-                    return Err(e.into());
-                }
-            } else {
-                debug!("Not a terminal, skipping foreground process group setup");
-            }
-        }
+    let tty = match File::open("/dev/tty") {
+        Ok(tty) => tty,
         Err(e) => {
             debug!(
                 "Cannot open /dev/tty ({}), skipping foreground process group setup",
                 e
             );
+            return Ok(());
         }
+    };
+    if !tty.is_terminal() {
+        debug!("Not a terminal, skipping foreground process group setup");
+        return Ok(());
+    }
+    debug!("Setting process group {} as foreground", &pgid);
+    if let Err(e) = tcsetpgrp(tty, pgid) {
+        error!("Failed to set process group {} as foreground: {}", &pgid, e);
+        return Err(e.into());
     }
     Ok(())
 }
@@ -456,7 +450,7 @@ pub fn reap_zombies() {
 
 /// Shell-style exit code for a child's status: its exit code, or 128 + the
 /// signal number if it was killed by a signal
-pub fn exit_code(status: std::process::ExitStatus) -> i32 {
+pub fn exit_code(status: ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     status
         .code()
@@ -469,7 +463,7 @@ pub fn exit_code(status: std::process::ExitStatus) -> i32 {
 /// In container environments, scinit's lifecycle is tied to the child process,
 /// so scinit exits with the child's exit code (see [`exit_code`]) and
 /// orchestrators can tell a crash from a clean shutdown.
-pub fn handle_child_exit(status: std::process::ExitStatus) -> i32 {
+pub fn handle_child_exit(status: ExitStatus) -> i32 {
     if status.success() {
         info!("Child process exited successfully, scinit exiting cleanly");
     } else if let Some(code) = status.code() {
@@ -513,35 +507,56 @@ mod tests {
         ProcessManager::new(config, PortManager::new(PortBindingConfig::default()))
     }
 
+    fn command(command: &str, args: &[&str]) -> ProcessConfig {
+        ProcessConfig {
+            command: command.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Whether `pid` has exited (zombies count: an orphan may never be reaped
+    /// when the tests run as a container's PID 1)
+    fn is_gone(pid: Pid) -> bool {
+        if kill(pid, None).is_err() {
+            return true;
+        }
+        std::fs::read_to_string(format!("/proc/{}/stat", pid))
+            .is_ok_and(|stat| stat.rsplit(')').next().is_some_and(|s| s.trim_start().starts_with('Z')))
+    }
+
+    /// Polls `f` every 10ms for up to 2s
+    fn poll(mut f: impl FnMut() -> bool) -> bool {
+        (0..200).any(|_| f() || {
+            std::thread::sleep(Duration::from_millis(10));
+            false
+        })
+    }
+
     #[tokio::test]
     async fn test_process_manager_creation() {
         let manager = manager(ProcessConfig::default());
-        assert_eq!(manager.state(), ProcessState::Stopped);
         assert!(!manager.is_running());
+        assert!(manager.pid().is_none());
+        assert!(manager.exit_status().is_none());
     }
 
     #[tokio::test]
     async fn test_process_spawn() {
-        let mut manager = manager(ProcessConfig {
-            command: "echo".to_string(),
-            args: vec!["hello".to_string()],
-            ..Default::default()
-        });
+        let mut manager = manager(command("echo", &["hello"]));
         assert!(manager.spawn_process().await.is_ok());
 
         // Wait for process to exit
-        let exit_status = manager.wait_for_exit().await.unwrap();
-        assert!(exit_status.is_some());
-        assert_eq!(manager.state(), ProcessState::Stopped);
+        let status = manager.wait_for_exit().await.unwrap();
+        assert!(status.success());
+        assert!(!manager.is_running());
     }
 
     #[tokio::test]
     async fn test_process_restart() {
         let mut manager = manager(ProcessConfig {
-            command: "echo".to_string(),
-            args: vec!["hello".to_string()],
             restart_delay: Duration::from_millis(100),
-            ..Default::default()
+            ..command("echo", &["hello"])
         });
 
         assert!(manager.restart().await.is_ok());
@@ -551,40 +566,62 @@ mod tests {
     #[tokio::test]
     async fn test_graceful_shutdown() {
         let mut manager = manager(ProcessConfig {
-            command: "sleep".to_string(),
-            args: vec!["10".to_string()],
             graceful_shutdown_timeout: Duration::from_millis(500),
-            ..Default::default()
+            ..command("sleep", &["10"])
         });
         assert!(manager.spawn_process().await.is_ok());
         assert!(manager.is_running());
 
         manager.graceful_shutdown().await;
-        assert_eq!(manager.state(), ProcessState::Stopped);
+        assert!(!manager.is_running());
     }
 
     #[tokio::test]
-    async fn test_process_info() {
+    async fn test_shutdown_records_exit() {
         let mut manager = manager(ProcessConfig {
-            command: "echo".to_string(),
-            args: vec!["hello".to_string()],
-            ..Default::default()
+            graceful_shutdown_timeout: Duration::from_secs(5),
+            ..command("sleep", &["10"])
         });
-        let info = manager.process_info();
+        manager.spawn_process().await.unwrap();
+        let pid = manager.pid().unwrap();
 
-        assert_eq!(info.state, ProcessState::Stopped);
+        manager.shutdown_with_signal(Signal::SIGTERM).await;
+        assert!(!manager.is_running());
+        assert_eq!(manager.pid(), Some(pid));
+        assert_eq!(manager.exit_status().map(exit_code), Some(128 + Signal::SIGTERM as i32));
+        // The exited child's pid may be reused, so it is never signalled again
+        assert!(manager.signal_group(Signal::SIGTERM).is_err());
+        // And there is nothing left to wait for
+        assert!(timeout(Duration::from_millis(50), manager.wait_for_exit()).await.is_err());
+    }
 
-        // Spawn process
-        assert!(manager.spawn_process().await.is_ok());
-        let info = manager.process_info();
-        assert_eq!(info.state, ProcessState::Running);
-        assert!(info.pid.is_some());
+    #[tokio::test]
+    async fn test_drop_kills_group_during_graceful_stop() {
+        // The child and its own child (which only the group kill reaches,
+        // kill_on_drop kills the leader alone) ignore SIGTERM, so the
+        // graceful stop below can't finish
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let mut env = Environment::new();
+        env.set("PID_FILE", pid_file.to_str().unwrap());
+        let mut manager = manager(ProcessConfig {
+            environment: env,
+            ..command("sh", &["-c", "trap '' TERM; sleep 10 & echo $! > \"$PID_FILE\"; wait"])
+        });
+        manager.spawn_process().await.unwrap();
+        let mut grandchild = None;
+        assert!(poll(|| {
+            grandchild = std::fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse().ok());
+            grandchild.is_some()
+        }));
+        let grandchild = Pid::from_raw(grandchild.unwrap());
 
-        // Wait for exit
-        manager.wait_for_exit().await.unwrap();
-        let info = manager.process_info();
-        assert_eq!(info.state, ProcessState::Stopped);
-        assert!(info.exit_status.is_some());
+        let stop = manager.shutdown_with_signal(Signal::SIGTERM);
+        assert!(timeout(Duration::from_millis(200), stop).await.is_err());
+        assert!(manager.is_running());
+
+        drop(manager);
+        assert!(poll(|| is_gone(grandchild)), "grandchild {} survived the drop", grandchild);
     }
 
     #[tokio::test]
@@ -593,14 +630,12 @@ mod tests {
         env.set("TEST_VAR", "test_value");
 
         let mut manager = manager(ProcessConfig {
-            command: "sh".to_string(),
-            args: vec!["-c".to_string(), "echo $TEST_VAR".to_string()],
             environment: env,
-            ..Default::default()
+            ..command("sh", &["-c", "test \"$TEST_VAR\" = test_value"])
         });
         assert!(manager.spawn_process().await.is_ok());
 
-        let exit_status = manager.wait_for_exit().await.unwrap();
-        assert!(exit_status.is_some());
+        let status = manager.wait_for_exit().await.unwrap();
+        assert!(status.success());
     }
 }

@@ -63,19 +63,19 @@ pub struct Config {
     pub args: Vec<String>,
     /// Zombie reaping interval
     pub zombie_reap_interval: Duration,
-    /// Live-reload configuration
-    pub live_reload: LiveReloadConfig,
+    /// Graceful shutdown timeout in seconds (with or without live reload)
+    pub graceful_timeout_secs: u64,
+    /// Live-reload configuration, `None` when disabled
+    pub live_reload: Option<LiveReloadConfig>,
     /// Port binding configuration
     pub port_binding: PortBindingConfig,
 }
 
 #[derive(Debug, Clone)]
 pub struct LiveReloadConfig {
-    pub enabled: bool,
-    pub watch_path: Option<PathBuf>,
+    pub watch_path: PathBuf,
     pub debounce_ms: u64,
     pub restart_delay_ms: u64,
-    pub graceful_timeout_secs: u64,
 }
 
 impl Config {
@@ -87,26 +87,21 @@ impl Config {
             .parse()
             .map_err(|e| eyre!("Invalid bind address '{}': {}", cli.bind_addr, e))?;
 
-        // Determine watch path
-        let watch_path = cli.watch_path.or_else(|| {
-            if cli.live_reload {
-                Some(PathBuf::from(&cli.command))
-            } else {
-                None
-            }
+        // The watch path defaults to the command itself
+        let live_reload = cli.live_reload.then(|| LiveReloadConfig {
+            watch_path: cli
+                .watch_path
+                .unwrap_or_else(|| PathBuf::from(&cli.command)),
+            debounce_ms: cli.debounce_ms,
+            restart_delay_ms: cli.restart_delay_ms,
         });
 
         Ok(Config {
             command: cli.command,
             args: cli.args,
             zombie_reap_interval: Duration::from_millis(cli.zombie_reap_interval_ms),
-            live_reload: LiveReloadConfig {
-                enabled: cli.live_reload,
-                watch_path,
-                debounce_ms: cli.debounce_ms,
-                restart_delay_ms: cli.restart_delay_ms,
-                graceful_timeout_secs: cli.graceful_timeout_secs,
-            },
+            graceful_timeout_secs: cli.graceful_timeout_secs,
+            live_reload,
             port_binding: PortBindingConfig {
                 ports: cli.ports,
                 bind_address,
@@ -116,16 +111,9 @@ impl Config {
 
     /// Get file watch configuration if live-reload is enabled
     pub fn file_watch_config(&self) -> Option<FileWatchConfig> {
-        if self.live_reload.enabled {
-            self.live_reload
-                .watch_path
-                .as_ref()
-                .map(|path| FileWatchConfig {
-                    watch_path: path.clone(),
-                    debounce_ms: self.live_reload.debounce_ms,
-                })
-        } else {
-            None
-        }
+        self.live_reload.as_ref().map(|live_reload| FileWatchConfig {
+            watch_path: live_reload.watch_path.clone(),
+            debounce_ms: live_reload.debounce_ms,
+        })
     }
 }

@@ -69,24 +69,21 @@ async fn app_main(signal_handler: &mut SignalHandler) -> Result<i32> {
     let process_config = ProcessConfig {
         command: config.command.clone(),
         args: config.args.clone(),
-        restart_delay: Duration::from_millis(config.live_reload.restart_delay_ms),
-        graceful_shutdown_timeout: Duration::from_secs(config.live_reload.graceful_timeout_secs),
+        // Restarts only happen with live reload
+        restart_delay: config
+            .live_reload
+            .as_ref()
+            .map_or(Duration::ZERO, |live_reload| {
+                Duration::from_millis(live_reload.restart_delay_ms)
+            }),
+        graceful_shutdown_timeout: Duration::from_secs(config.graceful_timeout_secs),
         environment: Environment::new(),
     };
 
     let mut process_manager = ProcessManager::new(process_config, port_manager);
 
-    // Create file watcher if live-reload is enabled
-    let mut file_watcher = config.file_watch_config().map(FileWatcher::new);
-
     // Run the main event loop
-    let code = run_main_loop(
-        config,
-        &mut process_manager,
-        signal_handler,
-        &mut file_watcher,
-    )
-    .await?;
+    let code = run_main_loop(config, &mut process_manager, signal_handler).await?;
 
     info!("scinit exiting with code {}", code);
     Ok(code)
@@ -97,7 +94,6 @@ async fn run_main_loop(
     config: Config,
     process_manager: &mut ProcessManager,
     signal_handler: &mut SignalHandler,
-    file_watcher: &mut Option<FileWatcher>,
 ) -> Result<i32> {
     let mut zombie_reap_interval = interval(config.zombie_reap_interval);
     // Shares tokio's SIGCHLD handler, which also drives `Child::wait()`
@@ -109,8 +105,8 @@ async fn run_main_loop(
     );
 
     // Start file watching if enabled
-    if let Some(ref mut file_watcher) = file_watcher {
-        file_watcher.start_watching()?;
+    let mut file_watcher = config.file_watch_config().map(FileWatcher::start).transpose()?;
+    if file_watcher.is_some() {
         info!("File watching started for live-reload");
     } else {
         debug!("Live-reload disabled, no file watching");
@@ -120,7 +116,7 @@ async fn run_main_loop(
     process_manager.spawn_process().await?;
 
     // Setup process group
-    if let Some(pid) = process_manager.process_info().pid {
+    if let Some(pid) = process_manager.pid() {
         use nix::unistd::getpgid;
         let pgid = getpgid(Some(pid))?;
         tokio::task::spawn_blocking(move || process_group_to_foreground(pgid)).await??;
@@ -130,31 +126,19 @@ async fn run_main_loop(
         select! {
             // Check if subprocess has exited
             exit_status = process_manager.wait_for_exit() => {
-                match exit_status {
-                    Ok(Some(status)) => {
-                        return Ok(handle_child_exit(status));
-                    }
-                    Ok(None) => {
-                        // No process to wait for, continue
-                        continue;
-                    }
-                    Err(e) => {
-                        error!("error waiting for subprocess: {}", e);
-                        return Err(e);
-                    }
-                }
+                let status = exit_status.inspect_err(|e| error!("error waiting for subprocess: {}", e))?;
+                return Ok(handle_child_exit(status));
             }
 
             // Synchronous signal handling - proper for init systems
             signal = signal_handler.wait_for_signal() => {
                 let signal = signal?;
-                match signal_handler.process_signal(signal, process_manager, config.live_reload.graceful_timeout_secs).await? {
+                match signal_handler.process_signal(signal, process_manager, config.graceful_timeout_secs).await? {
                     SignalAction::Exit => {
                         // The child's status if it was observed; otherwise
                         // report death by the signal that stopped us
                         return Ok(process_manager
-                            .process_info()
-                            .exit_status
+                            .exit_status()
                             .map(exit_code)
                             .unwrap_or(128 + signal as i32));
                     }
@@ -163,7 +147,7 @@ async fn run_main_loop(
             }
 
             // Live-reload: restart as soon as a (debounced) change arrives
-            Some(event) = next_file_event(file_watcher) => {
+            Some(event) = next_file_event(&mut file_watcher) => {
                 handle_file_event(event, process_manager).await?;
             }
 
