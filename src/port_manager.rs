@@ -3,9 +3,9 @@ use crate::Result;
 use nix::sys::socket::{setsockopt, sockopt::ReusePort};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::{AsRawFd, RawFd};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Configuration for port binding behavior
 #[derive(Debug, Clone)]
@@ -125,16 +125,6 @@ impl PortManager {
             env.set("LISTEN_FDS", self.sockets.len().to_string());
         }
         env
-    }
-}
-
-impl Drop for PortManager {
-    fn drop(&mut self) {
-        for (port, socket) in self.sockets.drain() {
-            if let Err(e) = socket.shutdown(Shutdown::Both) {
-                warn!("Failed to shutdown socket for port {}: {}", port, e);
-            }
-        }
     }
 }
 
