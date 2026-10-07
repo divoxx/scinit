@@ -159,22 +159,19 @@ fn ipv6_bind_addr() {
     scinit.assert_reply_from(&format!("[::1]:{}", port), pid);
 }
 
-/// Without `--ports`, a `LISTEN_FDS` already in scinit's environment reaches
-/// the child unchanged.
-///
-/// Asserted so a change is noticed: a stale `LISTEN_FDS` makes the child
-/// trust fds it doesn't have.
+/// Without `--ports`, `LISTEN_*` variables already in scinit's environment
+/// don't reach the child: a stale `LISTEN_FDS` makes it trust fds it doesn't
+/// have
 #[test]
-fn inherited_listen_fds_leaks_without_ports() {
+fn inherited_listen_fds_stripped_without_ports() {
     let (scinit, events) = Scinit::builder()
         .env("LISTEN_FDS", "7")
+        .env("LISTEN_PID", "1")
+        .env("LISTEN_FDNAMES", "stale")
         .spawn_dump(&["--then-exit"]);
-    assert_eq!(
-        env_value(&events, "LISTEN_FDS").as_deref(),
-        Some("7"),
-        "{}",
-        scinit.diagnostics()
-    );
+    for key in ["LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES"] {
+        assert_eq!(env_value(&events, key), None, "{}: {}", key, scinit.diagnostics());
+    }
 }
 
 /// Without `--ports`, scinit sets no `LISTEN_*` variables
