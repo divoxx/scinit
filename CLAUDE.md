@@ -70,12 +70,12 @@ cargo run -- --live-reload --debounce-ms 1000 --restart-delay-ms 500 my-app
 ### Signal Flow Architecture
 
 The signal handling follows proper init system semantics:
-1. **Signal Blocking**: Only specific signals are blocked for synchronous handling (SIGTERM, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2, SIGHUP, SIGCHLD)
-2. **Signal Detection**: Uses `sigtimedwait()` for synchronous signal handling (proper for init systems)
+1. **Signal Blocking**: `SignalHandler::install()` blocks SIGTERM, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2 and SIGHUP on the main thread before the tokio runtime starts, so every thread inherits the mask
+2. **Signal Detection**: One dedicated `scinit-sigwait` thread loops on `sigwait()` and forwards signals over a channel to the main loop's `select!` (cancel-safe, so no signal is lost while the loop is busy)
 3. **Signal Categories**:
    - **Termination signals** (SIGTERM, SIGINT, SIGQUIT): Forward to child, then graceful shutdown
    - **Forwarding signals** (SIGUSR1, SIGUSR2, SIGHUP): Forward to child process group only
-   - **Child signals** (SIGCHLD): Handled by init for zombie reaping
+   - **Child signals** (SIGCHLD): Never blocked. tokio's SIGCHLD handler drives `Child::wait()`; the main loop observes SIGCHLD through a tokio signal stream to reap orphans. The reaper skips the managed child (`MANAGED_CHILD`) so tokio gets its exit status
    - **Critical signals** (SIGFPE, SIGILL, SIGSEGV, etc.): Never blocked, cause immediate termination
 4. **Signal Forwarding**: Sent to entire process group using negative PID
 
@@ -118,7 +118,7 @@ The `listen` fixture mode verifies socket inheritance end to end:
 - Never allow crash-based restarts in container environments
 - Always use process groups for proper signal forwarding
 - File descriptors must have FD_CLOEXEC cleared for inheritance
-- **Signal masking**: Only block signals that init should handle synchronously, never block critical/synchronous signals
-- **Signal handling**: Use `sigtimedwait()` for proper init system signal semantics, not async signal handlers
+- **Signal masking**: Block handled signals on the main thread before any other thread exists; never block critical/synchronous signals or SIGCHLD
+- **Signal handling**: Consume handled signals only on the dedicated sigwait thread; never call `sigwait` from per-iteration tasks (cancelled waits leave threads that swallow signals)
 - Zombie reaping runs in background tasks to avoid blocking main loop
 - Terminal signals (SIGTTIN, SIGTTOU) are ignored to prevent blocking in containers

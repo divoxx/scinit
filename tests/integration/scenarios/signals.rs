@@ -58,30 +58,17 @@ fn assert_repeated_delivery(scinit: &mut Scinit, pid: i32, sig: Signal, count: u
     scinit.assert_running_for(Duration::from_millis(300));
 }
 
-// Every test that signals scinit is blocked first by main-thread-unmasked:
-// the signal lands on scinit's unmasked main thread and kills scinit via the
-// default action (e.g. exit 158 for USR1, 143 for TERM), orphaning the child,
-// which never sees the signal.
-//
-// Behind it is sigwait-thread-leak: with the main thread masked (verified on
-// a patched copy), the zombie-reap tick that fires immediately at startup
-// cancels the first select! iteration and leaves a stale sigwait thread that
-// swallows the first signal sent.
-
 #[test]
-#[ignore = "bug: main-thread-unmasked (KNOWN-ISSUES.md)"]
 fn usr1_forwarded_to_child() {
     assert_forwarded_twice(Signal::SIGUSR1);
 }
 
 #[test]
-#[ignore = "bug: main-thread-unmasked (KNOWN-ISSUES.md)"]
 fn usr2_forwarded_to_child() {
     assert_forwarded_twice(Signal::SIGUSR2);
 }
 
 #[test]
-#[ignore = "bug: main-thread-unmasked (KNOWN-ISSUES.md)"]
 fn hup_forwarded_to_child() {
     assert_forwarded_twice(Signal::SIGHUP);
 }
@@ -89,7 +76,6 @@ fn hup_forwarded_to_child() {
 /// Forwarding targets the whole process group, so a grandchild in the
 /// child's group receives the signal too
 #[test]
-#[ignore = "bug: main-thread-unmasked (KNOWN-ISSUES.md)"]
 fn usr1_forwarded_to_grandchild_in_group() {
     let (mut scinit, pid) = start_run(&[], &["--grandchild"]);
     let grandchild = scinit
@@ -118,7 +104,6 @@ fn usr1_forwarded_to_grandchild_in_group() {
 /// Signals keep being delivered after the default 5s zombie-reap tick has
 /// fired (the tick cancels the pending sigwait branch of select!)
 #[test]
-#[ignore = "bug: main-thread-unmasked (KNOWN-ISSUES.md)"]
 fn repeated_usr1_after_reap_tick() {
     let (mut scinit, pid) = start_run(&[], &[]);
     std::thread::sleep(Duration::from_millis(5500));
@@ -128,7 +113,6 @@ fn repeated_usr1_after_reap_tick() {
 /// A short reap interval cancels the sigwait branch many times over; every
 /// signal must still arrive
 #[test]
-#[ignore = "bug: main-thread-unmasked (KNOWN-ISSUES.md)"]
 fn repeated_usr1_with_short_reap_interval() {
     let (mut scinit, pid) = start_run(&["--zombie-reap-interval-ms", "200"], &[]);
     std::thread::sleep(Duration::from_millis(1500));
@@ -138,11 +122,13 @@ fn repeated_usr1_with_short_reap_interval() {
 /// With live-reload on, the main loop also polls file events; signals must
 /// still be delivered after the reap tick
 #[test]
-#[ignore = "bug: main-thread-unmasked (KNOWN-ISSUES.md)"]
 fn repeated_usr1_with_live_reload() {
     let builder = Scinit::builder();
     let watched = builder.dir().join("watched.txt");
     std::fs::write(&watched, "v1").unwrap();
+    // FSEvents can report a write made just before the watcher starts as a
+    // change, causing a spurious restart; let it age first
+    std::thread::sleep(Duration::from_secs(1));
     let mut scinit = builder
         .args(["--live-reload", "--watch-path"])
         .args([&watched])
@@ -162,11 +148,9 @@ fn repeated_usr1_with_live_reload() {
 
 /// SIGTERM is forwarded; the child exits and scinit follows promptly.
 ///
-/// With the first two bugs patched out, this still took ~4-5s: once SIGCHLD
-/// is blocked on every thread, tokio's `child.wait()` inside
-/// `graceful_shutdown` is not woken when the child exits (see report).
+/// Guards against tokio's `child.wait()` not being woken on child exit
+/// (it relies on tokio's SIGCHLD handler, so scinit must not consume SIGCHLD).
 #[test]
-#[ignore = "bug: main-thread-unmasked (KNOWN-ISSUES.md)"]
 fn sigterm_forwarded_then_scinit_exits() {
     let (mut scinit, pid) = start_run(&[], &[]);
     let start = Instant::now();
@@ -188,7 +172,6 @@ fn sigterm_forwarded_then_scinit_exits() {
 
 /// A child that ignores SIGTERM is SIGKILLed after --graceful-timeout-secs
 #[test]
-#[ignore = "bug: main-thread-unmasked (KNOWN-ISSUES.md)"]
 fn sigterm_escalates_to_sigkill() {
     let (mut scinit, pid) = start_run(&["--graceful-timeout-secs", "1"], &["--ignore", "TERM"]);
     let start = Instant::now();
@@ -218,13 +201,11 @@ fn assert_termination_forwarded(sig: Signal) {
 }
 
 #[test]
-#[ignore = "bug: main-thread-unmasked (KNOWN-ISSUES.md)"]
 fn sigint_forwarded_then_scinit_exits() {
     assert_termination_forwarded(Signal::SIGINT);
 }
 
 #[test]
-#[ignore = "bug: main-thread-unmasked (KNOWN-ISSUES.md)"]
 fn sigquit_forwarded_then_scinit_exits() {
     assert_termination_forwarded(Signal::SIGQUIT);
 }
@@ -245,17 +226,15 @@ fn assert_prompt_exit(sig: Signal) {
     );
 }
 
-// Blocked by main-thread-unmasked and sigwait-thread-leak, then by
-// sigint-fixed-delay, the bug these target (verified on a patched copy:
-// scinit exits ~2.1s after the child)
+// scinit currently waits a fixed 2s after SIGINT/SIGQUIT (measured ~2.1s)
 #[test]
-#[ignore = "bug: main-thread-unmasked (KNOWN-ISSUES.md)"]
+#[ignore = "bug: sigint-fixed-delay (KNOWN-ISSUES.md)"]
 fn sigint_exits_promptly_when_child_exits() {
     assert_prompt_exit(Signal::SIGINT);
 }
 
 #[test]
-#[ignore = "bug: main-thread-unmasked (KNOWN-ISSUES.md)"]
+#[ignore = "bug: sigint-fixed-delay (KNOWN-ISSUES.md)"]
 fn sigquit_exits_promptly_when_child_exits() {
     assert_prompt_exit(Signal::SIGQUIT);
 }

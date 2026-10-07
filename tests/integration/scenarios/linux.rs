@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 /// Signals scinit claims to handle synchronously (src/signals.rs)
+/// Signals scinit consumes on its sigwait thread. SIGCHLD is deliberately
+/// not among them: tokio's SIGCHLD handler drives `Child::wait()`.
 const HANDLED: &[Signal] = &[
     Signal::SIGTERM,
     Signal::SIGINT,
@@ -25,7 +27,6 @@ const HANDLED: &[Signal] = &[
     Signal::SIGUSR1,
     Signal::SIGUSR2,
     Signal::SIGHUP,
-    Signal::SIGCHLD,
 ];
 
 /// Read a hex signal-set field (`SigBlk`, `SigIgn`, ...) from a status file
@@ -63,10 +64,12 @@ fn child_sigblk_is_empty() {
 }
 
 /// Every scinit thread, including the main thread, must block the signals it
-/// handles; otherwise they are delivered to the unmasked main thread and take
-/// their default action (or vanish when scinit is PID 1)
+/// handles; otherwise they are delivered to an unmasked thread and take their
+/// default action (or vanish when scinit is PID 1).
+///
+/// The sigwait thread is exempt: while a thread sits in `sigwait`, Linux
+/// temporarily unblocks the awaited signals in its `SigBlk`.
 #[test]
-#[ignore = "bug: main-thread-unmasked (KNOWN-ISSUES.md)"]
 fn all_scinit_threads_block_handled_signals() {
     let scinit = Scinit::builder().child(["run"]).spawn().unwrap();
     scinit.child_pid().unwrap();
@@ -75,6 +78,10 @@ fn all_scinit_threads_block_handled_signals() {
     let mut unmasked = Vec::new();
     for entry in std::fs::read_dir(&tasks).unwrap() {
         let task = entry.unwrap().path();
+        let comm = std::fs::read_to_string(task.join("comm")).unwrap_or_default();
+        if comm.trim() == "scinit-sigwait" {
+            continue;
+        }
         let blocked = sigset_field(&task.join("status"), "SigBlk");
         let missing: Vec<&str> = HANDLED
             .iter()
@@ -82,7 +89,6 @@ fn all_scinit_threads_block_handled_signals() {
             .map(|s| s.as_str())
             .collect();
         if !missing.is_empty() {
-            let comm = std::fs::read_to_string(task.join("comm")).unwrap_or_default();
             unmasked.push(format!(
                 "tid {} ({}) SigBlk={:016x} missing {:?}",
                 task.file_name().unwrap().to_string_lossy(),
@@ -302,7 +308,6 @@ fn orphan_verdict(mut scinit: Pid1Scinit) {
 /// An orphan reparented to scinit (PID 1) is reaped promptly on SIGCHLD, well
 /// before the default 5s periodic reaper would get to it
 #[test]
-#[ignore = "bug: main-thread-unmasked (KNOWN-ISSUES.md)"]
 fn orphan_reaped_on_sigchld_as_pid1() {
     let Some(flags) = pid_namespace_flags() else {
         return;
@@ -327,7 +332,6 @@ fn orphan_reaped_by_periodic_reaper_as_pid1() {
 /// The kernel drops default-action signals aimed at a namespace init unless
 /// they are blocked or handled, so an unmasked main thread loses them.
 #[test]
-#[ignore = "bug: main-thread-unmasked (KNOWN-ISSUES.md)"]
 fn sigterm_forwarded_as_pid1() {
     let Some(flags) = pid_namespace_flags() else {
         return;

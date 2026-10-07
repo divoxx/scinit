@@ -4,7 +4,9 @@ use crate::process_manager::ProcessManager;
 pub use nix::sys::signal::Signal;
 
 use nix::sys::signal::{pthread_sigmask, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow};
+use eyre::eyre;
 use std::time::Duration;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tracing::{debug, error, info, warn};
 
 /// Converts signal number to human-readable name
@@ -24,32 +26,36 @@ pub fn signal_name(signal: i32) -> &'static str {
 
 /// Signal handler for the init system with proper init semantics.
 ///
-/// This handler uses platform-appropriate signal handling that maintains
-/// proper init system semantics: synchronous, deterministic signal processing
-/// with guaranteed delivery order.
+/// Handled signals are blocked on every thread and consumed by one dedicated
+/// `sigwait` thread, which forwards them over a channel. Signals that arrive
+/// while the main loop is busy (e.g. during a restart) queue in the channel
+/// instead of being lost.
+///
+/// SIGCHLD is deliberately not handled here: tokio's own SIGCHLD handler
+/// drives `Child::wait()`, so the main loop observes it through a tokio
+/// signal stream instead.
 #[derive(Debug)]
 pub(super) struct SignalHandler {
-    /// Set of signals we handle (blocked for synchronous handling)
+    /// Signals consumed by the sigwait thread (blocked on every thread)
     handled_signals: SigSet,
+    receiver: UnboundedReceiver<Signal>,
 }
 
 impl SignalHandler {
-    /// Creates a new signal handler with proper init system signal handling.
+    /// Blocks the handled signals and starts the sigwait thread.
     ///
-    /// This function:
-    /// - Blocks signals that should be handled synchronously by init
-    /// - Leaves critical signals (SIGFPE, SIGILL, etc.) unblocked
-    /// - Uses platform-appropriate synchronous signal handling
-    /// - Maintains proper init system semantics across platforms
-    pub fn new() -> Self {
-        // Create signal set with the signals we want to handle
-        let mut handled_signals = SigSet::empty();
-
+    /// Must be called on the main thread before any other thread exists
+    /// (in particular before the tokio runtime is built): threads inherit the
+    /// signal mask, so this leaves no thread on which a handled signal could
+    /// take its default action and kill scinit.
+    ///
+    /// Critical synchronous signals (SIGFPE, SIGILL, SIGSEGV, ...) are never
+    /// blocked.
+    pub fn install() -> Result<Self> {
         // Signals that init should handle synchronously:
         // - SIGTERM, SIGINT, SIGQUIT: Termination signals for graceful shutdown
         // - SIGUSR1, SIGUSR2: User-defined signals to forward
         // - SIGHUP: Hangup signal to forward
-        // - SIGCHLD: Child status changes (always handled by init)
         let signals_to_handle = [
             Signal::SIGTERM,
             Signal::SIGINT,
@@ -57,31 +63,14 @@ impl SignalHandler {
             Signal::SIGUSR1,
             Signal::SIGUSR2,
             Signal::SIGHUP,
-            Signal::SIGCHLD,
         ];
 
-        // Add signals to the set
+        let mut handled_signals = SigSet::empty();
         for &sig in &signals_to_handle {
             handled_signals.add(sig);
         }
 
-        SignalHandler { handled_signals }
-    }
-
-    /// Sets up signal masking for the current thread.
-    ///
-    /// This must be called on each thread that should handle signals synchronously.
-    /// Uses pthread_sigmask to block handled signals on the current thread only.
-    pub fn setup_thread_signals(&self) -> Result<()> {
-        let thread = std::thread::current();
-
-        // Block these signals for synchronous handling
-        pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&self.handled_signals), None)?;
-        debug!(
-            "Successfully blocked signals for thread {} {:?}",
-            thread.name().unwrap(),
-            thread.id(),
-        );
+        pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&handled_signals), None)?;
 
         // Ignore SIGTTIN and SIGTTOU to prevent blocking on terminal operations
         // This is critical for init systems running in containers
@@ -91,29 +80,42 @@ impl SignalHandler {
             nix::sys::signal::sigaction(Signal::SIGTTOU, &ignore_action)?;
         }
 
-        Ok(())
+        let (sender, receiver) = unbounded_channel();
+        std::thread::Builder::new()
+            .name("scinit-sigwait".into())
+            .spawn(move || loop {
+                match handled_signals.wait() {
+                    Ok(signal) => {
+                        debug!("Received signal: {:?} (init semantics)", signal);
+                        if sender.send(signal).is_err() {
+                            // Main loop is gone; nothing left to deliver to
+                            break;
+                        }
+                    }
+                    Err(e) => error!("sigwait failed: {}", e),
+                }
+            })?;
+
+        Ok(SignalHandler {
+            handled_signals,
+            receiver,
+        })
     }
 
-    /// Waits for a signal using proper init system semantics.
-    ///
-    /// This function provides synchronous, deterministic signal handling that
-    /// maintains init system guarantees for signal ordering and delivery.
-    /// Blocks until a signal is received.
-    pub async fn wait_for_signal(&self) -> Result<Signal> {
-        // Use spawn_blocking to maintain init semantics while being async-compatible
-        let signals = self.handled_signals;
+    /// The signals consumed by the sigwait thread
+    pub fn handled_signals(&self) -> SigSet {
+        self.handled_signals
+    }
 
-        tokio::task::spawn_blocking(move || -> Result<Signal> {
-            // Use sigwait for synchronous signal waiting
-            match signals.wait() {
-                Ok(signal) => {
-                    debug!("Received signal: {:?} (init semantics)", signal);
-                    Ok(signal)
-                }
-                Err(e) => Err(e.into()),
-            }
-        })
-        .await?
+    /// Waits for the next handled signal.
+    ///
+    /// Cancel-safe: dropping the future (e.g. when another `select!` branch
+    /// wins) never loses a signal.
+    pub async fn wait_for_signal(&mut self) -> Result<Signal> {
+        self.receiver
+            .recv()
+            .await
+            .ok_or_else(|| eyre!("signal thread exited"))
     }
 }
 
@@ -126,11 +128,6 @@ impl SignalHandler {
         graceful_timeout_secs: u64,
     ) -> Result<SignalAction> {
         match signal {
-            Signal::SIGCHLD => {
-                // Reap zombie processes asynchronously - this is always handled by init
-                debug!("received SIGCHLD, reaping zombie processes");
-                Ok(SignalAction::ReapZombies)
-            }
             Signal::SIGTERM | Signal::SIGINT | Signal::SIGQUIT => {
                 // Scenario B: Signal forwarding with graceful shutdown and timeout
                 info!(
@@ -220,8 +217,6 @@ impl SignalHandler {
 pub enum SignalAction {
     /// Continue normal operation
     Continue,
-    /// Reap zombie processes
-    ReapZombies,
     /// Exit the init system
     Exit,
 }

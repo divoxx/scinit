@@ -401,21 +401,44 @@ fn is_child_started(e: &Event) -> bool {
 
 impl Drop for Scinit {
     fn drop(&mut self) {
-        // Children run in their own process groups (pgid == pid), so kill each
-        // group explicitly; killing scinit alone would orphan them
-        for e in self.events() {
-            if e.name == "started" {
-                if let Some(pgid) = e.get("pgid").and_then(|p| p.parse::<i32>().ok()) {
-                    let _ = kill(Pid::from_raw(-pgid), Signal::SIGKILL);
-                }
-                let _ = kill(Pid::from_raw(e.pid()), Signal::SIGKILL);
-            }
+        // Children run in their own process groups (pgid == pid), so killing
+        // scinit alone would orphan them. Freeze scinit first so it can't fork
+        // a replacement (e.g. a live-reload restart in flight), then kill the
+        // group of every live child, including ones that haven't reported yet.
+        let running = self.is_running();
+        if running {
+            let _ = kill(self.pid, Signal::SIGSTOP);
         }
-        if self.is_running() {
+        let mut groups: Vec<i32> = if running { child_pids(self.pid) } else { Vec::new() };
+        groups.extend(
+            self.events()
+                .iter()
+                .filter(|e| e.name == "started")
+                .filter_map(|e| e.get("pgid").and_then(|p| p.parse::<i32>().ok())),
+        );
+        for pgid in groups {
+            let _ = kill(Pid::from_raw(-pgid), Signal::SIGKILL);
+            let _ = kill(Pid::from_raw(pgid), Signal::SIGKILL);
+        }
+        if running {
             let _ = kill(Pid::from_raw(-self.pid.as_raw()), Signal::SIGKILL);
             let _ = self.child.wait();
         }
     }
+}
+
+/// Direct children of `pid`, via `pgrep -P` (works on macOS and Linux)
+fn child_pids(pid: Pid) -> Vec<i32> {
+    Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output()
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Assert scinit exited with the given code
@@ -485,14 +508,12 @@ pub fn wait_for_pid_gone(pid: i32, timeout: Duration) -> bool {
     }
 }
 
-/// Connect, send a line, and return the trimmed response
+/// Connect and return the trimmed reply line
 pub fn request(addr: &str) -> Result<String> {
-    use std::io::Write;
     use std::net::TcpStream;
     let addr = addr.parse().context("bad socket address")?;
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.write_all(b"ping\n")?;
     let mut out = String::new();
     stream.read_to_string(&mut out)?;
     Ok(out.trim().to_string())

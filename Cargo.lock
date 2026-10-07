@@ -760,7 +760,6 @@ dependencies = [
  "libc",
  "nix",
  "notify",
- "once_cell",
  "socket2 0.6.0",
  "tempfile",
  "tokio",

@@ -18,7 +18,7 @@
 use nix::sys::signal::{self, SigHandler, SigSet, Signal};
 use nix::unistd::{self, ForkResult, Pid};
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpListener;
 use std::os::fd::FromRawFd;
 use std::str::FromStr;
@@ -312,9 +312,8 @@ fn cmd_listen() -> ! {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-                let mut buf = [0u8; 256];
-                let _ = stream.read(&mut buf);
+                // Reply without reading: closing with unread input would
+                // reset the connection before the client reads the reply
                 let _ = writeln!(stream, "pid={} fd={} port={}", pid, fd, port);
             }
         });

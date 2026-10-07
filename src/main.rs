@@ -8,10 +8,10 @@ mod process_manager;
 mod signals;
 
 use clap::Parser;
-use once_cell::sync::OnceCell;
 use environment::Environment;
 use std::time::Duration;
 use tokio::select;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::interval;
 use tracing::{debug, error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -25,8 +25,6 @@ use process_manager::{
 };
 use signals::{SignalAction, SignalHandler};
 
-static SIGNAL_HANDLER: OnceCell<SignalHandler> = OnceCell::new();
-
 fn main() -> Result<()> {
     // Initialize error handling and logging
     color_eyre::install()?;
@@ -38,22 +36,16 @@ fn main() -> Result<()> {
 
     info!("scinit starting");
 
-    let signal_handler = SignalHandler::new();
-    SIGNAL_HANDLER.set(signal_handler).unwrap();
+    // Before any other thread exists, so every thread inherits the mask
+    let mut signal_handler = SignalHandler::install()?;
+    debug!("blocked signals {:?} on all threads", signal_handler.handled_signals());
 
     debug!("starting tokio runtime");
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .on_thread_start(|| {
-            SIGNAL_HANDLER
-                .get()
-                .unwrap()
-                .setup_thread_signals()
-                .unwrap()
-        })
         .build()?;
 
-    let result = rt.block_on(app_main(SIGNAL_HANDLER.get().unwrap()));
+    let result = rt.block_on(app_main(&mut signal_handler));
     // Shut down with a timeout on every path: blocking tasks parked in
     // sigwait never finish, so dropping the runtime would block forever
     rt.shutdown_timeout(Duration::from_millis(100));
@@ -61,7 +53,7 @@ fn main() -> Result<()> {
     result
 }
 
-async fn app_main(signal_handler: &SignalHandler) -> Result<()> {
+async fn app_main(signal_handler: &mut SignalHandler) -> Result<()> {
     // Parse CLI arguments
     let cli = Cli::parse();
 
@@ -106,10 +98,12 @@ async fn app_main(signal_handler: &SignalHandler) -> Result<()> {
 async fn run_main_loop(
     config: Config,
     process_manager: &mut ProcessManager,
-    signal_handler: &SignalHandler,
+    signal_handler: &mut SignalHandler,
     file_watcher: &mut Option<FileWatcher>,
 ) -> Result<()> {
     let mut zombie_reap_interval = interval(config.zombie_reap_interval);
+    // Shares tokio's SIGCHLD handler, which also drives `Child::wait()`
+    let mut sigchld = signal(SignalKind::child())?;
 
     info!(
         "init system started, managing subprocess: {}",
@@ -164,9 +158,14 @@ async fn run_main_loop(
             signal = signal_handler.wait_for_signal() => {
                 match signal_handler.process_signal(signal?, process_manager, config.live_reload.graceful_timeout_secs).await? {
                     SignalAction::Exit => return Ok(()),
-                    SignalAction::ReapZombies => reap_zombies_async().await,
                     SignalAction::Continue => {},
                 }
+            }
+
+            // Reap orphans as soon as they exit (matters when scinit is PID 1)
+            _ = sigchld.recv() => {
+                debug!("received SIGCHLD, reaping zombie processes");
+                reap_zombies_async().await;
             }
 
             // Periodic zombie reaping (less frequent, non-blocking)
