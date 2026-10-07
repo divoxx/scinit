@@ -3,7 +3,6 @@
 #
 #   scripts/test-linux.sh                       # all tests
 #   scripts/test-linux.sh --test integration_test linux::
-#   scripts/test-linux.sh -- --ignored          # known-bug tests
 #
 # Arguments are passed through to `cargo test`. Builds the test image
 # (tests/container/Containerfile) first; the crate registry and target dir live

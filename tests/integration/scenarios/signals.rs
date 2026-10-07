@@ -142,8 +142,8 @@ fn sigterm_forwarded_then_scinit_exits() {
 }
 
 /// A child that ignores the termination signal is SIGKILLed once
-/// --graceful-timeout-secs expires, not before. The 3s timeout is longer than
-/// the fixed 2s SIGINT/SIGQUIT delay scinit used to apply.
+/// --graceful-timeout-secs expires, not before. The 3s timeout is long enough
+/// that escalating after any shorter fixed delay fails the timing check.
 fn assert_escalates_to_sigkill(sig: Signal) {
     let (mut scinit, pid) = Scinit::builder()
         .args(["--graceful-timeout-secs", "3"])
@@ -218,7 +218,7 @@ fn assert_prompt_exit(sig: Signal) {
     );
 }
 
-// scinit must not linger once the child has exited (it used to wait a fixed 2s)
+// scinit must not linger once the child has exited
 #[test]
 fn sigint_exits_promptly_when_child_exits() {
     assert_prompt_exit(Signal::SIGINT);

@@ -160,10 +160,8 @@ fn ipv6_bind_addr() {
 /// Without `--ports`, a `LISTEN_FDS` already in scinit's environment reaches
 /// the child unchanged.
 ///
-/// CURRENT behaviour, asserted so a change is noticed. Phase 2 may decide to
-/// strip inherited `LISTEN_*` vars when scinit passes no sockets (a stale
-/// `LISTEN_FDS` makes the child trust fds it doesn't have); if so, flip this
-/// to assert `None` and rename it `inherited_listen_fds_stripped_without_ports`.
+/// Asserted so a change is noticed: a stale `LISTEN_FDS` makes the child
+/// trust fds it doesn't have.
 #[test]
 fn inherited_listen_fds_leaks_without_ports() {
     let (scinit, events) = Scinit::builder()

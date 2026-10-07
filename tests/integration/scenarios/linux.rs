@@ -18,9 +18,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
 
-/// Signals scinit claims to handle synchronously (src/signals.rs)
-/// Signals scinit consumes on its sigwait thread. SIGCHLD is deliberately
-/// not among them: tokio's SIGCHLD handler drives `Child::wait()`.
+/// Signals scinit consumes on its sigwait thread (src/signals.rs). SIGCHLD is
+/// deliberately not among them: tokio's SIGCHLD handler drives
+/// `Child::wait()`. The same list as the fixture's `DEFAULT_TRAP`
+/// (tests/fixtures/test_child.rs); keep them in sync.
 const HANDLED: &[Signal] = &[
     Signal::SIGTERM,
     Signal::SIGINT,

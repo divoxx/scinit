@@ -51,10 +51,9 @@ pub struct Event {
 
 impl Event {
     pub(crate) fn parse(line: &str) -> Option<Self> {
-        let mut rest = line.trim_end();
-        let (name, tail) = rest.split_once(' ').unwrap_or((rest, ""));
+        let line = line.trim_end();
+        let (name, mut rest) = line.split_once(' ').unwrap_or((line, ""));
         let name = name.to_string();
-        rest = tail;
         let mut fields = Vec::new();
         while !rest.is_empty() {
             // `value=` always runs to the end of the line

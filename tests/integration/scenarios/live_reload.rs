@@ -1,23 +1,27 @@
 //! Live-reload: file changes restart the child; nothing else does.
 //!
-//! Watching is non-recursive on a single `--watch-path` (file or directory),
-//! only modifications of existing regular files count, and debouncing is
-//! leading-edge. A restart is SIGTERM to the child's group, a
-//! `--restart-delay-ms` pause, then a fresh spawn (ports are rebound).
+//! Watching is non-recursive on a single `--watch-path` (file or directory).
+//! Only content changes and renames of regular files count, not
+//! metadata-only changes. Debouncing is trailing-edge: the restart fires once
+//! changes have been quiet for `--debounce-ms`. A restart is SIGTERM to the
+//! child's group, a `--restart-delay-ms` pause, then a fresh spawn that gets
+//! the same listening sockets.
 //!
 //! macOS FSEvents has delivery latency and can hand the watcher events from
 //! just before it started, so every test waits for the child to start and
 //! then settles briefly before touching the filesystem.
 //!
-//! Most tests pass `--zombie-reap-interval-ms 100`: scinit only drains file
-//! events when its main `select!` wakes up, which in practice is the reap
-//! timer (see `restart_is_prompt_with_default_reap_interval`).
+//! Most tests pass `--zombie-reap-interval-ms 100`;
+//! `restart_is_prompt_with_default_reap_interval` covers the default.
 
 use crate::integration::harness::{
     free_port, let_setup_writes_age, loopback, request, Scinit, ScinitBuilder, TEST_CHILD, TIMEOUT,
 };
 use nix::sys::signal::Signal;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Time to let FSEvents settle after the child starts, before touching files
@@ -215,7 +219,7 @@ fn writes_outside_debounce_window_each_restart() {
 
 /// Creating a new (empty) file in the watched directory is not a modification.
 /// On macOS creation also emits `Modify(Metadata(Extended))` (xattrs), which
-/// `is_relevant_change` accepts like a content change.
+/// `is_relevant_change` ignores as metadata-only.
 #[test]
 fn creating_file_does_not_restart() {
     let b = Scinit::builder();
@@ -285,10 +289,8 @@ fn child_crash_is_not_restarted() {
     scinit.assert_exit_code(status, 139);
 }
 
-/// scinit still exits (without restarting) when its zombie reaper wins the
-/// race for the child's exit status. Today tokio's `child.wait()` then fails
-/// with ECHILD, `app_main` errors, and dropping the runtime blocks forever on
-/// the leaked sigwait threads, so scinit hangs.
+/// scinit exits without restarting even with a zombie reaper tight enough to
+/// race tokio's `child.wait()` for the child's exit status
 #[test]
 fn child_exit_with_fast_reaper_is_not_restarted_and_exits() {
     // The race is timing-dependent; a few attempts with a tight reap timer
@@ -305,14 +307,24 @@ fn child_exit_with_fast_reaper_is_not_restarted_and_exits() {
     }
 }
 
+/// Keep connecting to `addr` until `stop` is set and return every result.
+/// Each connection runs on its own thread so connections queued in the
+/// backlog overlap.
+fn hammer(addr: &str, stop: &AtomicBool) -> Vec<Result<String, String>> {
+    let mut attempts = Vec::new();
+    while !stop.load(Ordering::SeqCst) {
+        let addr = addr.to_string();
+        attempts.push(std::thread::spawn(move || request(&addr).map_err(|e| e.to_string())));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    attempts.into_iter().map(|t| t.join().unwrap()).collect()
+}
+
 /// No connection is refused or reset across a restart. Connections that
 /// arrive while no child is running must wait in the listener's backlog and
 /// be served by the new child, which requires passing it the same socket.
 #[test]
 fn restart_drops_no_connections() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-
     let port = free_port();
     let addr = loopback(port);
     let b = Scinit::builder();
@@ -328,21 +340,11 @@ fn restart_drops_no_connections() {
     scinit.wait_for_event("ready", TIMEOUT).unwrap();
     std::thread::sleep(SETTLE);
 
-    // Keep connecting throughout the restart; each one runs on its own
-    // thread so connections queued in the backlog overlap
+    // Keep connecting throughout the restart
     let stop = Arc::new(AtomicBool::new(false));
     let client = {
         let stop = stop.clone();
-        let addr = addr.clone();
-        std::thread::spawn(move || {
-            let mut attempts = Vec::new();
-            while !stop.load(Ordering::SeqCst) {
-                let addr = addr.clone();
-                attempts.push(std::thread::spawn(move || request(&addr).map_err(|e| e.to_string())));
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            attempts.into_iter().map(|t| t.join().unwrap()).collect::<Vec<_>>()
-        })
+        std::thread::spawn(move || hammer(&addr, &stop))
     };
 
     modify(&file, "v2");
@@ -453,18 +455,10 @@ fn default_watch_path_is_absolute_command() {
 /// Current behaviour: without `--watch-path`, a bare command name (resolved via
 /// PATH for spawning) is used verbatim as the watch path, relative to the cwd.
 /// It does not exist there, so scinit fails at startup with exit 1 before
-/// spawning anything. Phase 2 may resolve it via PATH or reject it clearly.
+/// spawning anything.
 #[test]
 fn default_watch_path_bare_command_exits_1() {
-    let bin_dir = Path::new(TEST_CHILD).parent().unwrap();
-    let path = match std::env::var_os("PATH") {
-        Some(p) => {
-            let mut dirs = vec![bin_dir.to_path_buf()];
-            dirs.extend(std::env::split_paths(&p));
-            std::env::join_paths(dirs).unwrap()
-        }
-        None => bin_dir.as_os_str().to_owned(),
-    };
+    let path = path_with(Path::new(TEST_CHILD).parent().unwrap());
     let (scinit, status) = Scinit::builder()
         .env("PATH", path.to_str().unwrap())
         .args(["--live-reload"])
@@ -474,4 +468,16 @@ fn default_watch_path_bare_command_exits_1() {
 
     scinit.assert_exit_code(status, 1);
     scinit.assert_start_count(0, "a bare command can't be watched");
+}
+
+/// `$PATH` with `dir` prepended
+fn path_with(dir: &Path) -> OsString {
+    match std::env::var_os("PATH") {
+        Some(p) => {
+            let mut dirs = vec![dir.to_path_buf()];
+            dirs.extend(std::env::split_paths(&p));
+            std::env::join_paths(dirs).unwrap()
+        }
+        None => dir.as_os_str().to_owned(),
+    }
 }
