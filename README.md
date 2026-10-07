@@ -36,7 +36,7 @@ CMD ["my-server"]
 | Option | Default | Description |
 |---|---|---|
 | `--graceful-timeout-secs <N>` | `30` | How long to wait for the child to exit after a termination signal before sending SIGKILL |
-| `--zombie-reap-interval-ms <N>` | `5000` | Interval for the periodic zombie reaper (orphans are also reaped on SIGCHLD) |
+| `--zombie-reap-interval-ms <N>` | `5000` | Interval for the periodic zombie reaper (orphans are also reaped on SIGCHLD); must be at least 1 |
 | `--live-reload` | off | Restart the child when the watched path changes |
 | `--watch-path <PATH>` | the command as given | File or directory to watch (non-recursive) |
 | `--debounce-ms <N>` | `500` | Wait this long after the last change before restarting |

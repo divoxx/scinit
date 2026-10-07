@@ -62,6 +62,23 @@ fn invalid_bind_addr_exits_one() {
     );
 }
 
+/// A zero `--zombie-reap-interval-ms` is a usage error (exit 2), not a panic, and the child never starts
+#[test]
+fn zero_zombie_reap_interval_exits_two() {
+    let (scinit, status) = Scinit::builder()
+        .args(["--zombie-reap-interval-ms", "0"])
+        .child(["exit", "0"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 2);
+    scinit.assert_start_count(0, "child must not start with an invalid config");
+    assert!(
+        scinit.stderr().contains("--zombie-reap-interval-ms"),
+        "{}",
+        scinit.diagnostics()
+    );
+}
+
 /// Args after the command, including ones that look like scinit flags, reach the child verbatim
 #[test]
 fn trailing_and_hyphenated_args_reach_child() {

@@ -68,8 +68,6 @@ Smaller issues, not (yet) covered by `#[ignore]` tests:
   them, and anything parsing the child's stdout sees scinit's lines too.
   Other inits (e.g. tini) log to stderr. Use
   `fmt::layer().with_writer(std::io::stderr)`.
-- **`--zombie-reap-interval-ms 0` (probably) panics.** `tokio::time::interval`
-  panics on a zero period. Reject 0 during argument parsing.
 - **`--live-reload` without `--watch-path` watches the command string.** The
   default watch path is `PathBuf::from(command)` (`src/cli.rs`), which only
   works when the command is a path; `--live-reload my-app` watches `./my-app`
