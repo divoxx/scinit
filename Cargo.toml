@@ -2,6 +2,8 @@
 name = "scinit"
 version = "0.1.0"
 edition = "2021"
+description = "A small init system for containers: signal forwarding, zombie reaping, live reload and systemd-style socket activation"
+license = "Apache-2.0"
 
 [[bin]]
 name = "scinit"
