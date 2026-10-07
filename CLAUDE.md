@@ -53,11 +53,13 @@ cargo run -- --live-reload --debounce-ms 1000 --restart-delay-ms 500 my-app
 
 **scinit** is a lightweight async init system designed for container environments, built around several key modules:
 
-- **`main` / `run_main_loop`** (`src/main.rs`): Builds the tokio runtime and runs the event loop coordinating subprocess lifecycle, signal handling and file events
-- **`ProcessManager`** (`src/process_manager.rs`): Handles subprocess spawning, monitoring, graceful restarts, and signal forwarding with process group management
-- **`SignalHandler`** (`src/signals.rs`): Synchronous `sigwait`-based signal handling, with proper signal masking excluding critical signals (SIGFPE, SIGILL, SIGSEGV, etc.)
-- **`FileWatcher`** (`src/file_watcher.rs`): Live-reload functionality using the `notify` crate with debouncing to prevent excessive restarts
-- **`PortManager`** (`src/port_manager.rs`): Socket inheritance system for zero-downtime restarts, supporting SO_REUSEPORT and multiple ports
+- **`main` / `run_main_loop`** (`src/main.rs`): Builds the tokio runtime and runs the event loop; dispatches signals (`on_signal`) and file events (`on_file_event`) to the `ProcessManager`
+- **`ProcessManager`** (`src/process_manager.rs`): Spawns, monitors, restarts and stops the child, and forwards signals to its process group. The child's lifecycle is a `ChildState` enum (`NotStarted` / `Running(ManagedChild)` / `Exited { pid, status }`)
+- **`SignalHandler`** (`src/signals.rs`): Receives signals only: masks the handled signals on all threads and consumes them on a dedicated `sigwait` thread, never blocking critical signals (SIGFPE, SIGILL, SIGSEGV, etc.)
+- **`FileWatcher`** (`src/file_watcher.rs`): Live-reload file watching using the `notify` crate, with a trailing-edge debounce
+- **`reaper`** (`src/reaper.rs`): Zombie reaping, leaving the managed child to tokio's `Child::wait()`
+- **`exit_status`** (`src/exit_status.rs`): Maps the child's status to scinit's exit code (code, or 128 + signal)
+- **`PortManager`** (`src/port_manager.rs`): Socket inheritance system for zero-downtime restarts, binding each port once and keeping it for scinit's lifetime
 - **`SocketActivationExec`** (`src/socket_activation.rs`): Execs a child with sockets from a `pre_exec` hook, so it can move them to fds 3.. and set `LISTEN_PID` to the child's own pid
 
 ### Key Architecture Principles
@@ -76,7 +78,7 @@ The signal handling follows proper init system semantics:
 3. **Signal Categories**:
    - **Termination signals** (SIGTERM, SIGINT, SIGQUIT): Forward to child, then graceful shutdown
    - **Forwarding signals** (SIGUSR1, SIGUSR2, SIGHUP): Forward to child process group only
-   - **Child signals** (SIGCHLD): Never blocked. tokio's SIGCHLD handler drives `Child::wait()`; the main loop observes SIGCHLD through a tokio signal stream to reap orphans. The reaper skips the managed child (`MANAGED_CHILD`) so tokio gets its exit status
+   - **Child signals** (SIGCHLD): Never blocked. tokio's SIGCHLD handler drives `Child::wait()`; the main loop observes SIGCHLD through a tokio signal stream to reap orphans. The reaper skips the managed child (marked while a `ManagedChild` guard exists) so tokio gets its exit status
    - **Critical signals** (SIGFPE, SIGILL, SIGSEGV, etc.): Never blocked, cause immediate termination
 4. **Signal Forwarding**: Sent to entire process group using negative PID
 
