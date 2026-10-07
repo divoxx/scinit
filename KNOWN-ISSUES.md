@@ -45,11 +45,6 @@ Smaller issues, not (yet) covered by `#[ignore]` tests:
   binds nothing, so the child may treat unrelated fds 3.. as listeners. The
   `--ports` path already replaces them. Strip them when no ports are
   configured, and flip `inherited_listen_fds_leaks_without_ports`.
-- **The final zombie reap isn't awaited.** On child exit, `handle_child_exit`
-  (`src/exit_status.rs`) calls `spawn_zombie_reap()`, which starts a
-  `spawn_blocking` reap without waiting for it; scinit then shuts the runtime
-  down within 100ms and exits. Orphans that exited just before the child may
-  be left unreaped. Await the reap before returning the exit code.
 - **`signal_name` uses Linux signal numbers.** `src/exit_status.rs` hardcodes
   10/12/17 for USR1/USR2/CHLD, so on macOS a child killed by SIGUSR1 (30) is
   logged as `UNKNOWN`, and signals outside the table (e.g. SIGSEGV) are
