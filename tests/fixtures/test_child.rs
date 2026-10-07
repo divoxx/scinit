@@ -84,27 +84,42 @@ fn short_name(sig: Signal) -> &'static str {
 
 /// Block `trap` signals and handle them synchronously, logging each one.
 /// Exits with status 0 when a signal in `exit_on` arrives.
+///
+/// The other common signals (`DEFAULT_TRAP`) keep their default action. They
+/// are waited for too and re-raised with the default disposition, because on
+/// macOS a default-action signal doesn't terminate a process whose thread is
+/// parked in `sigwait` for other signals. Ignored signals are left alone.
 fn signal_loop(trap: &[Signal], exit_on: &[Signal]) -> ! {
     let mut set = SigSet::empty();
-    for sig in trap {
-        set.add(*sig);
+    for sig in trap.iter().chain(DEFAULT_TRAP) {
+        if !is_ignored(*sig) {
+            set.add(*sig);
+        }
     }
     set.thread_block().expect("failed to block signals");
 
-    if trap.is_empty() {
-        loop {
-            std::thread::sleep(Duration::from_secs(3600));
-        }
-    }
-
     loop {
         let sig = set.wait().expect("sigwait failed");
+        if !trap.contains(&sig) {
+            die_by(sig);
+        }
         report("signal", &format!("sig={}", short_name(sig)));
         if exit_on.contains(&sig) {
             report("exit", "code=0");
             std::process::exit(0);
         }
     }
+}
+
+/// Terminate via `sig`'s default action
+fn die_by(sig: Signal) -> ! {
+    unsafe { signal::signal(sig, SigHandler::SigDfl) }.expect("failed to reset handler");
+    let mut set = SigSet::empty();
+    set.add(sig);
+    let _ = set.thread_unblock();
+    signal::raise(sig).expect("raise failed");
+    // Not reached for terminating signals
+    std::process::exit(128 + sig as i32);
 }
 
 fn cmd_run(args: &[String]) -> ! {

@@ -47,14 +47,19 @@ fn sig_bit(sig: Signal) -> u64 {
 /// The child must start with an empty signal mask, as seen by the kernel
 #[test]
 fn child_sigblk_is_empty() {
-    // An empty --trap list makes the fixture sleep without blocking anything
-    let scinit = Scinit::builder()
-        .child(["run", "--trap", ""])
-        .spawn()
+    // grep reads its own status right after exec, with the mask scinit set
+    let (scinit, status) = Scinit::builder()
+        .command(["grep", "^SigBlk:", "/proc/self/status"])
+        .run(TIMEOUT)
         .unwrap();
-    let pid = scinit.child_pid().unwrap();
+    assert_exit_code(&scinit, status, 0);
 
-    let blocked = sigset_field(Path::new(&format!("/proc/{}/status", pid)), "SigBlk");
+    let stdout = scinit.stdout();
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("SigBlk:"))
+        .unwrap_or_else(|| panic!("no SigBlk line\n{}", scinit.diagnostics()));
+    let blocked = u64::from_str_radix(line["SigBlk:".len()..].trim(), 16).unwrap();
     assert_eq!(
         blocked, 0,
         "child SigBlk should be 0, got {:016x}\n{}",
