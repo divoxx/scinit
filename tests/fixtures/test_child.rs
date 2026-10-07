@@ -61,6 +61,28 @@ fn report_started(role: &str) {
     );
 }
 
+/// Report `exit` and exit with `code`
+fn exit_reported(code: i32) -> ! {
+    report("exit", &format!("code={}", code));
+    std::process::exit(code);
+}
+
+/// The value of the last `key=` field in the report file
+fn last_reported_field(key: &str) -> Option<String> {
+    let report = std::fs::read_to_string(std::env::var("SCINIT_TEST_REPORT").ok()?).ok()?;
+    let prefix = format!("{}=", key);
+    report
+        .lines()
+        .rev()
+        .find_map(|l| l.split_whitespace().find_map(|f| f.strip_prefix(&prefix)))
+        .map(str::to_string)
+}
+
+/// The argument following `flag`
+fn flag_value<'a>(it: &mut impl Iterator<Item = &'a String>, flag: &str) -> &'a str {
+    it.next().unwrap_or_else(|| panic!("{} needs a value", flag))
+}
+
 fn parse_signal(name: &str) -> Signal {
     let name = name.trim().to_uppercase();
     let full = if name.starts_with("SIG") {
@@ -82,22 +104,47 @@ fn short_name(sig: Signal) -> &'static str {
     sig.as_str().trim_start_matches("SIG")
 }
 
+fn sigset<'a>(sigs: impl IntoIterator<Item = &'a Signal>) -> SigSet {
+    let mut set = SigSet::empty();
+    for sig in sigs {
+        set.add(*sig);
+    }
+    set
+}
+
+fn set_disposition(sig: Signal, handler: SigHandler) {
+    unsafe { signal::signal(sig, handler) }
+        .unwrap_or_else(|e| panic!("failed to set the disposition of {}: {}", sig, e));
+}
+
+fn is_ignored(sig: Signal) -> bool {
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::sigaction(sig as libc::c_int, std::ptr::null(), &mut old) };
+    rc == 0 && old.sa_sigaction == libc::SIG_IGN
+}
+
 /// Block `trap` signals and handle them synchronously, logging each one.
 /// Exits with status 0 when a signal in `exit_on` arrives.
+fn signal_loop(trap: &[Signal], exit_on: &[Signal]) -> ! {
+    wait_signals(&block_signals(trap), trap, exit_on)
+}
+
+/// Block `trap` and the other common signals (`DEFAULT_TRAP`) for `sigwait`,
+/// returning the blocked set. Ignored signals are left alone.
 ///
-/// The other common signals (`DEFAULT_TRAP`) keep their default action. They
+/// The `DEFAULT_TRAP` signals outside `trap` keep their default action: they
 /// are waited for too and re-raised with the default disposition, because on
 /// macOS a default-action signal doesn't terminate a process whose thread is
-/// parked in `sigwait` for other signals. Ignored signals are left alone.
-fn signal_loop(trap: &[Signal], exit_on: &[Signal]) -> ! {
-    let mut set = SigSet::empty();
-    for sig in trap.iter().chain(DEFAULT_TRAP) {
-        if !is_ignored(*sig) {
-            set.add(*sig);
-        }
-    }
+/// parked in `sigwait` for other signals.
+fn block_signals(trap: &[Signal]) -> SigSet {
+    let set = sigset(trap.iter().chain(DEFAULT_TRAP).filter(|s| !is_ignored(**s)));
     set.thread_block().expect("failed to block signals");
+    set
+}
 
+/// Wait on `set` forever: log signals in `trap`, exiting 0 on one in
+/// `exit_on`, and die by the default action of any other
+fn wait_signals(set: &SigSet, trap: &[Signal], exit_on: &[Signal]) -> ! {
     loop {
         let sig = set.wait().expect("sigwait failed");
         if !trap.contains(&sig) {
@@ -105,19 +152,24 @@ fn signal_loop(trap: &[Signal], exit_on: &[Signal]) -> ! {
         }
         report("signal", &format!("sig={}", short_name(sig)));
         if exit_on.contains(&sig) {
-            report("exit", "code=0");
-            std::process::exit(0);
+            exit_reported(0);
         }
     }
 }
 
+/// Unblock `sig` and raise it with its default disposition
+fn raise_with_default(sig: Signal) {
+    // KILL and STOP can't have their disposition changed (EINVAL)
+    if !matches!(sig, Signal::SIGKILL | Signal::SIGSTOP) {
+        set_disposition(sig, SigHandler::SigDfl);
+    }
+    let _ = sigset(&[sig]).thread_unblock();
+    signal::raise(sig).expect("raise failed");
+}
+
 /// Terminate via `sig`'s default action
 fn die_by(sig: Signal) -> ! {
-    unsafe { signal::signal(sig, SigHandler::SigDfl) }.expect("failed to reset handler");
-    let mut set = SigSet::empty();
-    set.add(sig);
-    let _ = set.thread_unblock();
-    signal::raise(sig).expect("raise failed");
+    raise_with_default(sig);
     // Not reached for terminating signals
     std::process::exit(128 + sig as i32);
 }
@@ -131,16 +183,16 @@ fn cmd_run(args: &[String]) -> ! {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--trap" => trap = parse_signals(it.next().expect("--trap needs a value")),
-            "--exit-on" => exit_on = parse_signals(it.next().expect("--exit-on needs a value")),
-            "--ignore" => ignore = parse_signals(it.next().expect("--ignore needs a value")),
+            "--trap" => trap = parse_signals(flag_value(&mut it, "--trap")),
+            "--exit-on" => exit_on = parse_signals(flag_value(&mut it, "--exit-on")),
+            "--ignore" => ignore = parse_signals(flag_value(&mut it, "--ignore")),
             "--grandchild" => grandchild = true,
             other => panic!("unknown run option: {}", other),
         }
     }
 
     for sig in &ignore {
-        unsafe { signal::signal(*sig, SigHandler::SigIgn) }.expect("failed to ignore signal");
+        set_disposition(*sig, SigHandler::SigIgn);
     }
     trap.retain(|s| !ignore.contains(s));
     exit_on.retain(|s| !ignore.contains(s));
@@ -165,42 +217,65 @@ fn cmd_exit(args: &[String]) -> ! {
         .parse()
         .expect("exit code must be an integer");
     report_started("child");
-    report("exit", &format!("code={}", code));
-    std::process::exit(code);
+    exit_reported(code);
 }
 
 fn cmd_kill_self(args: &[String]) -> ! {
     let sig = parse_signal(args.first().expect("kill-self needs a signal"));
     report_started("child");
     report("raise", &format!("sig={}", short_name(sig)));
-    // KILL and STOP can't have their disposition changed (EINVAL)
-    if !matches!(sig, Signal::SIGKILL | Signal::SIGSTOP) {
-        unsafe { signal::signal(sig, SigHandler::SigDfl) }.expect("failed to reset handler");
-    }
-    let mut set = SigSet::empty();
-    set.add(sig);
-    let _ = set.thread_unblock();
-    signal::raise(sig).expect("raise failed");
+    raise_with_default(sig);
     // SIGSTOP-like signals could land here; never report success
     std::thread::sleep(Duration::from_secs(5));
     std::process::exit(99);
 }
 
+fn is_open(fd: i32) -> bool {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    flags != -1
+}
+
+fn is_socket(fd: i32) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(fd, &mut st) };
+    rc == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFSOCK
+}
+
+/// `getsockname` or `getpeername`
+type SockAddrFn =
+    unsafe extern "C" fn(libc::c_int, *mut libc::sockaddr, *mut libc::socklen_t) -> libc::c_int;
+
+/// The address `query` returns for socket `fd`
+fn sock_addr(fd: i32, query: SockAddrFn) -> std::io::Result<libc::sockaddr_storage> {
+    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    if unsafe { query(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len) } == 0 {
+        Ok(addr)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Bound to an IPv4 or IPv6 address
+fn is_inet_bound(fd: i32) -> bool {
+    sock_addr(fd, libc::getsockname).is_ok_and(|addr| {
+        let family = addr.ss_family as i32;
+        family == libc::AF_INET || family == libc::AF_INET6
+    })
+}
+
+/// Anything but `ENOTCONN` from `getpeername` counts as having a peer
+fn has_peer(fd: i32) -> bool {
+    !matches!(
+        sock_addr(fd, libc::getpeername),
+        Err(e) if e.raw_os_error() == Some(libc::ENOTCONN)
+    )
+}
+
 /// Open fds in 0..1024, split into all fds and socket fds.
 fn scan_fds() -> (Vec<i32>, Vec<i32>) {
-    let mut open = Vec::new();
-    let mut sockets = Vec::new();
-    for fd in 0..1024 {
-        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
-            continue;
-        }
-        open.push(fd);
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut st) } == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFSOCK
-        {
-            sockets.push(fd);
-        }
-    }
+    let open: Vec<i32> = (0..1024).filter(|fd| is_open(*fd)).collect();
+    let sockets = open.iter().copied().filter(|fd| is_socket(*fd)).collect();
     (open, sockets)
 }
 
@@ -211,20 +286,17 @@ fn join(fds: &[i32]) -> String {
         .join(",")
 }
 
-fn is_ignored(sig: Signal) -> bool {
-    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::sigaction(sig as libc::c_int, std::ptr::null(), &mut old) };
-    rc == 0 && old.sa_sigaction == libc::SIG_IGN
-}
-
 fn cmd_dump(args: &[String]) -> ! {
     let mut env_keys: Vec<String> = Vec::new();
     let mut then_exit = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--env" => env_keys.push(it.next().expect("--env needs a key").clone()),
+            "--env" => env_keys.push(flag_value(&mut it, "--env").to_string()),
             "--then-exit" => then_exit = true,
+            // Unknown options are ignored, not rejected: tests pass arbitrary
+            // args (scinit-like flags included) to check they reach the child
+            // verbatim, as reported in the `arg` events below
             _ => {}
         }
     }
@@ -272,33 +344,19 @@ fn cmd_dump(args: &[String]) -> ! {
     report("dump-done", "");
 
     if then_exit {
-        report("exit", "code=0");
-        std::process::exit(0);
+        exit_reported(0);
     }
     signal_loop(DEFAULT_TRAP, DEFAULT_EXIT_ON);
 }
 
 /// A bound socket with no peer is a listener (SO_ACCEPTCONN is unreliable on macOS)
 fn is_listening(fd: i32) -> bool {
-    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    let bound = unsafe { libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len) } == 0
-        && (addr.ss_family as i32 == libc::AF_INET || addr.ss_family as i32 == libc::AF_INET6);
-    if !bound {
-        return false;
-    }
-    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    let rc = unsafe { libc::getpeername(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len) };
-    rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOTCONN)
+    is_inet_bound(fd) && !has_peer(fd)
 }
 
 fn cmd_listen() -> ! {
     // Block signals before spawning threads so every thread inherits the mask
-    let mut set = SigSet::empty();
-    for sig in DEFAULT_TRAP {
-        set.add(*sig);
-    }
-    set.thread_block().expect("failed to block signals");
+    let set = block_signals(DEFAULT_TRAP);
 
     report_started("child");
     report(
@@ -335,14 +393,7 @@ fn cmd_listen() -> ! {
     }
     report("ready", "");
 
-    loop {
-        let sig = set.wait().expect("sigwait failed");
-        report("signal", &format!("sig={}", short_name(sig)));
-        if DEFAULT_EXIT_ON.contains(&sig) {
-            report("exit", "code=0");
-            std::process::exit(0);
-        }
-    }
+    wait_signals(&set, DEFAULT_TRAP, DEFAULT_EXIT_ON);
 }
 
 fn proc_state(pid: Pid) -> Option<char> {
@@ -374,15 +425,8 @@ fn cmd_spawn_orphan() -> ! {
     }
 
     // Find the orphan pid from our own report line
-    let orphan = std::env::var("SCINIT_TEST_REPORT")
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| {
-            s.lines()
-                .filter_map(|l| l.split_whitespace().find_map(|f| f.strip_prefix("orphan_pid=")))
-                .last()
-                .and_then(|p| p.parse::<i32>().ok())
-        })
+    let orphan = last_reported_field("orphan_pid")
+        .and_then(|p| p.parse().ok())
         .map(Pid::from_raw);
 
     // Give the orphan time to exit and scinit time to reap it
