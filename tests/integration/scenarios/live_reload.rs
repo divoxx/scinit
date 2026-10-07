@@ -458,6 +458,8 @@ fn default_watch_path_bare_command_is_resolved_via_path() {
     let path = path_with(Path::new(TEST_CHILD).parent().unwrap());
     let (mut scinit, _) = Scinit::builder()
         .env("PATH", path.to_str().unwrap())
+        // SCINIT_LOG once scinit stops reading RUST_LOG (#2); both until then
+        .env("SCINIT_LOG", "info")
         .env("RUST_LOG", "info")
         .args(["--live-reload", "--zombie-reap-interval-ms", "100"])
         .command(["scinit-test-child", "run"])
