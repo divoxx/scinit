@@ -115,6 +115,7 @@ The `listen` fixture mode verifies socket inheritance end to end:
 
 - Never allow crash-based restarts in container environments
 - Always use process groups for proper signal forwarding
+- Listening sockets always set `SO_REUSEADDR` (rebinding over TIME_WAIT after a scinit restart); `SO_REUSEPORT` only with `--reuse-port`, since restarts reuse the same sockets and don't need it
 - Bound sockets stay close-on-exec; the child gets `dup2` copies at fds 3.. (which clears the flag), so only those are inherited
 - Code in the child between fork and exec (`pre_exec`) must be async-signal-safe: build everything before forking, never allocate there
 - **Signal masking**: Block handled signals on the main thread before any other thread exists; never block critical/synchronous signals or SIGCHLD

@@ -43,6 +43,7 @@ CMD ["my-server"]
 | `--restart-delay-ms <N>` | `1000` | Pause between the old child exiting and the new one starting |
 | `--ports <P1,P2,...>` | none | Ports to bind and pass to the child |
 | `--bind-addr <ADDR>` | `127.0.0.1` | Address to bind `--ports` on (IPv4 or IPv6) |
+| `--reuse-port` | off | Set `SO_REUSEPORT` on the `--ports` sockets, so other processes that also set it can bind the same ports |
 
 Logging goes to stdout through `tracing` (see [KNOWN-ISSUES.md](KNOWN-ISSUES.md)). Only errors are shown by default; set `RUST_LOG=info` (or `debug`) for more.
 
@@ -86,7 +87,8 @@ With `--ports`, scinit binds the listening sockets itself and passes them to the
 - The sockets are at fds **3, 4, ...** in `--ports` order.
 - `LISTEN_FDS` is the number of sockets, and `LISTEN_PID` is the child's own pid. Any `LISTEN_*` variables scinit itself inherited are replaced.
 - Each port is bound **once** and the same sockets are passed to every child. During a live-reload restart, connections wait in the socket's backlog and the new child serves them, so restarts don't drop or refuse connections.
-- Sockets are bound with `SO_REUSEPORT`.
+- Sockets are bound with `SO_REUSEADDR`, so a restarted scinit (e.g. after a container restart) can bind its ports again right away, even while connections it served are in TIME_WAIT. A port another process is listening on still fails with "Address already in use".
+- `SO_REUSEPORT` is only set with `--reuse-port`. Live-reload restarts don't need it; it is for sharing ports with other processes on purpose, such as handing over between two scinit instances or load balancing across several.
 
 ## Platforms
 
