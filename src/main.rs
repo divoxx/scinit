@@ -53,10 +53,12 @@ fn main() -> Result<()> {
         })
         .build()?;
 
-    rt.block_on(app_main(SIGNAL_HANDLER.get().unwrap()))?;
+    let result = rt.block_on(app_main(SIGNAL_HANDLER.get().unwrap()));
+    // Shut down with a timeout on every path: blocking tasks parked in
+    // sigwait never finish, so dropping the runtime would block forever
     rt.shutdown_timeout(Duration::from_millis(100));
 
-    Ok(())
+    result
 }
 
 async fn app_main(signal_handler: &SignalHandler) -> Result<()> {

@@ -1,0 +1,27 @@
+# Linux test image for scinit. Build from the repo root:
+#   podman build -f tests/container/Containerfile --ignorefile tests/container/containerignore .
+# Normally driven by scripts/test-linux.sh.
+FROM docker.io/library/rust:1-slim
+
+# procps: ps for zombie inspection; util-linux: unshare for the PID-1 tests
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends procps util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Dependencies first, against stub sources, so this layer is reused until
+# Cargo.toml or Cargo.lock change
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src tests/fixtures \
+    && echo 'fn main() {}' > src/main.rs \
+    && echo 'fn main() {}' > tests/fixtures/test_child.rs \
+    && echo '' > tests/integration_test.rs \
+    && cargo test --no-run \
+    && rm -rf src tests
+
+# The real sources. Touch them so cargo rebuilds over the stub artifacts even
+# when the copied mtimes are older.
+COPY . .
+RUN find src tests -name '*.rs' -exec touch {} + \
+    && cargo test --no-run

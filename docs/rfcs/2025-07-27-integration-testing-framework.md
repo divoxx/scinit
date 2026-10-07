@@ -5,6 +5,14 @@
 **Status:** Draft  
 **Author:** Claude Code  
 
+> **Note (superseded):** The performance and lifecycle frameworks described in
+> this RFC (`performance_framework.rs`, `lifecycle_framework.rs`), along with the
+> signal and socket frameworks, were removed. They were superseded by a
+> fixture-based suite: the `scinit-test-child` fixture
+> (`tests/fixtures/test_child.rs`), the harness in `tests/integration/harness.rs`
+> and the scenario modules in `tests/integration/scenarios/`. Bugs that suite
+> exposes are tracked in [KNOWN-ISSUES.md](../../KNOWN-ISSUES.md).
+
 ## Executive Summary
 
 This RFC proposes the development of a comprehensive integration testing framework for scinit, addressing critical gaps in our current testing approach that leave essential init system behaviors untested. While scinit currently has minimal unit tests embedded in individual modules and basic shell scripts for manual signal testing, it lacks the systematic validation required for a production-ready container init system. The proposed framework will provide automated testing for signal handling semantics, socket inheritance mechanisms, process lifecycle management, failure scenarios, and performance characteristics.

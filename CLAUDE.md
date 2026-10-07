@@ -18,13 +18,18 @@ cargo test
 # Run tests with output
 cargo test -- --nocapture
 
-# Run specific integration tests
+# Run the integration suite only
 cargo test --test integration_test
 
-# Run specific test scenarios
-cargo test --test integration_test test_live_reload_integration
-cargo test --test integration_test test_socket_inheritance
-cargo test --test integration_test test_graceful_shutdown
+# Run one scenario module
+cargo test --test integration_test signals::
+cargo test --test integration_test sockets::
+
+# Run the known-bug tests (expected to fail, see KNOWN-ISSUES.md)
+cargo test -- --ignored
+
+# Run the suite on Linux in rootless podman, plus the PID 1 checks
+scripts/test-linux.sh
 ```
 
 ### Running the Application
@@ -48,18 +53,18 @@ cargo run -- --live-reload --debounce-ms 1000 --restart-delay-ms 500 my-app
 
 **scinit** is a lightweight async init system designed for container environments, built around several key modules:
 
-- **`InitSystem`** (`src/main.rs:142-193`): Main orchestrator managing subprocess lifecycle, signal handling, and event loop coordination
-- **`ProcessManager`** (`src/process_manager.rs:80-443`): Handles subprocess spawning, monitoring, graceful restarts, and signal forwarding with process group management
-- **`SignalHandler`** (`src/signals.rs:17-165`): Async signal handling using tokio streams, with proper signal masking excluding critical signals (SIGFPE, SIGILL, SIGSEGV, etc.)
-- **`FileWatcher`** (`src/file_watcher.rs:46-255`): Live-reload functionality using the `notify` crate with debouncing to prevent excessive restarts
-- **`PortManager`** (`src/port_manager.rs:35-274`): Socket inheritance system for zero-downtime restarts, supporting SO_REUSEPORT and multiple ports
+- **`main` / `run_main_loop`** (`src/main.rs`): Builds the tokio runtime and runs the event loop coordinating subprocess lifecycle, signal handling and file events
+- **`ProcessManager`** (`src/process_manager.rs`): Handles subprocess spawning, monitoring, graceful restarts, and signal forwarding with process group management
+- **`SignalHandler`** (`src/signals.rs`): Synchronous `sigwait`-based signal handling, with proper signal masking excluding critical signals (SIGFPE, SIGILL, SIGSEGV, etc.)
+- **`FileWatcher`** (`src/file_watcher.rs`): Live-reload functionality using the `notify` crate with debouncing to prevent excessive restarts
+- **`PortManager`** (`src/port_manager.rs`): Socket inheritance system for zero-downtime restarts, supporting SO_REUSEPORT and multiple ports
 
 ### Key Architecture Principles
 
 1. **Async-First Design**: Uses tokio's async runtime throughout, with event-driven signal handling instead of polling
 2. **Container-Optimized**: Only allows file-change restarts, not crash restarts (crashes exit the container)
 3. **Process Group Management**: Creates isolated process groups and handles terminal control properly
-4. **Socket Inheritance**: Supports binding ports before process spawn and passing file descriptors via `SCINIT_INHERITED_FDS` environment variable
+4. **Socket Inheritance**: Supports binding ports before process spawn and passing them to the child using systemd-style socket activation (`LISTEN_FDS`/`LISTEN_PID`)
 5. **Graceful Shutdown**: Implements proper SIGTERM → SIGKILL escalation with configurable timeouts
 
 ### Signal Flow Architecture
@@ -84,19 +89,22 @@ The live-reload system integrates:
 
 ## Testing Infrastructure
 
-The project includes comprehensive Rust-based testing:
-
 - **Unit Tests**: Individual component testing in each module
-- **Integration Tests**: Full workflow testing in `tests/integration_test.rs`
-- **Echo Server**: Test server at `src/bin/echo_server.rs` for socket inheritance validation
-- **Legacy Shell Scripts**: Manual testing scripts for debugging
+- **Fixture child** (`tests/fixtures/test_child.rs`, bin `scinit-test-child`): purpose-built child that scinit runs in tests. It appends events (`started`, `signal`, `env`, `fds`, `sigmask`, `exit`, ...) to the file in `$SCINIT_TEST_REPORT`. Subcommands: `run` (trap/ignore signals), `exit <code>`, `kill-self <SIG>`, `dump` (argv, `LISTEN_*` env, fds, signal mask), `listen` (answers on inherited sockets), `spawn-orphan` (PID 1 reaping check)
+- **Harness** (`tests/integration/harness.rs`): `Scinit::builder()` spawns the real scinit binary with the fixture as child, captures stdout/stderr, and offers polling helpers (`wait_for`, `child_pid`, `wait_exit`) instead of fixed sleeps. Plain `#[test]`, no tokio
+- **Scenarios** (`tests/integration/scenarios/`): `cli`, `exit_codes`, `signals`, `sockets`, `live_reload`, and `linux` (Linux only: `/proc` checks and scinit as PID 1 via `unshare`). All compile into the single `integration_test` target
+- **Linux runner** (`scripts/test-linux.sh`, `tests/container/Containerfile`): builds a test image and runs `cargo test` in rootless podman (args pass through), with the permissions the `linux` PID-1 tests need; `SCINIT_REQUIRE_PID1=1` makes them fail rather than skip
 
-### Socket Inheritance Testing
+### Known Bugs
 
-The echo server demonstrates socket inheritance by:
-1. Reading `SCINIT_INHERITED_FDS` environment variable
-2. Converting raw file descriptors to tokio TcpListeners  
-3. Echoing back messages with server metadata (PID, inherited FDs)
+Tests that fail because of a known scinit bug are marked `#[ignore = "bug: <anchor> (KNOWN-ISSUES.md)"]`. Each anchor is a section in `KNOWN-ISSUES.md`. When fixing a bug, remove the `#[ignore]` from its tests (`grep -rn 'bug: <anchor>' tests/`) and delete its entry.
+
+### Socket Activation Testing
+
+The `listen` fixture mode verifies socket inheritance end to end:
+1. Reads `LISTEN_FDS`/`LISTEN_PID` and scans its open fds for inherited listeners
+2. Accepts on each one
+3. Replies with `pid=<pid> fd=<n> port=<port>`, so tests can tell which process answered
 
 ## Performance Characteristics
 

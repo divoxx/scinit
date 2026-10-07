@@ -117,11 +117,7 @@ The init system uses comprehensive error handling:
 
 ## Testing
 
-The project includes comprehensive testing for live-reloading functionality with socket inheritance:
-
-### Rust-Based Testing
-
-The testing infrastructure is built in Rust for better integration and reliability:
+The integration suite drives the real `scinit` binary with a purpose-built child process and asserts on what the child actually experienced plus scinit's own exit status.
 
 ```bash
 # Run all tests (unit + integration)
@@ -130,55 +126,40 @@ cargo test
 # Run tests with output
 cargo test -- --nocapture
 
-# Run specific integration tests
+# Run the integration suite only
 cargo test --test integration_test
 
-# Run specific test scenarios
-cargo test --test integration_test test_live_reload_integration
-cargo test --test integration_test test_multiple_ports
-cargo test --test integration_test test_rapid_file_changes
-cargo test --test integration_test test_graceful_shutdown
+# Run one scenario module
+cargo test --test integration_test signals::
+cargo test --test integration_test live_reload::
+
+# Run the tests for known bugs (expected to fail, see KNOWN-ISSUES.md)
+cargo test -- --ignored
+
+# Run everything on Linux in rootless podman, plus the PID 1 checks
+scripts/test-linux.sh
+scripts/test-linux.sh --test integration_test sockets::   # args go to cargo test
 ```
 
 ### Test Components
 
-The testing setup includes:
+1. **Fixture child** (`tests/fixtures/test_child.rs`, built as `scinit-test-child`): runs as scinit's child and appends events (`started`, `signal`, `env`, `fds`, `exit`, ...) to the file named by `$SCINIT_TEST_REPORT`. Subcommands: `run`, `exit <code>`, `kill-self <SIG>`, `dump`, `listen`, `spawn-orphan`.
+2. **Harness** (`tests/integration/harness.rs`): spawns scinit with the fixture, captures output, polls the report instead of sleeping, and cleans up every process group on drop.
+3. **Scenarios** (`tests/integration/scenarios/`): `cli`, `exit_codes`, `signals`, `sockets`, `live_reload`, and the Linux-only `linux` (`/proc` signal masks, scinit as PID 1 via `unshare`).
+4. **Linux runner** (`scripts/test-linux.sh`, `tests/container/Containerfile`): builds a test image and runs `cargo test` inside it, with the permissions the `linux` PID-1 tests need to create a PID namespace.
 
-1. **Echo Server** (`src/bin/echo_server.rs`): Rust-based TCP echo server with socket inheritance
-2. **Integration Tests** (`tests/integration_test.rs`): Comprehensive integration tests that build binaries and test full functionality
+### Socket Activation
 
-### Testing Socket Inheritance
+With `--ports`, scinit binds the listeners before spawning the child and passes them using systemd-style socket activation (`LISTEN_FDS`, `LISTEN_PID`). The fixture's `listen` mode accepts on every inherited socket and replies with its pid, fd and port, so tests can check which process answered, including across live-reload restarts.
 
-The echo server demonstrates socket inheritance by:
+### Known Bugs
 
-1. Reading inherited file descriptors from `SCINIT_INHERITED_FDS` environment variable
-2. Converting raw file descriptors to tokio TcpListeners
-3. Echoing back client messages with server metadata (PID, inherited FDs, etc.)
-
-### Test Features
-
-- **Socket Inheritance Verification**: Tests that file descriptors are properly inherited
-- **Live-Reload Testing**: Verifies automatic restarts on file changes
-- **Multiple Port Support**: Tests with different port configurations
-- **Rapid Change Testing**: Tests behavior with frequent file modifications
-- **Graceful Shutdown**: Verifies proper cleanup and shutdown behavior
-
-### Legacy Shell Scripts
-
-For manual testing or debugging, shell scripts are still available:
-
-```bash
-# Manual test (requires netcat and socat)
-./manual_test.sh
-
-# Full shell-based test
-./test_live_reload.sh
-```
+Tests that fail because of a known scinit bug are marked `#[ignore = "bug: <anchor> (KNOWN-ISSUES.md)"]`; each anchor is a section in [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
 ### Prerequisites
 
-- Rust toolchain for building scinit and echo-server
-- For shell scripts: `netcat` (nc) and `socat`
+- Rust toolchain
+- For `scripts/test-linux.sh`: podman (rootless is fine)
 
 ## Dependencies
 

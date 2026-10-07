@@ -1,10 +1,8 @@
-//! Integration testing framework for scinit init system
-//! 
-//! This module provides comprehensive testing capabilities for signal handling,
-//! socket inheritance, process lifecycle management, and performance validation.
+//! Integration tests for scinit.
+//!
+//! Every test drives the real `scinit` binary with the `scinit-test-child`
+//! fixture (tests/fixtures/test_child.rs) as its child, and asserts on what
+//! the child reports plus scinit's own exit status.
 
-pub mod infrastructure;
+pub mod harness;
 pub mod scenarios;
-
-// Re-export commonly used types for convenience
-pub use infrastructure::{ProcessTestHarness, SignalTestFramework, TestProcess};

@@ -4,7 +4,7 @@ use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::sys::socket::{setsockopt, sockopt::ReusePort};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, Shutdown};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr};
 use std::os::unix::io::{AsRawFd, BorrowedFd};
 use tracing::{debug, info};
 
@@ -36,7 +36,7 @@ impl Default for PortBindingConfig {
 }
 
 /// Manages port binding and socket inheritance for zero-downtime restarts.
-/// 
+///
 /// Binds ports before spawning child processes and provides file descriptors
 /// for inheritance. Uses SO_REUSEPORT for graceful restarts without port conflicts.
 pub struct PortManager {
@@ -50,10 +50,10 @@ pub struct PortManager {
 
 impl PortManager {
     /// Creates a new port manager with the given configuration
-    /// 
+    ///
     /// # Arguments
     /// * `config` - Configuration for port binding
-    /// 
+    ///
     /// # Returns
     /// * `Self` - The port manager instance
     pub fn new(config: PortBindingConfig) -> Self {
@@ -65,11 +65,11 @@ impl PortManager {
     }
 
     /// Binds the configured ports and prepares them for inheritance
-    /// 
+    ///
     /// This method binds all configured ports and sets up the sockets
     /// for inheritance by child processes. It uses SO_REUSEPORT if enabled
     /// to allow multiple processes to bind to the same port.
-    /// 
+    ///
     /// # Returns
     /// * `Result<()>` - Success or error
     pub async fn bind_ports(&mut self) -> Result<()> {
@@ -78,7 +78,11 @@ impl PortManager {
             return Ok(());
         }
 
-        info!("Binding {} ports to {}", self.config.ports.len(), self.config.bind_address);
+        info!(
+            "Binding {} ports to {}",
+            self.config.ports.len(),
+            self.config.bind_address
+        );
 
         let ports = self.config.ports.clone();
         for &port in &ports {
@@ -90,10 +94,10 @@ impl PortManager {
     }
 
     /// Binds a single port with proper error handling
-    /// 
+    ///
     /// # Arguments
     /// * `port` - The port number to bind
-    /// 
+    ///
     /// # Returns
     /// * `Result<()>` - Success or error
     async fn bind_single_port(&mut self, port: u16) -> Result<()> {
@@ -130,10 +134,10 @@ impl PortManager {
     }
 
     /// Gets the file descriptors for inherited ports
-    /// 
+    ///
     /// This method returns the file descriptors of bound sockets
     /// that should be inherited by child processes.
-    /// 
+    ///
     /// # Returns
     /// * `Vec<i32>` - List of file descriptors
     pub fn get_inherited_fds(&self) -> Vec<i32> {
@@ -144,7 +148,7 @@ impl PortManager {
     }
 
     /// Gets the number of inherited file descriptors for LISTEN_FDS environment variable
-    /// 
+    ///
     /// # Returns
     /// * `String` - Number of file descriptors as string
     pub fn get_listen_fds_count(&self) -> String {
@@ -152,23 +156,24 @@ impl PortManager {
     }
 
     /// Gets the socket names for LISTEN_FDNAMES environment variable
-    /// 
+    ///
     /// # Returns
     /// * `Option<String>` - Colon-separated socket names, if configured
     pub fn get_listen_fdnames(&self) -> Option<String> {
-        self.config.socket_names.as_ref().map(|names| {
-            names.join(":")
-        })
+        self.config
+            .socket_names
+            .as_ref()
+            .map(|names| names.join(":"))
     }
 
     /// Prepares file descriptors for systemd socket activation
-    /// 
+    ///
     /// This method ensures that file descriptors start at SD_LISTEN_FDS_START (3)
     /// and sets the FD_CLOEXEC flag as required by systemd socket activation.
-    /// 
+    ///
     /// # Arguments
     /// * `child_pid` - Process ID of the child process for validation
-    /// 
+    ///
     /// # Returns
     /// * `Result<()>` - Success or error
     pub fn prepare_systemd_fds(&self, _child_pid: nix::unistd::Pid) -> Result<()> {
@@ -220,24 +225,6 @@ impl PortManager {
 
         env
     }
-
-    /// Gets the inherited file descriptors as a formatted string for environment variables
-    /// 
-    /// # Returns
-    /// * `String` - Comma-separated list of file descriptors
-    /// 
-    /// # Deprecated
-    /// Use `get_socket_activation_env()` for systemd compatibility instead
-    #[deprecated(note = "Use get_socket_activation_env() for systemd compatibility")]
-    pub fn get_inherited_fds_string(&self) -> String {
-        self.get_inherited_fds()
-            .iter()
-            .map(|fd| fd.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-
-
 }
 
 impl Drop for PortManager {
@@ -315,11 +302,6 @@ mod tests {
         assert_eq!(fds.len(), 1);
         assert!(fds[0] > 0); // File descriptor should be positive
 
-        let fd_string = manager.get_inherited_fds_string();
-        assert!(!fd_string.is_empty());
-        
         // Ports will be cleaned up automatically when dropped
     }
-
-
-} 
+}
