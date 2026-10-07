@@ -4,8 +4,10 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::environment::Environment;
 use crate::file_watcher::FileWatchConfig;
 use crate::port_manager::PortBindingConfig;
+use crate::process_manager::ProcessConfig;
 use crate::Result;
 
 /// A live-reloading init system for managing subprocesses
@@ -63,8 +65,8 @@ pub struct Config {
     pub args: Vec<String>,
     /// Zombie reaping interval
     pub zombie_reap_interval: Duration,
-    /// Graceful shutdown timeout in seconds (with or without live reload)
-    pub graceful_timeout_secs: u64,
+    /// Graceful shutdown timeout (with or without live reload)
+    pub graceful_timeout: Duration,
     /// Live-reload configuration, `None` when disabled
     pub live_reload: Option<LiveReloadConfig>,
     /// Port binding configuration
@@ -74,8 +76,8 @@ pub struct Config {
 #[derive(Debug, Clone)]
 pub struct LiveReloadConfig {
     pub watch_path: PathBuf,
-    pub debounce_ms: u64,
-    pub restart_delay_ms: u64,
+    pub debounce: Duration,
+    pub restart_delay: Duration,
 }
 
 impl Config {
@@ -92,15 +94,15 @@ impl Config {
             watch_path: cli
                 .watch_path
                 .unwrap_or_else(|| PathBuf::from(&cli.command)),
-            debounce_ms: cli.debounce_ms,
-            restart_delay_ms: cli.restart_delay_ms,
+            debounce: Duration::from_millis(cli.debounce_ms),
+            restart_delay: Duration::from_millis(cli.restart_delay_ms),
         });
 
         Ok(Config {
             command: cli.command,
             args: cli.args,
             zombie_reap_interval: Duration::from_millis(cli.zombie_reap_interval_ms),
-            graceful_timeout_secs: cli.graceful_timeout_secs,
+            graceful_timeout: Duration::from_secs(cli.graceful_timeout_secs),
             live_reload,
             port_binding: PortBindingConfig {
                 ports: cli.ports,
@@ -109,11 +111,26 @@ impl Config {
         })
     }
 
+    /// Configuration for the managed child
+    pub fn process_config(&self) -> ProcessConfig {
+        ProcessConfig {
+            command: self.command.clone(),
+            args: self.args.clone(),
+            // Restarts only happen with live reload
+            restart_delay: self
+                .live_reload
+                .as_ref()
+                .map_or(Duration::ZERO, |live_reload| live_reload.restart_delay),
+            graceful_shutdown_timeout: self.graceful_timeout,
+            environment: Environment::new(),
+        }
+    }
+
     /// Get file watch configuration if live-reload is enabled
     pub fn file_watch_config(&self) -> Option<FileWatchConfig> {
         self.live_reload.as_ref().map(|live_reload| FileWatchConfig {
             watch_path: live_reload.watch_path.clone(),
-            debounce_ms: live_reload.debounce_ms,
+            debounce: live_reload.debounce,
         })
     }
 }

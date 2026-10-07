@@ -1,4 +1,5 @@
-use crate::process_manager::ProcessManager;
+//! Receiving the signals scinit handles; main.rs decides what to do with them.
+
 use crate::Result;
 
 pub use nix::sys::signal::Signal;
@@ -6,22 +7,7 @@ pub use nix::sys::signal::Signal;
 use eyre::eyre;
 use nix::sys::signal::{pthread_sigmask, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tracing::{debug, error, info};
-
-/// Converts signal number to human-readable name
-pub fn signal_name(signal: i32) -> &'static str {
-    match signal {
-        2 => "SIGINT",
-        9 => "SIGKILL",
-        15 => "SIGTERM",
-        3 => "SIGQUIT",
-        1 => "SIGHUP",
-        10 => "SIGUSR1",
-        12 => "SIGUSR2",
-        17 => "SIGCHLD",
-        _ => "UNKNOWN",
-    }
-}
+use tracing::{debug, error};
 
 /// Signal handler for the init system with proper init semantics.
 ///
@@ -79,55 +65,6 @@ impl SignalHandler {
             .await
             .ok_or_else(|| eyre!("signal thread exited"))
     }
-
-    /// Processes a specific signal according to init system semantics
-    pub async fn process_signal(
-        &self,
-        signal: Signal,
-        process_manager: &mut ProcessManager,
-        graceful_timeout_secs: u64,
-    ) -> Result<SignalAction> {
-        match signal {
-            Signal::SIGTERM | Signal::SIGINT | Signal::SIGQUIT => {
-                info!(
-                    "received termination signal {:?}, initiating graceful shutdown",
-                    signal
-                );
-                self.handle_termination_signal(signal, process_manager, graceful_timeout_secs)
-                    .await;
-                Ok(SignalAction::Exit)
-            }
-            Signal::SIGUSR1 | Signal::SIGUSR2 | Signal::SIGHUP => {
-                // These signals should be forwarded to the child process only
-                info!("forwarding signal {:?} to child process", signal);
-                process_manager.try_signal_group(signal);
-                Ok(SignalAction::Continue)
-            }
-            _ => {
-                // Any other signals we somehow receive should be forwarded
-                debug!("forwarding unexpected signal {:?} to child process", signal);
-                process_manager.try_signal_group(signal);
-                Ok(SignalAction::Continue)
-            }
-        }
-    }
-
-    /// Forwards a termination signal to the child, escalating to SIGKILL if
-    /// it outlives the graceful timeout
-    async fn handle_termination_signal(
-        &self,
-        signal: Signal,
-        process_manager: &mut ProcessManager,
-        graceful_timeout_secs: u64,
-    ) {
-        info!(
-            "Termination signal {:?} received, forwarding to child process (timeout: {}s)",
-            signal, graceful_timeout_secs
-        );
-        process_manager.shutdown_with_signal(signal).await;
-
-        info!("scinit exiting due to termination signal {:?}", signal);
-    }
 }
 
 /// Signals that init should handle synchronously:
@@ -176,13 +113,4 @@ fn spawn_sigwait_thread(set: SigSet, sender: UnboundedSender<Signal>) -> Result<
             }
         })?;
     Ok(())
-}
-
-/// Actions that signal processing can return
-#[derive(Debug, PartialEq)]
-pub enum SignalAction {
-    /// Continue normal operation
-    Continue,
-    /// Exit the init system
-    Exit,
 }

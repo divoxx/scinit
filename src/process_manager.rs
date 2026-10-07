@@ -1,41 +1,18 @@
 use crate::environment::Environment;
 use crate::port_manager::PortManager;
-use crate::signals::signal_name;
+use crate::reaper::{clear_managed_child, set_managed_child};
+use crate::signals::Signal;
 use crate::socket_activation::SocketActivationExec;
 use crate::Result;
 use eyre::eyre;
 use nix::sys::signal::kill;
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{getpgid, tcsetpgrp, Pid};
+use nix::unistd::{getpgid, Pid};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::IsTerminal;
-use std::ops::ControlFlow;
-use std::os::unix::process::ExitStatusExt;
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
-
-use super::signals::Signal;
-
-/// PID of the managed child, or 0 when there is none.
-///
-/// The zombie reaper must leave this process alone: its exit status belongs to
-/// tokio's `child.wait()`, which fails with ECHILD if the reaper takes it first.
-static MANAGED_CHILD: AtomicI32 = AtomicI32::new(0);
-
-/// Marks `pid` as the managed child
-fn set_managed_child(pid: Pid) {
-    MANAGED_CHILD.store(pid.as_raw(), Ordering::SeqCst);
-}
-
-/// Clears the managed child mark, unless another child has replaced `pid`
-fn clear_managed_child(pid: Pid) {
-    let _ = MANAGED_CHILD.compare_exchange(pid.as_raw(), 0, Ordering::SeqCst, Ordering::SeqCst);
-}
 
 /// Configuration for process management behavior
 #[derive(Debug, Clone)]
@@ -300,6 +277,10 @@ impl ProcessManager {
         }
     }
 
+    pub fn graceful_shutdown_timeout(&self) -> Duration {
+        self.config.graceful_shutdown_timeout
+    }
+
     /// PID of the running or last exited child
     pub fn pid(&self) -> Option<Pid> {
         match &self.state {
@@ -365,155 +346,10 @@ impl Drop for ProcessManager {
     }
 }
 
-/// Sets the process group as the foreground process group if a terminal is available
-pub fn process_group_to_foreground(pgid: Pid) -> Result<()> {
-    let tty = match File::open("/dev/tty") {
-        Ok(tty) => tty,
-        Err(e) => {
-            debug!(
-                "Cannot open /dev/tty ({}), skipping foreground process group setup",
-                e
-            );
-            return Ok(());
-        }
-    };
-    if !tty.is_terminal() {
-        debug!("Not a terminal, skipping foreground process group setup");
-        return Ok(());
-    }
-    debug!("Setting process group {} as foreground", &pgid);
-    if let Err(e) = tcsetpgrp(tty, pgid) {
-        error!("Failed to set process group {} as foreground: {}", &pgid, e);
-        return Err(e.into());
-    }
-    Ok(())
-}
-
-/// Returns the PID of a child that has exited, without reaping it
-fn peek_exited_child() -> Option<Pid> {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        libc::waitid(
-            libc::P_ALL,
-            0,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if rc != 0 {
-        // ECHILD: no children at all
-        return None;
-    }
-    #[cfg(target_os = "linux")]
-    let pid = unsafe { info.si_pid() };
-    #[cfg(not(target_os = "linux"))]
-    let pid = info.si_pid;
-    // With WNOHANG, si_pid stays 0 when no child has exited yet
-    (pid != 0).then(|| Pid::from_raw(pid))
-}
-
-/// Reaps zombie processes to prevent process table exhaustion
-///
-/// Each exited child is peeked at before being reaped, so the managed child
-/// is left for tokio's `child.wait()`. While the managed child is the zombie
-/// returned first, other zombies wait for the next pass; tokio reaps the
-/// managed child promptly and `handle_child_exit` runs a final pass.
-pub fn reap_zombies() {
-    let mut reaped_count = 0;
-
-    while let Some(pid) = peek_exited_child() {
-        if is_managed_child(pid) {
-            break;
-        }
-        match reap_one(pid) {
-            ControlFlow::Continue(reaped) => reaped_count += usize::from(reaped),
-            ControlFlow::Break(()) => break,
-        }
-    }
-
-    if reaped_count > 0 {
-        debug!("reaped {} zombie processes", reaped_count);
-    }
-}
-
-fn is_managed_child(pid: Pid) -> bool {
-    pid.as_raw() == MANAGED_CHILD.load(Ordering::SeqCst)
-}
-
-/// Reaps exited child `pid`. Continues with whether it was reaped, or
-/// breaks when the pass should stop.
-fn reap_one(pid: Pid) -> ControlFlow<(), bool> {
-    match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
-        Ok(WaitStatus::Exited(pid, status)) => {
-            debug!("reaped zombie process {} with exit status {}", pid, status);
-            ControlFlow::Continue(true)
-        }
-        Ok(WaitStatus::Signaled(pid, signal, _)) => {
-            debug!(
-                "reaped zombie process {} killed by signal {:?}",
-                pid, signal
-            );
-            ControlFlow::Continue(true)
-        }
-        Ok(WaitStatus::StillAlive) => ControlFlow::Break(()),
-        Ok(other) => {
-            debug!("ignoring wait status {:?}", other);
-            ControlFlow::Continue(false)
-        }
-        // Reaped concurrently (e.g. by tokio)
-        Err(nix::Error::ECHILD) => ControlFlow::Continue(false),
-        Err(e) => {
-            warn!("error reaping zombies: {}", e);
-            ControlFlow::Break(())
-        }
-    }
-}
-
-/// Shell-style exit code for a child's status: its exit code, or 128 + the
-/// signal number if it was killed by a signal
-pub fn exit_code(status: ExitStatus) -> i32 {
-    status
-        .code()
-        .or_else(|| status.signal().map(|sig| 128 + sig))
-        .unwrap_or(1)
-}
-
-/// Handles the child's exit, which ends scinit too.
-///
-/// In container environments, scinit's lifecycle is tied to the child process,
-/// so scinit exits with the child's exit code (see [`exit_code`]) and
-/// orchestrators can tell a crash from a clean shutdown.
-pub fn handle_child_exit(status: ExitStatus) -> i32 {
-    log_child_exit(status);
-
-    // Reap any remaining zombies before exiting
-    debug!("Reaping any remaining zombie processes before exit");
-    spawn_zombie_reap();
-
-    exit_code(status)
-}
-
-fn log_child_exit(status: ExitStatus) {
-    if status.success() {
-        info!("Child process exited successfully, scinit exiting cleanly");
-    } else if let Some(code) = status.code() {
-        info!("Child process exited with error code {}, scinit exiting", code);
-    } else if let Some(signal) = status.signal() {
-        info!("Child process terminated by signal {} ({}), scinit exiting",
-              signal, signal_name(signal));
-    } else {
-        info!("Child process terminated by signal, scinit exiting");
-    }
-}
-
-/// Starts a zombie reap pass on a blocking thread, without waiting for it
-pub fn spawn_zombie_reap() {
-    tokio::task::spawn_blocking(reap_zombies);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exit_status::exit_code;
     use crate::port_manager::PortBindingConfig;
 
     fn manager(config: ProcessConfig) -> ProcessManager {

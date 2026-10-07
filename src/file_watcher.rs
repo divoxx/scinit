@@ -1,10 +1,9 @@
-use crate::process_manager::ProcessManager;
 use crate::Result;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Events that can be emitted by the file watcher
 #[derive(Debug)]
@@ -21,7 +20,7 @@ pub struct FileWatchConfig {
     /// Path to watch for changes
     pub watch_path: PathBuf,
     /// Debounce time for file changes (prevents excessive restarts)
-    pub debounce_ms: u64,
+    pub debounce: Duration,
 }
 
 /// Async file watcher that monitors files for changes and emits events
@@ -58,8 +57,7 @@ impl FileWatcher {
         watcher.watch(&watch_path, RecursiveMode::NonRecursive)?;
         info!("Started watching path: {:?}", watch_path);
 
-        let debounce = Duration::from_millis(config.debounce_ms);
-        tokio::spawn(debounce_events(rx, event_tx, watch_path, debounce));
+        tokio::spawn(debounce_events(rx, event_tx, watch_path, config.debounce));
 
         Ok(FileWatcher {
             _watcher: watcher,
@@ -158,23 +156,6 @@ fn changed_path(event: &notify::Event, fallback: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Handles one file watcher event, restarting the process on a change
-pub async fn handle_file_event(
-    event: FileChangeEvent,
-    process_manager: &mut ProcessManager,
-) -> Result<()> {
-    match event {
-        FileChangeEvent::FileChanged(path) => {
-            info!("File changed: {:?}, triggering restart", path);
-            process_manager.restart().await?;
-        }
-        FileChangeEvent::WatchError(error) => {
-            warn!("File watching error: {}", error);
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,7 +167,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let config = FileWatchConfig {
             watch_path: temp_dir.path().to_path_buf(),
-            debounce_ms: 100,
+            debounce: Duration::from_millis(100),
         };
 
         assert!(FileWatcher::start(config).is_ok());
@@ -197,7 +178,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let config = FileWatchConfig {
             watch_path: temp_dir.path().to_path_buf(),
-            debounce_ms: 100,
+            debounce: Duration::from_millis(100),
         };
 
         let mut watcher = FileWatcher::start(config).unwrap();
@@ -224,7 +205,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let config = FileWatchConfig {
             watch_path: temp_dir.path().to_path_buf(),
-            debounce_ms: 500,
+            debounce: Duration::from_millis(500),
         };
 
         let mut watcher = FileWatcher::start(config).unwrap();
