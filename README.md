@@ -36,7 +36,7 @@ CMD ["my-server"]
 | Option | Default | Description |
 |---|---|---|
 | `--graceful-timeout-secs <N>` | `30` | How long to wait for the child to exit after a termination signal before sending SIGKILL |
-| `--zombie-reap-interval-ms <N>` | `5000` | Interval for the periodic zombie reaper (orphans are also reaped on SIGCHLD) |
+| `--zombie-reap-interval-ms <N>` | `5000` | Interval for the periodic zombie reaper (orphans are also reaped on SIGCHLD); must be at least 1 |
 | `--live-reload` | off | Restart the child when the watched path changes |
 | `--watch-path <PATH>` | the command's executable | File or directory to watch (non-recursive). By default, a bare command name is looked up in `PATH` like exec does; scinit exits with an error if it isn't found |
 | `--debounce-ms <N>` | `500` | Wait this long after the last change before restarting |
@@ -105,7 +105,7 @@ With `--ports`, scinit binds the listening sockets itself and passes them to the
 
 - The sockets are at fds **3, 4, ...** in `--ports` order.
 - The child gets no other fds besides stdio, with or without `--ports`: anything else scinit itself inherited is closed on exec, as systemd does.
-- `LISTEN_FDS` is the number of sockets, and `LISTEN_PID` is the child's own pid. Any `LISTEN_*` variables scinit itself inherited are replaced.
+- `LISTEN_FDS` is the number of sockets, and `LISTEN_PID` is the child's own pid. Any `LISTEN_*` variables scinit itself inherited are replaced (and removed when there is no `--ports`), so the child never sees stale ones.
 - Each port is bound **once** and the same sockets are passed to every child. During a live-reload restart, connections wait in the socket's backlog and the new child serves them, so restarts don't drop or refuse connections.
 - Sockets are bound with `SO_REUSEADDR`, so a restarted scinit (e.g. after a container restart) can bind its ports again right away, even while connections it served are in TIME_WAIT. On Linux, a port another process is listening on still fails with "Address already in use". On macOS (BSD socket semantics), binding a specific address such as the default `127.0.0.1` succeeds even if another process listens on the wildcard address (`0.0.0.0`) for that port, and loopback connections then go to scinit's child; the same exact address still fails.
 - `SO_REUSEPORT` is only set with `--reuse-port`. Live-reload restarts don't need it; it is for sharing ports with other processes on purpose, such as handing over between two scinit instances or load balancing across several.

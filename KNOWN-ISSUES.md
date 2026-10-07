@@ -34,18 +34,6 @@ sketch), with their failing tests marked `#[ignore]`.
 
 Smaller issues, not (yet) covered by `#[ignore]` tests:
 
-- **`LISTEN_*` leaks without `--ports`.** A `LISTEN_FDS`/`LISTEN_PID` already in
-  scinit's environment is passed to the child unchanged even when scinit
-  binds nothing, so the child may treat unrelated fds 3.. as listeners. The
-  `--ports` path already replaces them. Strip them when no ports are
-  configured, and flip `inherited_listen_fds_leaks_without_ports`.
-- **The final zombie reap isn't awaited.** On child exit, `handle_child_exit`
-  (`src/exit_status.rs`) calls `spawn_zombie_reap()`, which starts a
-  `spawn_blocking` reap without waiting for it; scinit then shuts the runtime
-  down within 100ms and exits. Orphans that exited just before the child may
-  be left unreaped. Await the reap before returning the exit code.
-- **`--zombie-reap-interval-ms 0` (probably) panics.** `tokio::time::interval`
-  panics on a zero period. Reject 0 during argument parsing.
 - **FSEvents replays writes made just before the watcher starts (macOS).**
   On macOS, a file written shortly before scinit starts watching can be
   reported as a change right after startup, causing one spurious restart.

@@ -9,6 +9,7 @@ use crate::Result;
 use eyre::eyre;
 use nix::sys::signal::kill;
 use nix::unistd::{getpgid, Pid};
+use std::os::unix::ffi::OsStrExt;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::process::{Child, Command};
@@ -151,6 +152,7 @@ impl ProcessManager {
 
         // Inherited as is (non-UTF-8 variables included), plus the overrides
         command.envs(overrides.clone().into_inner());
+        remove_inherited_listen_vars(&mut command, overrides);
         command
     }
 
@@ -321,6 +323,18 @@ impl ProcessManager {
     #[cfg(test)]
     pub fn is_running(&self) -> bool {
         matches!(self.state, ChildState::Running(_))
+    }
+}
+
+/// Drops the `LISTEN_*` variables scinit inherited, unless `overrides` sets
+/// them: they describe someone else's sockets, so the child would trust fds
+/// it doesn't have
+fn remove_inherited_listen_vars(command: &mut Command, overrides: &Environment) {
+    for (key, _) in std::env::vars_os() {
+        let inherited_listen_var = key.as_bytes().starts_with(b"LISTEN_");
+        if inherited_listen_var && !key.to_str().is_some_and(|k| overrides.contains(k)) {
+            command.env_remove(key);
+        }
     }
 }
 

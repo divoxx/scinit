@@ -159,22 +159,19 @@ fn ipv6_bind_addr() {
     scinit.assert_reply_from(&format!("[::1]:{}", port), pid);
 }
 
-/// Without `--ports`, a `LISTEN_FDS` already in scinit's environment reaches
-/// the child unchanged.
-///
-/// Asserted so a change is noticed: a stale `LISTEN_FDS` makes the child
-/// trust fds it doesn't have.
+/// Without `--ports`, `LISTEN_*` variables already in scinit's environment
+/// don't reach the child: a stale `LISTEN_FDS` makes it trust fds it doesn't
+/// have
 #[test]
-fn inherited_listen_fds_leaks_without_ports() {
+fn inherited_listen_fds_stripped_without_ports() {
     let (scinit, events) = Scinit::builder()
         .env("LISTEN_FDS", "7")
+        .env("LISTEN_PID", "1")
+        .env("LISTEN_FDNAMES", "stale")
         .spawn_dump(&["--then-exit"]);
-    assert_eq!(
-        env_value(&events, "LISTEN_FDS").as_deref(),
-        Some("7"),
-        "{}",
-        scinit.diagnostics()
-    );
+    for key in ["LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES"] {
+        assert_eq!(env_value(&events, key), None, "{}: {}", key, scinit.diagnostics());
+    }
 }
 
 /// Without `--ports`, scinit sets no `LISTEN_*` variables
@@ -206,6 +203,30 @@ fn stray_inherited_fd_not_passed_with_ports() {
         .ports(&free_ports(2))
         .spawn_dump(&["--then-exit"]);
     assert_eq!(open_fds(&events), [0, 1, 2, 3, 4], "{}", scinit.diagnostics());
+}
+
+/// A clean run with `--ports` leaves nothing on scinit's stderr: closing the
+/// listeners at exit must not report errors (e.g. `shutdown()` on a listening
+/// socket fails with ENOTCONN on macOS)
+#[test]
+fn clean_exit_with_ports_reports_no_errors() {
+    let (scinit, status) = Scinit::builder()
+        .ports(&free_ports(2))
+        .child(["exit", "0"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 0);
+    let stderr = scinit.stderr();
+    let scinit_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|l| !l.starts_with("[test-child]"))
+        .collect();
+    assert!(
+        scinit_lines.is_empty(),
+        "unexpected scinit output on stderr: {:?}\n{}",
+        scinit_lines,
+        scinit.diagnostics()
+    );
 }
 
 /// A port held by another listener cannot be bound: scinit fails with exit 1
