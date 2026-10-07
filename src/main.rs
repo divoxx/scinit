@@ -1,3 +1,6 @@
+// scinit's output goes through tracing events (src/logging.rs), never directly
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 type Result<T> = eyre::Result<T>;
 
 mod cli;

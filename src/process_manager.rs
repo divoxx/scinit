@@ -345,14 +345,14 @@ impl Drop for ProcessManager {
         let Some(pid) = self.running_pid() else {
             return;
         };
-        eprintln!("ProcessManager dropped with running child (PID: {}), emergency cleanup", pid);
+        warn!("ProcessManager dropped with running child (PID: {}), emergency cleanup", pid);
 
         // Emergency SIGKILL to process group - no graceful shutdown in Drop
         match self.signal_group(Signal::SIGKILL) {
-            Ok(()) => eprintln!("Sent SIGKILL to process group {} during emergency cleanup", pid),
+            Ok(()) => warn!("Sent SIGKILL to process group {} during emergency cleanup", pid),
             // Process already dead - this is fine, no cleanup needed
             Err(e) if matches!(e.downcast_ref::<nix::Error>(), Some(nix::Error::ESRCH)) => {}
-            Err(e) => eprintln!("Failed to send SIGKILL to process group during emergency cleanup: {}", e),
+            Err(e) => error!("Failed to send SIGKILL to process group during emergency cleanup: {}", e),
         }
 
         // Brief pause to let SIGKILL take effect

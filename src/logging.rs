@@ -1,5 +1,9 @@
 //! scinit's own diagnostics: stderr only, as `[scinit] LEVEL message`.
 //!
+//! Everything scinit reports goes through `tracing` events, including fatal
+//! errors (`main`) and panics (the hook below); `print!`-style macros are
+//! denied crate-wide so nothing bypasses the format or `SCINIT_LOG`.
+//!
 //! stdout belongs to the child, so nothing scinit says goes there. The level
 //! comes from `SCINIT_LOG`, not `RUST_LOG`: the child inherits the
 //! environment, and a `RUST_LOG` meant for a Rust child shouldn't make scinit
@@ -31,6 +35,17 @@ pub fn init() {
         )
         .with(filter)
         .init();
+
+    // Panics are reported like any other error, not by the default hook
+    // writing straight to stderr
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!(" at {}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        let message = info.payload_as_str().unwrap_or("non-string payload");
+        tracing::error!("panic{}: {}", location, message);
+    }));
 }
 
 /// Color only on a terminal: container logs and files would otherwise get
