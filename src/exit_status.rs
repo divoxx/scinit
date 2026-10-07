@@ -1,6 +1,7 @@
 //! Turning the child's exit into scinit's own exit.
 
 use crate::reaper::spawn_zombie_reap;
+use nix::sys::signal::Signal;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 use tracing::{debug, info};
@@ -47,17 +48,32 @@ fn log_child_exit(status: ExitStatus) {
     }
 }
 
-/// Converts signal number to human-readable name
+/// Platform name of signal number `signal`, e.g. "SIGUSR1"
 fn signal_name(signal: i32) -> &'static str {
-    match signal {
-        2 => "SIGINT",
-        9 => "SIGKILL",
-        15 => "SIGTERM",
-        3 => "SIGQUIT",
-        1 => "SIGHUP",
-        10 => "SIGUSR1",
-        12 => "SIGUSR2",
-        17 => "SIGCHLD",
-        _ => "UNKNOWN",
+    Signal::try_from(signal).map_or("UNKNOWN", Signal::as_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signal_name_uses_platform_numbers() {
+        assert_eq!(signal_name(Signal::SIGUSR1 as i32), "SIGUSR1");
+        assert_eq!(signal_name(Signal::SIGUSR2 as i32), "SIGUSR2");
+        assert_eq!(signal_name(Signal::SIGCHLD as i32), "SIGCHLD");
+        assert_eq!(signal_name(Signal::SIGKILL as i32), "SIGKILL");
+    }
+
+    #[test]
+    fn signal_name_covers_signals_outside_the_common_set() {
+        assert_eq!(signal_name(Signal::SIGSEGV as i32), "SIGSEGV");
+        assert_eq!(signal_name(Signal::SIGABRT as i32), "SIGABRT");
+    }
+
+    #[test]
+    fn signal_name_of_invalid_number_is_unknown() {
+        assert_eq!(signal_name(0), "UNKNOWN");
+        assert_eq!(signal_name(999), "UNKNOWN");
     }
 }

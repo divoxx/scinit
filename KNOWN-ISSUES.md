@@ -50,11 +50,6 @@ Smaller issues, not (yet) covered by `#[ignore]` tests:
   `spawn_blocking` reap without waiting for it; scinit then shuts the runtime
   down within 100ms and exits. Orphans that exited just before the child may
   be left unreaped. Await the reap before returning the exit code.
-- **`signal_name` uses Linux signal numbers.** `src/exit_status.rs` hardcodes
-  10/12/17 for USR1/USR2/CHLD, so on macOS a child killed by SIGUSR1 (30) is
-  logged as `UNKNOWN`, and signals outside the table (e.g. SIGSEGV) are
-  `UNKNOWN` everywhere. Logs only; exit codes are correct. Use
-  `Signal::try_from(n).map(Signal::as_str)`.
 - **Stray inherited fds reach the child.** Any non-close-on-exec fd that
   scinit itself inherited (e.g. sockets leaked by GitHub's macOS runner) is
   passed on to the child, next to the activated sockets at 3... Container
