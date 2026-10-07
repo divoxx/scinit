@@ -22,9 +22,15 @@ COPY . .
 #   env!("CARGO_BIN_EXE_*")
 # - registry: copied to /opt and moved into CARGO_HOME by the next step, since
 #   the mount hides that path for the duration of this one
+#
+# The target cache is shared by every branch and worktree, and cargo decides
+# freshness by mtime, so the copied sources are touched first: otherwise a
+# checkout older than another branch's cached build reuses that branch's
+# binaries. Only scinit's own crates rebuild; dependencies stay cached.
 RUN --mount=type=cache,id=scinit-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=scinit-target,target=/cache/target,sharing=locked \
     mkdir -p /app/target && cp -a /cache/target/. /app/target/ \
+    && find src tests .cargo Cargo.toml -type f -exec touch {} + \
     && cargo test --no-run \
     && rm -rf /cache/target/* \
     && cp -a /app/target/. /cache/target/ \

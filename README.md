@@ -38,13 +38,33 @@ CMD ["my-server"]
 | `--graceful-timeout-secs <N>` | `30` | How long to wait for the child to exit after a termination signal before sending SIGKILL |
 | `--zombie-reap-interval-ms <N>` | `5000` | Interval for the periodic zombie reaper (orphans are also reaped on SIGCHLD) |
 | `--live-reload` | off | Restart the child when the watched path changes |
-| `--watch-path <PATH>` | the command as given | File or directory to watch (non-recursive) |
+| `--watch-path <PATH>` | the command's executable | File or directory to watch (non-recursive). By default, a bare command name is looked up in `PATH` like exec does; scinit exits with an error if it isn't found |
 | `--debounce-ms <N>` | `500` | Wait this long after the last change before restarting |
 | `--restart-delay-ms <N>` | `1000` | Pause between the old child exiting and the new one starting |
 | `--ports <P1,P2,...>` | none | Ports to bind and pass to the child |
 | `--bind-addr <ADDR>` | `127.0.0.1` | Address to bind `--ports` on (IPv4 or IPv6) |
+| `--reuse-port` | off | Set `SO_REUSEPORT` on the `--ports` sockets, so other processes that also set it can bind the same ports |
 
-Logging goes to stdout through `tracing` (see [KNOWN-ISSUES.md](KNOWN-ISSUES.md)). Only errors are shown by default; set `RUST_LOG=info` (or `debug`) for more.
+### Logging
+
+scinit writes its own messages to **stderr** only, so stdout carries nothing but the child's output (`docker run img cmd | jq` stays clean). Lines use tracing's standard format, with the level and the `scinit` module that logged them:
+
+```
+ERROR scinit: Failed to spawn process 'my-app': No such file or directory (os error 2)
+ INFO scinit::process_manager: Spawning process: my-app ["--port", "8080"]
+```
+
+Lines carry no timestamp: container log drivers (Docker's `json-file`, Kubernetes' CRI log files, journald) record one per line, shown with `docker logs -t` or `kubectl logs --timestamps`. Attached runs (`docker run` without `-d`) and runs outside a container get none. Color is used only when stderr is a terminal (`NO_COLOR` turns it off).
+
+Verbosity is set with **`SCINIT_LOG`**, using [tracing's `EnvFilter` syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html). The default is `error`.
+
+```bash
+SCINIT_LOG=info scinit my-server                        # lifecycle events: spawn, restart, signals
+SCINIT_LOG=debug scinit my-server                       # everything
+SCINIT_LOG=scinit::file_watcher=debug scinit my-server  # one module
+```
+
+scinit doesn't read `RUST_LOG`: it's passed to the child unchanged, so setting it for your app doesn't make scinit verbose, and the other way around.
 
 ## Behavior
 
@@ -86,7 +106,8 @@ With `--ports`, scinit binds the listening sockets itself and passes them to the
 - The sockets are at fds **3, 4, ...** in `--ports` order.
 - `LISTEN_FDS` is the number of sockets, and `LISTEN_PID` is the child's own pid. Any `LISTEN_*` variables scinit itself inherited are replaced.
 - Each port is bound **once** and the same sockets are passed to every child. During a live-reload restart, connections wait in the socket's backlog and the new child serves them, so restarts don't drop or refuse connections.
-- Sockets are bound with `SO_REUSEPORT`.
+- Sockets are bound with `SO_REUSEADDR`, so a restarted scinit (e.g. after a container restart) can bind its ports again right away, even while connections it served are in TIME_WAIT. On Linux, a port another process is listening on still fails with "Address already in use". On macOS (BSD socket semantics), binding a specific address such as the default `127.0.0.1` succeeds even if another process listens on the wildcard address (`0.0.0.0`) for that port, and loopback connections then go to scinit's child; the same exact address still fails.
+- `SO_REUSEPORT` is only set with `--reuse-port`. Live-reload restarts don't need it; it is for sharing ports with other processes on purpose, such as handing over between two scinit instances or load balancing across several.
 
 ## Platforms
 
@@ -119,7 +140,7 @@ scripts/test-linux.sh --test integration_test sockets::   # args go to cargo tes
 - **Harness** (`tests/integration/harness.rs`): spawns scinit with the fixture, captures its output, polls the report instead of sleeping, and cleans up every process group on drop.
 - **Scenarios** (`tests/integration/scenarios/`): `cli`, `exit_codes`, `signals`, `sockets`, `live_reload`, and the Linux-only `linux` (`/proc` signal masks, scinit as PID 1 in a new PID namespace).
 - **Linux runner** (`scripts/test-linux.sh`, `tests/container/Containerfile`): builds a test image and runs `cargo test` in rootless podman, with the permissions the PID-1 tests need. Requires podman.
-- **CI** (`.github/workflows/ci.yml`): runs `cargo test` on macOS and `scripts/test-linux.sh` on Linux for every pull request and push to `main`.
+- **CI** (`.github/workflows/ci.yml`): runs `cargo clippy --all-targets -- -D warnings` on macOS and Linux, `cargo test` on macOS and `scripts/test-linux.sh` on Linux for every pull request and push to `main`.
 
 Known issues and open design decisions are tracked in [KNOWN-ISSUES.md](KNOWN-ISSUES.md). Tests for a known bug are marked `#[ignore = "bug: <anchor> (KNOWN-ISSUES.md)"]` and can be run with `cargo test -- --ignored`.
 

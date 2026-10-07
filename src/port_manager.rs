@@ -14,6 +14,8 @@ pub struct PortBindingConfig {
     pub ports: Vec<u16>,
     /// Address to bind ports to
     pub bind_address: IpAddr,
+    /// Set SO_REUSEPORT, so other sockets that also set it can bind the same ports
+    pub reuse_port: bool,
 }
 
 impl Default for PortBindingConfig {
@@ -21,6 +23,7 @@ impl Default for PortBindingConfig {
         Self {
             ports: Vec::new(),
             bind_address: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            reuse_port: false,
         }
     }
 }
@@ -28,7 +31,7 @@ impl Default for PortBindingConfig {
 /// Manages port binding and socket inheritance for zero-downtime restarts.
 ///
 /// Binds ports before spawning child processes and provides file descriptors
-/// for inheritance. Uses SO_REUSEPORT for graceful restarts without port conflicts.
+/// for inheritance. Each port is bound once, so restarts reuse the same sockets.
 pub struct PortManager {
     /// Configuration for port binding
     config: PortBindingConfig,
@@ -44,7 +47,7 @@ impl PortManager {
         }
     }
 
-    /// Binds the configured ports that aren't bound yet, with SO_REUSEPORT
+    /// Binds the configured ports that aren't bound yet
     pub fn bind_ports(&mut self) -> Result<()> {
         if self.config.ports.is_empty() {
             debug!("No ports configured for binding");
@@ -80,7 +83,12 @@ impl PortManager {
             Type::STREAM,
             Some(Protocol::TCP),
         )?;
-        setsockopt(&socket, ReusePort, &true)?;
+        // SO_REUSEADDR lets a restarted scinit rebind while connections from
+        // the previous one sit in TIME_WAIT, without sharing a live port
+        socket.set_reuse_address(true)?;
+        if self.config.reuse_port {
+            setsockopt(&socket, ReusePort, &true)?;
+        }
         socket.bind(&socket_addr.into())?;
         socket.listen(128)?;
 
@@ -123,6 +131,7 @@ impl PortManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix::sys::socket::getsockopt;
 
     fn ports(ports: Vec<u16>) -> PortBindingConfig {
         PortBindingConfig {
@@ -152,6 +161,30 @@ mod tests {
         assert!(manager.bind_ports().is_ok());
         let bound_count = manager.sockets.len();
         assert!((1..=2).contains(&bound_count));
+    }
+
+    /// (SO_REUSEADDR, SO_REUSEPORT) of the one socket bound with `reuse_port`
+    fn bound_socket_options(reuse_port: bool) -> (bool, bool) {
+        let mut manager = PortManager::new(PortBindingConfig {
+            reuse_port,
+            ..ports(vec![0])
+        });
+        manager.bind_ports().unwrap();
+        let socket = &manager.sockets[&0];
+        (
+            socket.reuse_address().unwrap(),
+            getsockopt(socket, ReusePort).unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_reuse_address_without_reuse_port_by_default() {
+        assert_eq!(bound_socket_options(false), (true, false));
+    }
+
+    #[test]
+    fn test_reuse_port_opt_in() {
+        assert_eq!(bound_socket_options(true), (true, true));
     }
 
     #[test]
