@@ -209,6 +209,11 @@ fn cmd_run(args: &[String]) -> ! {
     trap.retain(|s| !ignore.contains(s));
     exit_on.retain(|s| !ignore.contains(s));
 
+    // Block before reporting `started` (and before forking, so the grandchild
+    // inherits the mask): tests signal as soon as they see `started`, and a
+    // signal arriving before the block would take its default action
+    let set = block_signals(&trap);
+
     let mut role = "child";
     if grandchild {
         // Single-threaded at this point, so fork is safe
@@ -219,7 +224,7 @@ fn cmd_run(args: &[String]) -> ! {
     }
 
     report_started(role);
-    signal_loop(&trap, &exit_on);
+    wait_signals(&set, &trap, &exit_on);
 }
 
 fn cmd_exit(args: &[String]) -> ! {
@@ -325,6 +330,9 @@ fn cmd_dump(args: &[String]) -> ! {
     let mask = SigSet::thread_get_mask().expect("failed to read signal mask");
     let (open, sockets) = scan_fds();
 
+    // Blocked before reporting, like `run`, so a signal sent right after
+    // `started` waits for the loop below instead of killing the process
+    let set = block_signals(DEFAULT_TRAP);
     report_started("child");
 
     for (i, arg) in std::env::args().enumerate() {
@@ -367,7 +375,7 @@ fn cmd_dump(args: &[String]) -> ! {
     if then_exit {
         exit_reported(0);
     }
-    signal_loop(DEFAULT_TRAP, DEFAULT_EXIT_ON);
+    wait_signals(&set, DEFAULT_TRAP, DEFAULT_EXIT_ON);
 }
 
 /// A bound socket with no peer is a listener (SO_ACCEPTCONN is unreliable on macOS)
