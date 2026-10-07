@@ -4,7 +4,7 @@
 //! to the file named by `$SCINIT_TEST_REPORT`, so tests can observe what the
 //! child actually experienced (signals received, environment, fds, ...).
 //!
-//! Event format: `<name> pid=<pid> key=value ...`. A trailing `value=` field
+//! Event format: `<name> pid=<pid> t=<µs since epoch> key=value ...`. A trailing `value=` field
 //! extends to the end of the line and may contain spaces.
 //!
 //! Subcommands:
@@ -35,10 +35,13 @@ const DEFAULT_TRAP: &[Signal] = &[
 const DEFAULT_EXIT_ON: &[Signal] = &[Signal::SIGTERM, Signal::SIGINT, Signal::SIGQUIT];
 
 fn report(event: &str, fields: &str) {
+    // `t` (µs since the Unix epoch) lets tests time events by when they
+    // happened rather than when a poll noticed them; it precedes `fields`
+    // because a `value=` field must stay last
     let line = if fields.is_empty() {
-        format!("{} pid={}\n", event, unistd::getpid())
+        format!("{} pid={} t={}\n", event, unistd::getpid(), now_micros())
     } else {
-        format!("{} pid={} {}\n", event, unistd::getpid(), fields)
+        format!("{} pid={} t={} {}\n", event, unistd::getpid(), now_micros(), fields)
     };
     if let Ok(path) = std::env::var("SCINIT_TEST_REPORT") {
         // O_APPEND with a single write keeps lines atomic across processes
@@ -47,6 +50,13 @@ fn report(event: &str, fields: &str) {
         }
     }
     eprint!("[test-child] {}", line);
+}
+
+fn now_micros() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0)
 }
 
 fn report_started(role: &str) {
