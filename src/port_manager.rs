@@ -80,8 +80,14 @@ impl PortManager {
             self.config.bind_address
         );
 
+        // Sockets are bound once and kept for scinit's lifetime, so every
+        // child (including after a live-reload restart) gets the same
+        // listeners and connections queue in their backlog in between
         let ports = self.config.ports.clone();
         for &port in &ports {
+            if self.sockets.contains_key(&port) {
+                continue;
+            }
             self.bind_single_port(port).await?;
         }
 

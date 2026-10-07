@@ -368,7 +368,6 @@ fn child_exit_with_fast_reaper_is_not_restarted_and_exits() {
 /// arrive while no child is running must wait in the listener's backlog and
 /// be served by the new child, which requires passing it the same socket.
 #[test]
-#[ignore = "bug: socket-rebound-on-restart (KNOWN-ISSUES.md)"]
 fn restart_drops_no_connections() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;

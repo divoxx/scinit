@@ -108,39 +108,6 @@ kill -KILL $pid; pkill -f 'scinit-test-child run'
 **Fix sketch:** trailing-edge debounce: on each relevant change, (re)arm a
 timer for `--debounce-ms`, and restart when it fires with no newer change.
 
-### socket-rebound-on-restart
-
-**Description:** Live-reload restarts are not zero-downtime. Instead of
-handing the same listening sockets to every child, scinit binds new ones on
-each spawn (`SO_REUSEPORT` lets them share the port) and drops the old ones.
-Connections that arrive during the restart wait in the old socket's backlog
-and are reset when it is closed; while both sockets exist, the kernel also
-spreads new connections onto the one about to close. Observed: about 21 of 36
-connections reset across a single restart with `--restart-delay-ms 500`.
-
-**Location:** `src/process_manager.rs` `spawn_process` calls
-`PortManager::bind_ports` on every spawn; `src/port_manager.rs`
-`bind_single_port` replaces (and so closes) the previous socket in `sockets`.
-
-**Reproduction:**
-```bash
-mkdir -p /tmp/watch && echo v1 > /tmp/watch/app.conf
-$SCINIT --live-reload --watch-path /tmp/watch --restart-delay-ms 500 --ports 8080 $CHILD listen & pid=$!
-sleep 2
-(for i in $(seq 50); do nc -w1 127.0.0.1 8080 </dev/null || echo FAILED & sleep 0.02; done; wait) &
-echo v2 > /tmp/watch/app.conf; wait %2   # several FAILED lines
-kill -KILL $pid; pkill -f 'scinit-test-child listen'
-```
-
-**Affected tests:** see `#[ignore]` tests tagged with this anchor:
-`grep -rn 'bug: socket-rebound-on-restart' tests/`
-
-**Fix sketch:** bind once at startup and pass the same sockets to every
-child; only `spawn_process`'s first call binds. With one socket kept open
-across restarts the kernel queues connections while no child is accepting,
-and `SO_REUSEPORT` is no longer needed for restarts (consider defaulting it
-off so a second scinit can't silently share the port).
-
 ## Minor
 
 Smaller issues, not (yet) covered by `#[ignore]` tests:
