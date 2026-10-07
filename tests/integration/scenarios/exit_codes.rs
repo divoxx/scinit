@@ -45,6 +45,8 @@ fn child_self_signal_exits_128_plus_signo() {
 #[test]
 fn child_signal_is_logged_by_name() {
     let (scinit, status) = Scinit::builder()
+        // SCINIT_LOG once scinit stops reading RUST_LOG (#2); both until then
+        .env("SCINIT_LOG", "info")
         .env("RUST_LOG", "info")
         .child(["kill-self", "USR1"])
         .run(TIMEOUT)
