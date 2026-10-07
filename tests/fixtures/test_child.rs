@@ -17,10 +17,12 @@
 
 use nix::sys::signal::{self, SigHandler, SigSet, Signal};
 use nix::unistd::{self, ForkResult, Pid};
+use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::TcpListener;
 use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -296,6 +298,14 @@ fn join(fds: &[i32]) -> String {
         .join(",")
 }
 
+/// `value` as text, with the bytes of a non-UTF-8 value escaped (`\xff`)
+fn escape_non_utf8(value: &OsStr) -> String {
+    match value.to_str() {
+        Some(s) => s.to_string(),
+        None => value.as_bytes().escape_ascii().to_string(),
+    }
+}
+
 fn cmd_dump(args: &[String]) -> ! {
     let mut env_keys: Vec<String> = Vec::new();
     let mut then_exit = false;
@@ -321,9 +331,10 @@ fn cmd_dump(args: &[String]) -> ! {
         report("arg", &format!("index={} value={}", i, arg));
     }
 
-    for (key, value) in std::env::vars() {
-        if key.starts_with("LISTEN_") || env_keys.contains(&key) {
-            report("env", &format!("key={} value={}", key, value));
+    for (key, value) in std::env::vars_os() {
+        let key = key.to_string_lossy();
+        if key.starts_with("LISTEN_") || env_keys.iter().any(|k| *k == key) {
+            report("env", &format!("key={} value={}", key, escape_non_utf8(&value)));
         }
     }
     for key in &env_keys {

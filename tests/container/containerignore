@@ -1,4 +1,9 @@
-target
-.git
-.DS_Store
-**/*.swp
+# Allowlist: send only what the test image build needs. Everything else
+# (target/, .git, agent worktrees under .claude/, ...) stays out of the build
+# context, where it would only slow down `podman build` by gigabytes.
+*
+!Cargo.toml
+!Cargo.lock
+!.cargo
+!src
+!tests

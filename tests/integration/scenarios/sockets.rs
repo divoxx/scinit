@@ -2,8 +2,10 @@
 //! passes them via the systemd protocol (`LISTEN_FDS`, `LISTEN_PID`, fds 3..).
 
 use crate::integration::harness::{
-    env_value, free_ports, loopback, open_fds, socket_fds, Event, Scinit, TIMEOUT,
+    env_value, free_port, free_ports, loopback, open_fds, socket_fds, wait_for_pid_gone, Event,
+    Scinit, TIMEOUT,
 };
+use nix::sys::signal::Signal;
 use std::net::TcpListener;
 
 fn listen_fds_matches_port_count(n: usize) {
@@ -206,12 +208,8 @@ fn stray_inherited_fd_not_passed_with_ports() {
     assert_eq!(open_fds(&events), [0, 1, 2, 3, 4], "{}", scinit.diagnostics());
 }
 
-/// A port held by a listener without SO_REUSEPORT cannot be bound: scinit
-/// fails with exit 1 and never starts the child.
-///
-/// scinit sets SO_REUSEPORT on its own socket, but both sockets must set it
-/// for the bind to share the port, so EADDRINUSE is the correct outcome on
-/// both macOS and Linux.
+/// A port held by another listener cannot be bound: scinit fails with exit 1
+/// and never starts the child
 #[test]
 fn port_in_use_exits_1() {
     let holder = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -229,4 +227,85 @@ fn port_in_use_exits_1() {
     );
     scinit.assert_start_count(0, "child should not start when binding fails");
     drop(holder);
+}
+
+/// Start scinit with `args` and a `listen` child on `port`; wait until it answers
+fn start_listening(port: u16, args: &[&str]) -> (Scinit, i32) {
+    let scinit = Scinit::builder()
+        .args(args)
+        .ports(&[port])
+        .child(["listen"])
+        .spawn()
+        .unwrap();
+    scinit.wait_for_event("ready", TIMEOUT).unwrap();
+    let pid = scinit.child_pid().unwrap();
+    scinit.assert_reply_from(&loopback(port), pid);
+    (scinit, pid)
+}
+
+/// Without `--reuse-port`, a second scinit can't bind a port that a running
+/// scinit listens on
+#[test]
+fn second_scinit_cannot_share_port_by_default() {
+    let port = free_port();
+    let (_first, _) = start_listening(port, &[]);
+    let (second, status) = Scinit::builder()
+        .ports(&[port])
+        .child(["dump", "--then-exit"])
+        .run(TIMEOUT)
+        .unwrap();
+    second.assert_exit_code(status, 1);
+    assert!(
+        second.stderr().contains("Address already in use"),
+        "expected EADDRINUSE\n{}",
+        second.diagnostics()
+    );
+    second.assert_start_count(0, "child should not start when binding fails");
+}
+
+/// With `--reuse-port` on both, two scinits listen on the same port. Which
+/// one answers is up to the kernel (Linux load-balances across listeners,
+/// macOS prefers the latest), so only check that the second one bound.
+#[test]
+fn reuse_port_lets_two_scinits_share_port() {
+    let port = free_port();
+    let (_first, _) = start_listening(port, &["--reuse-port"]);
+    let second = Scinit::builder()
+        .args(["--reuse-port"])
+        .ports(&[port])
+        .child(["listen"])
+        .spawn()
+        .unwrap();
+    second.wait_for_event("ready", TIMEOUT).unwrap();
+    assert!(
+        second.listeners().iter().any(|(_, p)| *p == port),
+        "{}",
+        second.diagnostics()
+    );
+}
+
+/// A new scinit can bind a port right after the previous one exits, while the
+/// connections it served (and closed first) are still in TIME_WAIT
+#[test]
+fn rebind_after_serving_connections() {
+    let port = free_port();
+    let (first, pid) = start_listening(port, &[]);
+    for _ in 0..5 {
+        first.assert_reply_from(&loopback(port), pid);
+    }
+    // Stop it gracefully so scinit itself reaps the child. Killing scinit
+    // would orphan the child, and in the Linux test container the orphan is
+    // re-parented to `cargo test` (PID 1), which never reaps it.
+    let mut first = first;
+    first.signal(Signal::SIGTERM).unwrap();
+    first.wait_exit(TIMEOUT).unwrap();
+    assert!(wait_for_pid_gone(pid, TIMEOUT), "listen child {} still running", pid);
+
+    let (second, status) = Scinit::builder()
+        .ports(&[port])
+        .child(["dump", "--then-exit"])
+        .run(TIMEOUT)
+        .unwrap();
+    second.assert_exit_code(status, 0);
+    second.assert_start_count(1, "child should start once the port is bound");
 }
