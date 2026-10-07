@@ -364,6 +364,64 @@ fn child_exit_with_fast_reaper_is_not_restarted_and_exits() {
     }
 }
 
+/// No connection is refused or reset across a restart. Connections that
+/// arrive while no child is running must wait in the listener's backlog and
+/// be served by the new child, which requires passing it the same socket.
+#[test]
+#[ignore = "bug: socket-rebound-on-restart (KNOWN-ISSUES.md)"]
+fn restart_drops_no_connections() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{}", port);
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let file = dir.join("app.conf");
+    modify(&file, "v1");
+    // A long restart delay widens the window with no child accepting
+    let scinit = live_reload_with(b, &dir, 200, 500)
+        .args(["--ports", &port.to_string()])
+        .child(["listen"])
+        .spawn()
+        .unwrap();
+    scinit.wait_for_event("ready", TIMEOUT).unwrap();
+    std::thread::sleep(SETTLE);
+
+    // Keep connecting throughout the restart; each one runs on its own
+    // thread so connections queued in the backlog overlap
+    let stop = Arc::new(AtomicBool::new(false));
+    let client = {
+        let stop = stop.clone();
+        let addr = addr.clone();
+        std::thread::spawn(move || {
+            let mut attempts = Vec::new();
+            while !stop.load(Ordering::SeqCst) {
+                let addr = addr.clone();
+                attempts.push(std::thread::spawn(move || request(&addr).map_err(|e| e.to_string())));
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            attempts.into_iter().map(|t| t.join().unwrap()).collect::<Vec<_>>()
+        })
+    };
+
+    modify(&file, "v2");
+    scinit.wait_for_nth("ready", 2, TIMEOUT).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    stop.store(true, Ordering::SeqCst);
+    let results = client.join().unwrap();
+
+    let failures: Vec<&String> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {} connections failed across the restart: {:?}\n{}",
+        failures.len(),
+        results.len(),
+        failures,
+        scinit.diagnostics()
+    );
+}
+
 /// A listening child answers on the same port after a restart, from the new pid
 #[test]
 fn listener_survives_restart() {
