@@ -60,6 +60,13 @@ Smaller issues, not (yet) covered by `#[ignore]` tests:
   foreground group, but it isn't called again after a live-reload restart, so
   later children don't get Ctrl-C or terminal input when run interactively.
   No effect in containers without a TTY. Call it after every spawn.
+- **Stray inherited fds reach the child.** Any non-close-on-exec fd that
+  scinit itself inherited (e.g. sockets leaked by GitHub's macOS runner) is
+  passed on to the child, next to the activated sockets at 3... Container
+  runtimes start scinit with only stdio open, so this rarely matters there;
+  systemd closes everything except the passed fds. The test harness starts
+  scinit with a clean fd table. Consider marking all fds above 2 (other than
+  the activated sockets) close-on-exec in the child's `pre_exec`.
 - **`--zombie-reap-interval-ms 0` (probably) panics.** `tokio::time::interval`
   panics on a zero period. Reject 0 during argument parsing.
 - **`--live-reload` without `--watch-path` watches the command string.** The

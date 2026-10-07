@@ -210,6 +210,19 @@ impl ScinitBuilder {
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
+        // Start scinit with only stdio open, as in a container. Some hosts
+        // (e.g. GitHub's macOS runners) leak non-close-on-exec fds into every
+        // process, which would otherwise reach the child as stray sockets.
+        let max_fd = open_fd_limit();
+        unsafe {
+            cmd.pre_exec(move || {
+                for fd in 3..max_fd {
+                    // fcntl is async-signal-safe; unopened fds just fail
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+                Ok(())
+            });
+        }
 
         let mut child = cmd.spawn().context("failed to spawn scinit")?;
         let stdout = Arc::new(Mutex::new(String::new()));
@@ -252,6 +265,16 @@ impl ScinitBuilder {
         let mut scinit = self.spawn()?;
         let status = scinit.wait_exit(timeout)?;
         Ok((scinit, status))
+    }
+}
+
+/// Upper bound for fd numbers to scan, computed before forking
+fn open_fd_limit() -> i32 {
+    let limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    if limit > 0 {
+        limit.min(65536) as i32
+    } else {
+        1024
     }
 }
 
