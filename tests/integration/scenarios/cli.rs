@@ -62,6 +62,19 @@ fn invalid_bind_addr_exits_one() {
     );
 }
 
+/// scinit logs to stderr, leaving stdout to the child
+#[test]
+fn logs_go_to_stderr() {
+    let (scinit, status) = Scinit::builder()
+        .env("RUST_LOG", "info")
+        .command(["echo", "child-output"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 0);
+    assert!(scinit.stderr().contains("scinit starting"), "{}", scinit.diagnostics());
+    assert_eq!(scinit.stdout(), "child-output\n", "{}", scinit.diagnostics());
+}
+
 /// Args after the command, including ones that look like scinit flags, reach the child verbatim
 #[test]
 fn trailing_and_hyphenated_args_reach_child() {

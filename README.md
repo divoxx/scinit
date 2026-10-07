@@ -44,7 +44,7 @@ CMD ["my-server"]
 | `--ports <P1,P2,...>` | none | Ports to bind and pass to the child |
 | `--bind-addr <ADDR>` | `127.0.0.1` | Address to bind `--ports` on (IPv4 or IPv6) |
 
-Logging goes to stdout through `tracing` (see [KNOWN-ISSUES.md](KNOWN-ISSUES.md)). Only errors are shown by default; set `RUST_LOG=info` (or `debug`) for more.
+Logging goes to stderr through `tracing`, so stdout carries only the child's output. Only errors are shown by default; set `RUST_LOG=info` (or `debug`) for more.
 
 ## Behavior
 

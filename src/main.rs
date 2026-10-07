@@ -31,8 +31,9 @@ fn main() -> Result<()> {
     // Initialize error handling and logging
     color_eyre::install()?;
 
+    // Logs go to stderr, keeping stdout for the child's output
     tracing_subscriber::registry()
-        .with(fmt::layer())
+        .with(fmt::layer().with_writer(std::io::stderr))
         .with(EnvFilter::from_default_env())
         .init();
 

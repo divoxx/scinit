@@ -62,12 +62,6 @@ Smaller issues, not (yet) covered by `#[ignore]` tests:
   systemd closes everything except the passed fds. The test harness starts
   scinit with a clean fd table. Consider marking all fds above 2 (other than
   the activated sockets) close-on-exec in the child's `pre_exec`.
-- **scinit logs to stdout.** The `tracing` subscriber in `src/main.rs` uses
-  the default writer, so scinit's log lines are interleaved with the child's
-  stdout, which the child shares. Container log collectors can't separate
-  them, and anything parsing the child's stdout sees scinit's lines too.
-  Other inits (e.g. tini) log to stderr. Use
-  `fmt::layer().with_writer(std::io::stderr)`.
 - **`--zombie-reap-interval-ms 0` (probably) panics.** `tokio::time::interval`
   panics on a zero period. Reject 0 during argument parsing.
 - **`--live-reload` without `--watch-path` watches the command string.** The
