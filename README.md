@@ -44,7 +44,26 @@ CMD ["my-server"]
 | `--ports <P1,P2,...>` | none | Ports to bind and pass to the child |
 | `--bind-addr <ADDR>` | `127.0.0.1` | Address to bind `--ports` on (IPv4 or IPv6) |
 
-Logging goes to stdout through `tracing` (see [KNOWN-ISSUES.md](KNOWN-ISSUES.md)). Only errors are shown by default; set `RUST_LOG=info` (or `debug`) for more.
+### Logging
+
+scinit writes its own messages to **stderr** only, so stdout carries nothing but the child's output (`docker run img cmd | jq` stays clean). Lines use tracing's standard format, with the level and the `scinit` module that logged them:
+
+```
+ERROR scinit: Failed to spawn process 'my-app': No such file or directory (os error 2)
+ INFO scinit::process_manager: Spawning process: my-app ["--port", "8080"]
+```
+
+Lines carry no timestamp: container log drivers (Docker's `json-file`, Kubernetes' CRI log files, journald) record one per line, shown with `docker logs -t` or `kubectl logs --timestamps`. Attached runs (`docker run` without `-d`) and runs outside a container get none. Color is used only when stderr is a terminal (`NO_COLOR` turns it off).
+
+Verbosity is set with **`SCINIT_LOG`**, using [tracing's `EnvFilter` syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html). The default is `error`.
+
+```bash
+SCINIT_LOG=info scinit my-server                        # lifecycle events: spawn, restart, signals
+SCINIT_LOG=debug scinit my-server                       # everything
+SCINIT_LOG=scinit::file_watcher=debug scinit my-server  # one module
+```
+
+scinit doesn't read `RUST_LOG`: it's passed to the child unchanged, so setting it for your app doesn't make scinit verbose, and the other way around.
 
 ## Behavior
 

@@ -20,6 +20,7 @@ fn help_exits_zero() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Usage"), "help output missing usage:\n{}", stdout);
     assert!(stdout.contains("--live-reload"), "help output missing flags:\n{}", stdout);
+    assert!(stdout.contains("SCINIT_LOG"), "help output missing SCINIT_LOG:\n{}", stdout);
 }
 
 /// `--version` prints the crate version and exits 0
@@ -60,6 +61,73 @@ fn invalid_bind_addr_exits_one() {
         "{}",
         scinit.diagnostics()
     );
+}
+
+/// scinit logs to stderr, leaving stdout to the child
+#[test]
+fn logs_go_to_stderr() {
+    let (scinit, status) = Scinit::builder()
+        .env("SCINIT_LOG", "info")
+        .command(["echo", "child-output"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 0);
+    assert!(
+        scinit.stderr().contains("INFO scinit: scinit starting"),
+        "{}",
+        scinit.diagnostics()
+    );
+    assert_eq!(scinit.stdout(), "child-output\n", "{}", scinit.diagnostics());
+}
+
+/// `RUST_LOG` is the child's: it doesn't change scinit's verbosity and
+/// reaches the child unchanged
+#[test]
+fn rust_log_is_left_to_the_child() {
+    let (scinit, status) = Scinit::builder()
+        .env("RUST_LOG", "debug")
+        .command(["sh", "-c", "echo \"child RUST_LOG=$RUST_LOG\""])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 0);
+    assert_eq!(scinit.stdout(), "child RUST_LOG=debug\n", "{}", scinit.diagnostics());
+    // The child writes nothing to stderr, so any output there is scinit's
+    assert!(
+        scinit.stderr().is_empty(),
+        "scinit logged at RUST_LOG's level\n{}",
+        scinit.diagnostics()
+    );
+}
+
+/// Off a terminal, log lines carry no ANSI color codes
+#[test]
+fn logs_have_no_color_when_not_a_terminal() {
+    let (scinit, status) = Scinit::builder()
+        .env("SCINIT_LOG", "debug")
+        .command(["true"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 0);
+    let stderr = scinit.stderr();
+    assert!(stderr.contains("DEBUG scinit"), "{}", scinit.diagnostics());
+    assert!(!stderr.contains('\x1b'), "escape codes in logs:\n{:?}", stderr);
+}
+
+/// Fatal errors use the same format as other logs
+#[test]
+fn fatal_errors_are_logged_as_events() {
+    let (scinit, status) = Scinit::builder()
+        .command(["/nonexistent/scinit-no-such-binary"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 1);
+    let stderr = scinit.stderr();
+    assert!(
+        stderr.starts_with("ERROR scinit: Failed to spawn process"),
+        "{}",
+        scinit.diagnostics()
+    );
+    assert!(!stderr.contains('\x1b'), "escape codes in error:\n{:?}", stderr);
 }
 
 /// Args after the command, including ones that look like scinit flags, reach the child verbatim
@@ -112,4 +180,45 @@ fn nonexistent_command_exits_one() {
         .run(TIMEOUT)
         .unwrap();
     scinit.assert_exit_code(status, 1);
+}
+
+/// Run scinit with stderr on a pseudo-terminal and return what it wrote there
+fn stderr_on_terminal(envs: &[(&str, &str)]) -> String {
+    use std::io::Read;
+    let pty = nix::pty::openpty(None, None).expect("openpty");
+    let mut cmd = Command::new(SCINIT);
+    cmd.args(["true"])
+        .env("SCINIT_LOG", "info")
+        .env_remove("NO_COLOR")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(pty.slave));
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("failed to run scinit");
+    // The command holds our copy of the slave; drop it so reading the master
+    // ends once scinit (and its child) exit
+    drop(cmd);
+    let mut out = Vec::new();
+    let mut master = std::fs::File::from(pty.master);
+    // Linux reports the closed slave as EIO rather than EOF
+    let _ = master.read_to_end(&mut out);
+    child.wait().unwrap();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// On a terminal, log lines are colored (here: the green INFO level)
+#[test]
+fn logs_are_colored_on_a_terminal() {
+    let out = stderr_on_terminal(&[]);
+    assert!(out.contains("\x1b[32m INFO\x1b[0m"), "no colored level in:\n{:?}", out);
+}
+
+/// `NO_COLOR` turns color off even on a terminal
+#[test]
+fn no_color_disables_color_on_a_terminal() {
+    let out = stderr_on_terminal(&[("NO_COLOR", "1")]);
+    assert!(out.contains("INFO scinit: scinit starting"), "{:?}", out);
+    assert!(!out.contains('\x1b'), "escape codes despite NO_COLOR:\n{:?}", out);
 }
