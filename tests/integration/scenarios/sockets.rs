@@ -187,6 +187,30 @@ fn no_ports_no_listen_vars() {
     assert!(socket_fds(&events).is_empty(), "{}", scinit.diagnostics());
 }
 
+/// A clean run with `--ports` leaves nothing on scinit's stderr: closing the
+/// listeners at exit must not report errors (e.g. `shutdown()` on a listening
+/// socket fails with ENOTCONN on macOS)
+#[test]
+fn clean_exit_with_ports_reports_no_errors() {
+    let (scinit, status) = Scinit::builder()
+        .ports(&free_ports(2))
+        .child(["exit", "0"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 0);
+    let stderr = scinit.stderr();
+    let scinit_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|l| !l.starts_with("[test-child]"))
+        .collect();
+    assert!(
+        scinit_lines.is_empty(),
+        "unexpected scinit output on stderr: {:?}\n{}",
+        scinit_lines,
+        scinit.diagnostics()
+    );
+}
+
 /// A port held by a listener without SO_REUSEPORT cannot be bound: scinit
 /// fails with exit 1 and never starts the child.
 ///
