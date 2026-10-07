@@ -5,6 +5,7 @@ use crate::integration::harness::{
     env_value, free_port, free_ports, loopback, socket_fds, wait_for_pid_gone, Event, Scinit,
     TIMEOUT,
 };
+use nix::sys::signal::Signal;
 use std::net::TcpListener;
 
 fn listen_fds_matches_port_count(n: usize) {
@@ -243,12 +244,20 @@ fn second_scinit_cannot_share_port_by_default() {
     second.assert_start_count(0, "child should not start when binding fails");
 }
 
-/// With `--reuse-port` on both, two scinits listen on the same port
+/// With `--reuse-port` on both, two scinits listen on the same port. Which
+/// one answers is up to the kernel (Linux load-balances across listeners,
+/// macOS prefers the latest), so only check that the second one bound.
 #[test]
 fn reuse_port_lets_two_scinits_share_port() {
     let port = free_port();
     let (_first, _) = start_listening(port, &["--reuse-port"]);
-    let (second, _) = start_listening(port, &["--reuse-port"]);
+    let second = Scinit::builder()
+        .args(["--reuse-port"])
+        .ports(&[port])
+        .child(["listen"])
+        .spawn()
+        .unwrap();
+    second.wait_for_event("ready", TIMEOUT).unwrap();
     assert!(
         second.listeners().iter().any(|(_, p)| *p == port),
         "{}",
@@ -265,7 +274,12 @@ fn rebind_after_serving_connections() {
     for _ in 0..5 {
         first.assert_reply_from(&loopback(port), pid);
     }
-    drop(first);
+    // Stop it gracefully so scinit itself reaps the child. Killing scinit
+    // would orphan the child, and in the Linux test container the orphan is
+    // re-parented to `cargo test` (PID 1), which never reaps it.
+    let mut first = first;
+    first.signal(Signal::SIGTERM).unwrap();
+    first.wait_exit(TIMEOUT).unwrap();
     assert!(wait_for_pid_gone(pid, TIMEOUT), "listen child {} still running", pid);
 
     let (second, status) = Scinit::builder()
