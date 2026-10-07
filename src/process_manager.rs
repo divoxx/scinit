@@ -8,7 +8,6 @@ use crate::Result;
 use eyre::eyre;
 use nix::sys::signal::kill;
 use nix::unistd::{getpgid, Pid};
-use std::collections::HashMap;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::process::{Child, Command};
@@ -148,10 +147,8 @@ impl ProcessManager {
         command.stdout(Stdio::inherit());
         command.stderr(Stdio::inherit());
 
-        let mut env_vars = Environment::from(std::env::vars().collect::<HashMap<_, _>>());
-        env_vars.extend(overrides.clone());
-        command.env_clear();
-        command.envs(env_vars.into_inner());
+        // Inherited as is (non-UTF-8 variables included), plus the overrides
+        command.envs(overrides.clone().into_inner());
         command
     }
 
