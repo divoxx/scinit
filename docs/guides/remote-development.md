@@ -2,7 +2,7 @@
 
 In an organization with many services, running everything on a laptop is a hassle and often impossible: there are too many services, too much data, and too many dependencies on the real infrastructure. So development moves to a remote environment, a Docker host or a Kubernetes cluster, and the existing tools mostly take one of two routes. Some keep your service running on your laptop and route network traffic between it and the cluster, as [Telepresence](https://www.telepresence.io) does. Others, such as [Garden](https://garden.io) and [Tilt](https://tilt.dev), are built around a deploy loop: a change rebuilds the image and re-applies the manifests, and the cluster replaces the pods.
 
-scinit's live reload and socket inheritance were designed for a different approach. The service runs in the cluster, deployed once, and stays deployed: no traffic is routed to your laptop, and a code change doesn't touch the manifests or recreate the pod. Only the code moves, and the running process is swapped for the new build in place. This guide describes how such an environment fits together and what scinit's part in it is.
+scinit's live reload and socket inheritance were designed for a different approach. The service runs in the cluster and then can stay deployed, and only the code or binary needs to change: no traffic is routed to your laptop, a code change doesn't touch the manifests or recreate the pod, and the running process is swapped for the new build in place. This guide describes how such an environment fits together and what scinit's part in it is.
 
 ## The pieces
 
