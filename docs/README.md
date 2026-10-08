@@ -2,7 +2,7 @@
 
 These pages explain how scinit works and why it behaves the way it does. They are plain Markdown, written to be read on GitHub. If you only want to look up a flag, go straight to the [command-line reference](reference/cli.md).
 
-scinit is a container init: it does what tini and dumb-init do, bounds every shutdown with a SIGKILL deadline, and adds two features designed for development, live reload and socket inheritance. Those were built for remote development environments, where a service stays deployed in a Docker host or Kubernetes cluster and only its code moves: your edits are synchronized into the running container, rebuilt there, and scinit swaps the running process for the new build while keeping its listening sockets open. The same entrypoint then runs the service in production. The [README](../README.md) compares scinit with other inits and lists its use cases.
+scinit is a container init: it does what tini and dumb-init do, sends SIGKILL to your program when it doesn't exit within a timeout after a shutdown signal, and adds two features designed for development, live reload and socket inheritance. Those were built for remote development environments, where a service stays deployed in a Docker host or Kubernetes cluster and only its code moves: your edits are synchronized into the running container, rebuilt there, and scinit swaps the running process for the new build while keeping its listening sockets open. The same entrypoint then runs the service in production. The [README](../README.md) compares scinit with other inits and lists its use cases.
 
 The order below starts with getting scinit running and then works from the core job of an init towards the development features.
 

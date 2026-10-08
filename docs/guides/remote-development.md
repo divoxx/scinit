@@ -6,7 +6,7 @@ scinit's live reload and socket inheritance were designed for a different approa
 
 ## The pieces
 
-A development environment built this way has four moving parts, and scinit is deliberately the smallest of them. A deployment tool sets up the development pod once: an application container whose entrypoint is scinit, a build sidecar next to it, and a volume the two share. A file-sync tool such as [Mutagen](https://mutagen.io), or something simpler, keeps the source code inside the pod in step with your editor. The build sidecar watches those sources, recompiles the program when they change, and writes the new binary into the shared volume. scinit runs the program in the application container and owns two things: the running process, and the listening sockets clients connect to.
+A development environment built this way has four parts, and scinit has the narrowest responsibility of them. A deployment tool sets up the development pod once: an application container whose entrypoint is scinit, a build sidecar next to it, and a volume the two share. A file-sync tool such as [Mutagen](https://mutagen.io), or something simpler, keeps the source code inside the pod in step with your editor. The build sidecar watches those sources, recompiles the program when they change, and writes the new binary into the shared volume. scinit runs the program in the application container and owns two things: the running process, and the listening sockets clients connect to.
 
 ```mermaid
 flowchart LR
@@ -44,7 +44,7 @@ sequenceDiagram
     New->>C: accept and answer the queued connection
 ```
 
-Restarting a server normally leaves a window in which nothing listens on its port, and every client in that window, from your browser to a `kubectl port-forward` to another service in the cluster, gets "connection refused". With `--ports`, scinit binds the listening sockets itself before starting your program and passes the same sockets to every new process, using the systemd socket-activation protocol. A connection made during a restart waits in the socket's backlog and is answered by the new build, so from the outside the service never went away. [Socket activation](socket-activation.md) explains the protocol, how your program picks the sockets up, and how restarts look to Kubernetes probes.
+Restarting a server normally leaves a window in which nothing listens on its port, and every client in that window, from your browser to a `kubectl port-forward` to another service in the cluster, gets "connection refused". With `--ports`, scinit binds the listening sockets itself before starting your program and passes the same sockets to every new process, using the systemd socket-activation protocol. A connection made during a restart waits in the socket's backlog and is answered by the new build, so clients don't see the restart as an error. [Socket activation](socket-activation.md) explains the protocol, how your program picks the sockets up, and how restarts look to Kubernetes probes.
 
 ## From development to production
 

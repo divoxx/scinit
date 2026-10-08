@@ -26,7 +26,7 @@ scinit is built for Linux containers, and it also runs on macOS so that you can 
 
 ## A first run
 
-The smallest useful thing scinit can do is run one command and get out of the way:
+The simplest use of scinit is to run one command and exit with its status:
 
 ```
 $ scinit -- echo hello

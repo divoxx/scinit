@@ -1,6 +1,6 @@
 # Logging
 
-An init sits in an awkward place for logging. Everything the container prints is your application's output, and that is what you want to read. Anything the init adds has to stay out of the way: it must not touch the app's stdout, it must not fill the logs during normal operation, and it must be easy to tell apart from the app's own lines. But when something goes wrong, such as a restart that didn't happen or a shutdown that took 30 seconds, the init is the only one that knows why.
+An init's own log output shares the container's output streams with your application. Everything the container prints is your application's output, and that is what you want to read. Anything the init adds has to stay out of the way: it must not touch the app's stdout, it must not fill the logs during normal operation, and it must be easy to tell apart from the app's own lines. But when something goes wrong, such as a restart that didn't happen or a shutdown that took 30 seconds, the init is the only one that knows why.
 
 So scinit is quiet by default and detailed on request. It only prints errors unless you ask for more with the `SCINIT_LOG` environment variable. It writes to stderr only, never stdout, and every line names the part of scinit that wrote it.
 
