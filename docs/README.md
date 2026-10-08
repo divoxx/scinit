@@ -1,6 +1,10 @@
 # scinit documentation
 
-These pages explain how scinit works and why it behaves the way it does. They are plain Markdown, written to be read on GitHub. If you only want to look up a flag, go straight to the [command-line reference](reference/cli.md). Otherwise, the order below starts with getting scinit running and then works from the core job of an init towards the development features.
+These pages explain how scinit works and why it behaves the way it does. They are plain Markdown, written to be read on GitHub. If you only want to look up a flag, go straight to the [command-line reference](reference/cli.md).
+
+scinit exists to make remote development environments feel local. When there are too many services to run on a laptop, you develop against a Docker host or a Kubernetes cluster instead: your edits are synchronized into a container, rebuilt there (often by a sidecar container), and the running service has to pick up the new build without anything connected to it noticing. scinit runs as that container's init, restarts the service when a new build lands ([live reload](guides/live-reload.md)) and keeps its listening sockets open across the restart ([socket activation](guides/socket-activation.md)). Underneath, it is a complete container init, so the same entrypoint works in production. The [README](../README.md) has a diagram of this setup.
+
+The order below starts with getting scinit running and then works from the core job of an init towards the development features.
 
 ## Start here
 

@@ -109,7 +109,7 @@ The same applies to Ctrl-C in a terminal. When scinit runs attached to a termina
 
 ## A first live-reload loop
 
-scinit can also restart your program when its files change, which makes it a small development loop. Create a script that stands in for a server: it prints its version and then waits.
+scinit can also restart your program when its files change. This is what it was built for: in a remote development environment, a new build of your service lands in the container and scinit swaps the running process for it (the [README](../README.md) shows the full setup). Locally, the same mechanism makes a small development loop. Create a script that stands in for a server: it prints its version and then waits.
 
 ```bash
 mkdir scinit-demo && cd scinit-demo
@@ -158,4 +158,4 @@ With it, scinit binds port 8080 once and hands the same socket to every new proc
 
 ## Next steps
 
-If you are putting scinit into production images, read [Why a container needs an init](guides/why-an-init.md), [Signals and shutdown](guides/signals-and-shutdown.md) and [Exit codes](guides/exit-codes.md) next. If you are setting up a development loop, continue with [Live reload](guides/live-reload.md) and [Socket activation](guides/socket-activation.md). [Logging](guides/logging.md) helps when something doesn't behave as you expect, and the [command-line reference](reference/cli.md) lists every option. The [documentation index](README.md) has the full list.
+If you are putting scinit into production images, read [Why a container needs an init](guides/why-an-init.md), [Signals and shutdown](guides/signals-and-shutdown.md) and [Exit codes](guides/exit-codes.md) next. If you are setting up a development environment, continue with [Live reload](guides/live-reload.md) and [Socket activation](guides/socket-activation.md). [Logging](guides/logging.md) helps when something doesn't behave as you expect, and the [command-line reference](reference/cli.md) lists every option. The [documentation index](README.md) has the full list.

@@ -1,8 +1,10 @@
 # Live reload
 
-When you develop inside a container, the edit-and-test loop has an awkward step in the middle. You change a file, and then something has to stop the old process and start a new one. Restarting the whole container works, but it is slow, it drops every open connection, and it often means leaving your editor. Running a separate file watcher inside the container is better, but that watcher then becomes PID 1 or has to be supervised by one, and you are back to the problems an init exists to solve.
+Live reload is the reason scinit exists. When a system has too many services to run on a laptop, development moves to a remote environment: you edit code locally, the changes are synchronized into a container in a Docker host or Kubernetes cluster, the code is rebuilt there, and the running service has to pick up the new build. A typical setup is a development pod in which a sidecar container recompiles the program whenever its sources change and writes the new binary into a volume shared with the application container.
 
-scinit already sits between the container runtime and your application, so it can do this job itself. With `--live-reload`, it watches a path and, when the contents change, stops the child the same way `docker stop` would and starts a fresh one. Combined with [socket activation](socket-activation.md), clients connecting during the restart wait in the kernel's queue instead of being refused.
+That last step, swapping the running process for the new build, is awkward to do from outside. Restarting the whole container or pod is slow, drops every open connection, and in Kubernetes can mean rescheduling. Running a separate file watcher inside the container is better, but that watcher then becomes PID 1 or has to be supervised by one, and you are back to the problems an init exists to solve.
+
+scinit already sits between the container runtime and your application, so it does this job itself. With `--live-reload`, it watches a path (by default the program's own executable) and, when the contents change, stops the child the same way `docker stop` would and starts a fresh one from the new build. Combined with [socket activation](socket-activation.md), clients connecting during the restart, whether a browser, a `kubectl port-forward` or another service in the cluster, wait in the kernel's queue instead of being refused.
 
 ## How a change becomes a restart
 

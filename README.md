@@ -1,14 +1,27 @@
 # scinit
 
-A small init system for containers, written in Rust. scinit runs as the container's PID 1, starts your program as its one child, and handles what an init has to: forwarding signals, shutting down gracefully, reaping zombies, and exiting with the child's status. It can also restart the child when files change (live reload), and pass it listening sockets using the systemd socket-activation protocol, so restarts don't drop connections.
+A small init system for containers, written in Rust, built to make remote development environments feel local. scinit runs as the container's PID 1 and starts your program as its one child. It does what any container init has to: forwarding signals, shutting down gracefully, reaping zombies, and exiting with the child's status. On top of that, it restarts your program when a new build of it lands in the container (live reload), and it keeps the program's listening sockets open across those restarts (socket inheritance), so nothing connected to it notices the swap.
 
 ## Why scinit
 
-The first process in a container runs as PID 1, and the kernel treats PID 1 differently from every other process. A signal that PID 1 has not installed a handler for is simply dropped, so the default action that would normally terminate a process never happens. Most programs don't install a SIGTERM handler because they rely on that default, which is why a server run directly as the container's command often ignores `docker stop`: Docker waits out its 10 second timeout and then kills it with SIGKILL, skipping any cleanup.
+In an organization with many services, running everything on a laptop is a hassle and often impossible: there are too many services, too much data, and too many dependencies on the real infrastructure. The alternative is to develop against a remote environment, a Docker host or a Kubernetes cluster, and tools such as [Garden](https://garden.io), [Tilt](https://tilt.dev) and [Telepresence](https://www.telepresence.io) each take a different approach to that. The common shape is this: you edit code locally, the changes are synchronized into a container in the cluster (with [Mutagen](https://mutagen.io) or something like it), the code is rebuilt there, and the running service picks up the new build.
 
-PID 1 also inherits every orphaned process in the container. When a process exits, its parent has to collect its exit status with `wait()`, or it stays in the process table as a zombie. A server that spawns helpers (a shell script, a worker pool, a health check) and doesn't expect to be an init never collects the orphans that get re-parented to it, and the zombies pile up.
+scinit is the piece that does the last step. A typical setup is a development pod where a sidecar container recompiles the program whenever synchronized sources change, and writes the binary into a volume shared with the application container. scinit runs the application, notices the new binary and restarts it.
 
-scinit sits in front of your program and does that job. It handles the signals, forwards them to your program's process group, escalates to SIGKILL if the program doesn't exit within a timeout, reaps orphans, and exits with your program's exit code, so the orchestrator can tell a crash from a clean shutdown. That is the same job [tini](https://github.com/krallin/tini) and [dumb-init](https://github.com/Yelp/dumb-init) do. scinit adds a development loop on top: with `--live-reload` it restarts your program when its files change, and with `--ports` it binds the listening sockets itself and hands the same sockets to every restarted child, so clients wait in the socket's backlog during a restart instead of getting "connection refused".
+```mermaid
+flowchart LR
+    Dev["Your editor"] -- "file sync" --> Builder
+    subgraph Pod["Development pod"]
+        Builder["Build sidecar"] -- "new binary" --> Vol[("Shared volume")]
+        Vol -- "change detected" --> scinit["scinit (PID 1)"]
+        scinit -- "restart, same sockets" --> App["Your service"]
+    end
+    Clients["Browser, port-forward,<br/>other services"] -- "connections" --> scinit
+```
+
+Restarting a server normally means a window in which nothing listens on its port, and every client in that window, from a browser to a `kubectl port-forward` to another service in the cluster, gets "connection refused". With `--ports`, scinit binds the listening sockets itself and hands the same sockets to every new process, so connections made during a restart wait in the socket's backlog and are answered by the new build. From the outside, the service never went away.
+
+Underneath, scinit is still a proper init. The kernel treats PID 1 differently from every other process: a signal PID 1 has no handler for is simply dropped, so a server run directly as the container's command often ignores `docker stop` until it is killed with SIGKILL, and orphaned processes are re-parented to PID 1 and stay zombies unless it collects them. scinit handles the signals, forwards them to your program's process group, escalates to SIGKILL after a timeout, reaps orphans, and exits with your program's exit code, the same job [tini](https://github.com/krallin/tini) and [dumb-init](https://github.com/Yelp/dumb-init) do. Without live reload, a crash still ends the container, so the same image and entrypoint work in production.
 
 ## Examples
 
