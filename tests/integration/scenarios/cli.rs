@@ -281,3 +281,93 @@ fn zero_zombie_reap_interval_exits_two() {
         scinit.diagnostics()
     );
 }
+
+/// Write a script to `dir` that prints each of its arguments on its own line
+fn print_args_script(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("print-args");
+    std::fs::write(&path, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Flags right after the command name, even ones scinit has, reach the child
+/// instead of being parsed by scinit
+#[test]
+fn flags_right_after_the_command_reach_child() {
+    let builder = Scinit::builder();
+    let script = print_args_script(&builder.dir());
+    let (scinit, status) = builder
+        .command([
+            script.into_os_string(),
+            "--help".into(),
+            "-V".into(),
+            "--ports".into(),
+            "9".into(),
+            "hi".into(),
+        ])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 0);
+    assert_eq!(
+        scinit.stdout(),
+        "--help\n-V\n--ports\n9\nhi\n",
+        "{}",
+        scinit.diagnostics()
+    );
+}
+
+/// scinit's options before the command are its own; the same option after
+/// the command is the child's
+#[test]
+fn options_split_at_the_command_name() {
+    let builder = Scinit::builder();
+    let script = print_args_script(&builder.dir());
+    let (scinit, status) = builder
+        .args(["--graceful-timeout-secs", "3"])
+        .command([
+            script.into_os_string(),
+            "--graceful-timeout-secs".into(),
+            "not-a-number".into(),
+        ])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 0);
+    assert_eq!(
+        scinit.stdout(),
+        "--graceful-timeout-secs\nnot-a-number\n",
+        "{}",
+        scinit.diagnostics()
+    );
+}
+
+/// After `--`, the command and all its args (including another `--`) reach the child
+#[test]
+fn double_dash_before_the_command_is_consumed_once() {
+    let builder = Scinit::builder();
+    let script = print_args_script(&builder.dir());
+    let (scinit, status) = builder
+        .args(["--"])
+        .command([script.into_os_string(), "--".into(), "--help".into()])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 0);
+    assert_eq!(scinit.stdout(), "--\n--help\n", "{}", scinit.diagnostics());
+}
+
+/// A misspelled scinit option is a usage error (exit 2), not taken as the command
+#[test]
+fn misspelled_option_exits_two() {
+    let (scinit, status) = Scinit::builder()
+        .args(["--live-relaod"])
+        .child(["exit", "0"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 2);
+    scinit.assert_start_count(0, "child must not start after a usage error");
+    assert!(
+        scinit.stderr().contains("--live-relaod"),
+        "{}",
+        scinit.diagnostics()
+    );
+}
