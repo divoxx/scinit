@@ -26,10 +26,14 @@ Environment:
               The error that ends scinit is printed whatever the filter.
 
               Logs go to stderr only, one event per line, without
-              timestamps:
-                ERROR scinit: Failed to spawn process 'my-app': ...
-                 INFO scinit::process_manager: Spawning process: ...
-              Colored only when stderr is a terminal and NO_COLOR is unset.
+              timestamps, as a level tag, `scinit:` and the message:
+                [fail]  scinit: Failed to spawn process 'my-app': ...
+                [info]  scinit: Spawning process: ...
+                  [ok]  scinit: Process spawned with PID: 42
+              At debug and trace, the module (such as
+              scinit::file_watcher) replaces `scinit:`. Colored only
+              when stderr is a terminal (or CLICOLOR_FORCE is set to
+              other than 0) and NO_COLOR is unset.
 
               scinit does not read RUST_LOG; it reaches the child
               unchanged.")]

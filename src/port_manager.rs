@@ -1,4 +1,5 @@
 use crate::environment::Environment;
+use crate::logging::ok;
 use crate::Result;
 use nix::sys::socket::{setsockopt, sockopt::ReusePort};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -71,7 +72,7 @@ impl PortManager {
             self.bind_single_port(port)?;
         }
 
-        info!("Successfully bound {} ports", self.sockets.len());
+        ok!("Successfully bound {} ports", self.sockets.len());
         Ok(())
     }
 

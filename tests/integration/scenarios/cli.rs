@@ -90,7 +90,7 @@ fn logs_go_to_stderr() {
         .unwrap();
     scinit.assert_exit_code(status, 0);
     assert!(
-        scinit.stderr().contains("INFO scinit: scinit starting"),
+        scinit.stderr().contains("scinit: scinit starting"),
         "{}",
         scinit.diagnostics()
     );
@@ -136,12 +136,41 @@ fn logs_have_no_color_when_not_a_terminal() {
         .unwrap();
     scinit.assert_exit_code(status, 0);
     let stderr = scinit.stderr();
-    assert!(stderr.contains("DEBUG scinit"), "{}", scinit.diagnostics());
+    assert!(
+        stderr.contains("starting tokio runtime"),
+        "{}",
+        scinit.diagnostics()
+    );
     assert!(
         !stderr.contains('\x1b'),
         "escape codes in logs:\n{:?}",
         stderr
     );
+}
+
+/// Each line has a right-aligned status tag, then `scinit`, or the module at
+/// debug and trace
+#[test]
+fn log_lines_have_a_status_tag_and_name_scinit() {
+    let (scinit, status) = Scinit::builder()
+        .env("SCINIT_LOG", "info,scinit::process_manager=debug")
+        .command(["true"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 0);
+    let stderr = scinit.stderr();
+    for expected in [
+        "[info]  scinit: scinit starting",
+        "  [ok]  scinit: Process spawned with PID: ",
+        " [dbg]  scinit::process_manager: Process exited with status",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "missing {:?}\n{}",
+            expected,
+            scinit.diagnostics()
+        );
+    }
 }
 
 /// Fatal errors use the same format as other logs
@@ -154,7 +183,7 @@ fn fatal_errors_are_logged_as_events() {
     scinit.assert_exit_code(status, 1);
     let stderr = scinit.stderr();
     assert!(
-        stderr.starts_with("ERROR scinit: Failed to spawn process"),
+        stderr.starts_with("[fail]  scinit: Failed to spawn process"),
         "{}",
         scinit.diagnostics()
     );
@@ -225,6 +254,7 @@ fn stderr_on_terminal(envs: &[(&str, &str)]) -> String {
     cmd.args(["true"])
         .env("SCINIT_LOG", "info")
         .env_remove("NO_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(pty.slave));
@@ -243,13 +273,13 @@ fn stderr_on_terminal(envs: &[(&str, &str)]) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// On a terminal, log lines are colored (here: the green INFO level)
+/// On a terminal, log lines are colored (here: the cyan `[info]` tag)
 #[test]
 fn logs_are_colored_on_a_terminal() {
     let out = stderr_on_terminal(&[]);
     assert!(
-        out.contains("\x1b[32m INFO\x1b[0m"),
-        "no colored level in:\n{:?}",
+        out.contains("\x1b[36m[info]\x1b[0m"),
+        "no colored tag in:\n{:?}",
         out
     );
 }
@@ -258,12 +288,30 @@ fn logs_are_colored_on_a_terminal() {
 #[test]
 fn no_color_disables_color_on_a_terminal() {
     let out = stderr_on_terminal(&[("NO_COLOR", "1")]);
-    assert!(out.contains("INFO scinit: scinit starting"), "{:?}", out);
+    assert!(out.contains("scinit: scinit starting"), "{:?}", out);
     assert!(
         !out.contains('\x1b'),
         "escape codes despite NO_COLOR:\n{:?}",
         out
     );
+}
+
+/// `CLICOLOR_FORCE` turns color on off a terminal, unless `NO_COLOR` is set
+#[test]
+fn clicolor_force_colors_logs_off_a_terminal() {
+    let run = |envs: &[(&str, &str)]| {
+        let mut builder = Scinit::builder().env("SCINIT_LOG", "info");
+        for (k, v) in envs {
+            builder = builder.env(k, v);
+        }
+        let (scinit, status) = builder.command(["true"]).run(TIMEOUT).unwrap();
+        scinit.assert_exit_code(status, 0);
+        scinit.stderr()
+    };
+    let stderr = run(&[("CLICOLOR_FORCE", "1")]);
+    assert!(stderr.contains("\x1b[36m[info]\x1b[0m"), "{:?}", stderr);
+    let stderr = run(&[("CLICOLOR_FORCE", "1"), ("NO_COLOR", "1")]);
+    assert!(!stderr.contains('\x1b'), "{:?}", stderr);
 }
 
 /// A zero `--zombie-reap-interval-ms` is a usage error (exit 2), not a panic, and the child never starts
@@ -392,7 +440,7 @@ fn fatal_error_is_shown_whatever_scinit_log_says() {
     for value in ["", "off", "scinit::reaper=debug", "inf"] {
         let stderr = spawn_failure_stderr(value);
         assert!(
-            stderr.contains("ERROR scinit: Failed to spawn process"),
+            stderr.contains("Failed to spawn process"),
             "no fatal error with SCINIT_LOG={:?}:\n{}",
             value,
             stderr
@@ -406,7 +454,7 @@ fn fatal_error_is_shown_whatever_scinit_log_says() {
 fn bare_word_that_is_not_a_level_warns_and_is_kept() {
     let stderr = spawn_failure_stderr("inf");
     assert!(
-        stderr.contains("WARN scinit::logging: SCINIT_LOG: \"inf\" is not a level"),
+        stderr.contains("[warn]  scinit: SCINIT_LOG: \"inf\" is not a level"),
         "{}",
         stderr
     );
@@ -414,8 +462,7 @@ fn bare_word_that_is_not_a_level_warns_and_is_kept() {
     // The rest of the value still applies
     let stderr = spawn_failure_stderr("info,deubg");
     assert!(
-        stderr.contains("\"deubg\" is not a level")
-            && stderr.contains("INFO scinit: scinit starting"),
+        stderr.contains("\"deubg\" is not a level") && stderr.contains("scinit: scinit starting"),
         "{}",
         stderr
     );
@@ -434,7 +481,7 @@ fn default_level_shows_warnings() {
     assert!(
         scinit
             .stderr()
-            .contains("WARN scinit::process_manager: Graceful shutdown timeout, forcing kill"),
+            .contains("[warn]  scinit: Graceful shutdown timeout, forcing kill"),
         "{}",
         scinit.diagnostics()
     );
