@@ -4,7 +4,7 @@ When a process exits, it doesn't disappear right away. The kernel keeps a small 
 
 Normally the parent reaps its own children. The trouble starts when a parent exits before its child: the child becomes an orphan and is reparented, usually to PID 1. In a container, PID 1 is whatever the image's entrypoint runs, and an application that never expected to adopt other processes won't reap them. Each one stays a zombie until the container stops, holding a PID. Containers often run with a PID limit, and a steady trickle of zombies from shell scripts, health checks or helper processes can eventually exhaust it, at which point nothing in the container can fork.
 
-When scinit is PID 1, orphans are reparented to scinit, and it reaps them.
+When scinit is PID 1, orphans are reparented to scinit, and it reaps them. On Linux this also holds when scinit is not PID 1, because scinit registers itself as a child subreaper (see [Things to know](#things-to-know)).
 
 ```mermaid
 flowchart TB
@@ -12,7 +12,7 @@ flowchart TB
     A --> W["helper started by the app"]
     W --> O["process started by the helper"]
     W -. "helper exits first" .-> X["helper is gone"]
-    O -. "orphan is reparented to PID 1" .-> S
+    O -. "orphan is reparented to scinit" .-> S
     S -. "orphan exits, scinit reaps it" .-> R["no zombie left"]
 ```
 
@@ -60,21 +60,13 @@ The orphan was reparented to scinit, reaped as soon as it exited, and is gone fr
 
 ## Things to know
 
-scinit only receives orphans when it is PID 1. Linux lets any process volunteer to adopt orphans from its descendants by marking itself a child subreaper (`PR_SET_CHILD_SUBREAPER`), but scinit doesn't do this. If something else is PID 1, orphans skip scinit and go to that process instead. Here scinit runs under a shell that `exec`s into `sleep`, and the orphan ends up a zombie under PID 1 even though scinit is running:
+On Linux, scinit marks itself a child subreaper (`PR_SET_CHILD_SUBREAPER`) at startup, before it starts the child. The kernel reparents an orphan to its nearest living ancestor that is a subreaper, and only to PID 1 when there is none, so orphans of the child come to scinit even when something else is PID 1: under the runtime's own init (`docker run --init`), in a Kubernetes pod with `shareProcessNamespace: true`, where the pause container is PID 1, or when scinit runs outside a container. The reaping passes above, including the final one, then cover those orphans too. If the kernel refuses the call, scinit logs a warning and continues, and orphans go to PID 1 as they would without it. The flag is not inherited by the child.
 
-```console
-$ podman run -d --name z3 scinit-demo \
-    sh -c 'scinit -- sh -c "(sleep 1 &); exec sleep infinity" & exec sleep infinity'
-$ podman exec z3 ps -eo pid,ppid,stat,comm
-    PID    PPID STAT COMMAND
-      1       0 Ss   sleep
-      2       1 Sl   scinit
-     10       2 S    sleep
-     13       1 Z    sleep
-     14       0 Rs   ps
-```
+macOS has no equivalent, so there scinit only receives orphans when it is PID 1. Outside a container, which is how scinit runs on macOS, orphans go to launchd, which reaps them.
 
-In practice this means: make scinit the container's entrypoint (`ENTRYPOINT ["scinit", "--"]`), and don't also enable the runtime's own init (`docker run --init`), which would take PID 1. Outside a container, orphans go to the host's init or to your session's subreaper, which reap them as usual, so there is nothing for scinit to do.
+Being a subreaper only changes where orphans go while scinit is running. scinit doesn't wait for live orphans before exiting. In a container where scinit is PID 1 the kernel kills them when it exits; otherwise they are reparented again, to PID 1 or the next subreaper above scinit, and keep running.
+
+Making scinit the container's entrypoint (`ENTRYPOINT ["scinit", "--"]`) is still the recommended setup, since signal handling and the container's exit code depend on scinit being PID 1 (see [why an init](why-an-init.md)). Also enabling the runtime's init is harmless but adds nothing.
 
 Lowering `--zombie-reap-interval-ms` is rarely useful, since SIGCHLD already triggers a pass whenever a child exits; the periodic pass is only a safety net. The value must be at least 1.
 

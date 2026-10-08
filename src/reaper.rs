@@ -1,5 +1,5 @@
-//! Zombie reaping for scinit's children other than the managed one, which
-//! matters when scinit runs as PID 1 and inherits orphans.
+//! Zombie reaping for scinit's children other than the managed one: the
+//! orphans scinit inherits as PID 1 or, on Linux, as a child subreaper.
 
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
@@ -12,6 +12,19 @@ use tracing::{debug, warn};
 /// The zombie reaper must leave this process alone: its exit status belongs to
 /// tokio's `child.wait()`, which fails with ECHILD if the reaper takes it first.
 static MANAGED_CHILD: AtomicI32 = AtomicI32::new(0);
+
+/// Marks scinit as a child subreaper, so orphans of its descendants are
+/// reparented to scinit and reaped here even when it isn't PID 1. Linux
+/// only; macOS has no equivalent, so there it does nothing. Not inherited by
+/// the child: the flag is cleared on fork.
+pub fn become_subreaper() {
+    #[cfg(target_os = "linux")]
+    match nix::sys::prctl::set_child_subreaper(true) {
+        Ok(()) => debug!("registered as child subreaper"),
+        // Orphans then go to PID 1 or another subreaper, as without the flag
+        Err(e) => warn!("failed to register as child subreaper: {}", e),
+    }
+}
 
 /// Marks `pid` as the managed child
 pub fn set_managed_child(pid: Pid) {
@@ -178,5 +191,16 @@ mod tests {
         runtime.shutdown_background();
 
         assert_eq!(reaped, Err(Errno::ECHILD), "zombie {pid} was not reaped");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn become_subreaper_sets_the_flag() {
+        // The flag would make this process adopt the orphans of other tests
+        if !isolated("reaper::tests::become_subreaper_sets_the_flag") {
+            return;
+        }
+        become_subreaper();
+        assert_eq!(nix::sys::prctl::get_child_subreaper(), Ok(true));
     }
 }

@@ -87,7 +87,7 @@ Beyond that, scinit takes care of a few things about the environment the child s
 
 ## Things to know
 
-scinit only takes on the init's duties when it actually is PID 1. It doesn't register itself as a child subreaper, so if something else is PID 1 (for example because you also passed `docker run --init`, or because you run scinit outside a container), orphans are reparented to that process, not to scinit. Running two inits is harmless but pointless; pick one.
+The kernel's special treatment of signals and the container's exit status only apply when scinit actually is PID 1. Reaping does not depend on it on Linux: scinit registers itself as a child subreaper, so orphans of the child are reparented to scinit even if something else is PID 1 (for example because you also passed `docker run --init`). On macOS, which has no subreaper mechanism, orphans go to launchd. Running two inits is harmless but pointless; pick one.
 
 The kernel's protection of PID 1 also applies to scinit. scinit installs handling for the signals it cares about (SIGTERM, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2 and SIGHUP), so those arrive. Signals outside that set, such as SIGWINCH or SIGTSTP, are not forwarded to the child. They take their default action on scinit itself, which, when scinit is PID 1, means the kernel discards them.
 

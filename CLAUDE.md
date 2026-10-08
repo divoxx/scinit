@@ -60,7 +60,7 @@ cargo run -- --live-reload --debounce-ms 1000 --restart-delay-ms 500 my-app
 - **`ProcessManager`** (`src/process_manager.rs`): Spawns, monitors, restarts and stops the child, and forwards signals to its process group. The child's lifecycle is a `ChildState` enum (`NotStarted` / `Running(ManagedChild)` / `Exited { status }`). Every spawn hands the terminal to the new child, which takes the foreground itself before exec (`src/terminal.rs`)
 - **`SignalHandler`** (`src/signals.rs`): Receives signals only: masks the handled signals on all threads and consumes them on a dedicated `sigwait` thread, never blocking critical signals (SIGFPE, SIGILL, SIGSEGV, etc.)
 - **`FileWatcher`** (`src/file_watcher.rs`): Live-reload file watching using the `notify` crate, with a trailing-edge debounce
-- **`reaper`** (`src/reaper.rs`): Zombie reaping, leaving the managed child to tokio's `Child::wait()`
+- **`reaper`** (`src/reaper.rs`): Zombie reaping, leaving the managed child to tokio's `Child::wait()`. On Linux, `become_subreaper` sets `PR_SET_CHILD_SUBREAPER` at startup, so orphans of the child are reparented to scinit even when it isn't PID 1
 - **`exit_status`** (`src/exit_status.rs`): Maps the child's status to scinit's exit code (code, or 128 + signal)
 - **`PortManager`** (`src/port_manager.rs`): Socket inheritance system for zero-downtime restarts, binding each port once and keeping it for scinit's lifetime
 - **`fds`** (`src/fds.rs`): Marks the fds scinit inherited (other than stdio) close-on-exec in the child, so it only gets stdio and the activated sockets
@@ -98,9 +98,9 @@ The live-reload system integrates:
 ## Testing Infrastructure
 
 - **Unit Tests**: Individual component testing in each module
-- **Fixture child** (`tests/fixtures/test_child.rs`, bin `scinit-test-child`): purpose-built child that scinit runs in tests. It appends events (`started`, `signal`, `env`, `fds`, `sigmask`, `exit`, ...) to the file in `$SCINIT_TEST_REPORT`. Subcommands: `run` (trap/ignore signals), `exit <code>`, `kill-self <SIG>`, `dump` (argv, `LISTEN_*` env, fds, signal mask), `listen` (answers on inherited sockets), `spawn-orphan` (PID 1 reaping check)
+- **Fixture child** (`tests/fixtures/test_child.rs`, bin `scinit-test-child`): purpose-built child that scinit runs in tests. It appends events (`started`, `signal`, `env`, `fds`, `sigmask`, `exit`, ...) to the file in `$SCINIT_TEST_REPORT`. Subcommands: `run` (trap/ignore signals), `exit <code>`, `kill-self <SIG>`, `dump` (argv, `LISTEN_*` env, fds, signal mask), `listen` (answers on inherited sockets), `spawn-orphan` (reports the orphan's new parent and whether it was reaped)
 - **Harness** (`tests/integration/harness.rs`): `Scinit::builder()` spawns the real scinit binary with the fixture as child (with only stdio open), captures stdout/stderr, and offers builder shortcuts (`start`, `spawn_dump`, `ports`, `watch`), polling helpers (`wait_for`, `wait_for_nth_match`, `wait_exit`, `poll_until`) and assertions (`assert_exit_code`, `assert_start_count`, `assert_reply_from`) instead of fixed sleeps. Plain `#[test]`, no tokio
-- **Scenarios** (`tests/integration/scenarios/`): `cli`, `exit_codes`, `signals`, `sockets`, `live_reload`, and `linux` (Linux only: `/proc` checks and scinit as PID 1 via `unshare`). All compile into the single `integration_test` target
+- **Scenarios** (`tests/integration/scenarios/`): `cli`, `exit_codes`, `signals`, `sockets`, `live_reload`, and `linux` (Linux only: `/proc` checks, subreaper reaping, and scinit as PID 1 via `unshare`). All compile into the single `integration_test` target
 - **Linux runner** (`scripts/test-linux.sh`, `tests/container/Containerfile`): builds a test image and runs `cargo test` in rootless podman (args pass through), with the permissions the `linux` PID-1 tests need; `SCINIT_REQUIRE_PID1=1` makes them fail rather than skip
 - **CI** (`.github/workflows/ci.yml`): on every PR and push to `main`, runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` on macOS and Linux, `cargo test` on a macOS runner and `scripts/test-linux.sh` on an Ubuntu runner
 
@@ -129,5 +129,6 @@ The `listen` fixture mode verifies socket inheritance end to end:
 - **Signal masking**: Block handled signals on the main thread before any other thread exists; never block critical/synchronous signals or SIGCHLD
 - **Signal handling**: Consume handled signals only on the dedicated sigwait thread; never call `sigwait` from per-iteration tasks (cancelled waits leave threads that swallow signals)
 - Zombie reaping runs in background tasks to avoid blocking main loop, except the final pass before scinit exits (`reap_before_exit`, on every exit path), which runs inline so it completes before the runtime shuts down
+- On Linux scinit is a child subreaper (`PR_SET_CHILD_SUBREAPER`, set in `run` before anything is spawned; a failure only logs a warning), so it adopts orphans whether or not it is PID 1 and the reaper must handle any number of children besides the managed one. macOS has no equivalent
 - Terminal signals (SIGTTIN, SIGTTOU) are ignored in scinit to prevent blocking in containers. The child resets every disposition to `SIG_DFL` before exec, after taking the terminal's foreground itself (which needs SIGTTOU still ignored)
 - scinit's own logs (`src/logging.rs`) go to stderr only, in tracing's standard format without timestamps (`LEVEL scinit::module: message`; color only on a terminal), filtered by `SCINIT_LOG` (default `error`); never read `RUST_LOG`, which belongs to the child. Fatal errors are logged the same way
