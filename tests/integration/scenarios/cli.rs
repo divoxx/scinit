@@ -18,9 +18,21 @@ fn help_exits_zero() {
     let out = scinit_output(&["--help"]);
     assert_eq!(out.status.code(), Some(0), "{:?}", out);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Usage"), "help output missing usage:\n{}", stdout);
-    assert!(stdout.contains("--live-reload"), "help output missing flags:\n{}", stdout);
-    assert!(stdout.contains("SCINIT_LOG"), "help output missing SCINIT_LOG:\n{}", stdout);
+    assert!(
+        stdout.contains("Usage"),
+        "help output missing usage:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("--live-reload"),
+        "help output missing flags:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("SCINIT_LOG"),
+        "help output missing SCINIT_LOG:\n{}",
+        stdout
+    );
 }
 
 /// `--version` prints the crate version and exits 0
@@ -43,7 +55,11 @@ fn missing_command_exits_two() {
     let out = scinit_output(&[]);
     assert_eq!(out.status.code(), Some(2), "{:?}", out);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("COMMAND") || stderr.contains("command"), "{}", stderr);
+    assert!(
+        stderr.contains("COMMAND") || stderr.contains("command"),
+        "{}",
+        stderr
+    );
 }
 
 /// An unparseable `--bind-addr` fails config validation (exit 1) before the child starts
@@ -77,7 +93,12 @@ fn logs_go_to_stderr() {
         "{}",
         scinit.diagnostics()
     );
-    assert_eq!(scinit.stdout(), "child-output\n", "{}", scinit.diagnostics());
+    assert_eq!(
+        scinit.stdout(),
+        "child-output\n",
+        "{}",
+        scinit.diagnostics()
+    );
 }
 
 /// `RUST_LOG` is the child's: it doesn't change scinit's verbosity and
@@ -90,7 +111,12 @@ fn rust_log_is_left_to_the_child() {
         .run(TIMEOUT)
         .unwrap();
     scinit.assert_exit_code(status, 0);
-    assert_eq!(scinit.stdout(), "child RUST_LOG=debug\n", "{}", scinit.diagnostics());
+    assert_eq!(
+        scinit.stdout(),
+        "child RUST_LOG=debug\n",
+        "{}",
+        scinit.diagnostics()
+    );
     // The child writes nothing to stderr, so any output there is scinit's
     assert!(
         scinit.stderr().is_empty(),
@@ -110,7 +136,11 @@ fn logs_have_no_color_when_not_a_terminal() {
     scinit.assert_exit_code(status, 0);
     let stderr = scinit.stderr();
     assert!(stderr.contains("DEBUG scinit"), "{}", scinit.diagnostics());
-    assert!(!stderr.contains('\x1b'), "escape codes in logs:\n{:?}", stderr);
+    assert!(
+        !stderr.contains('\x1b'),
+        "escape codes in logs:\n{:?}",
+        stderr
+    );
 }
 
 /// Fatal errors use the same format as other logs
@@ -127,7 +157,11 @@ fn fatal_errors_are_logged_as_events() {
         "{}",
         scinit.diagnostics()
     );
-    assert!(!stderr.contains('\x1b'), "escape codes in error:\n{:?}", stderr);
+    assert!(
+        !stderr.contains('\x1b'),
+        "escape codes in error:\n{:?}",
+        stderr
+    );
 }
 
 /// Args after the command, including ones that look like scinit flags, reach the child verbatim
@@ -212,7 +246,11 @@ fn stderr_on_terminal(envs: &[(&str, &str)]) -> String {
 #[test]
 fn logs_are_colored_on_a_terminal() {
     let out = stderr_on_terminal(&[]);
-    assert!(out.contains("\x1b[32m INFO\x1b[0m"), "no colored level in:\n{:?}", out);
+    assert!(
+        out.contains("\x1b[32m INFO\x1b[0m"),
+        "no colored level in:\n{:?}",
+        out
+    );
 }
 
 /// `NO_COLOR` turns color off even on a terminal
@@ -220,7 +258,11 @@ fn logs_are_colored_on_a_terminal() {
 fn no_color_disables_color_on_a_terminal() {
     let out = stderr_on_terminal(&[("NO_COLOR", "1")]);
     assert!(out.contains("INFO scinit: scinit starting"), "{:?}", out);
-    assert!(!out.contains('\x1b'), "escape codes despite NO_COLOR:\n{:?}", out);
+    assert!(
+        !out.contains('\x1b'),
+        "escape codes despite NO_COLOR:\n{:?}",
+        out
+    );
 }
 
 /// A zero `--zombie-reap-interval-ms` is a usage error (exit 2), not a panic, and the child never starts

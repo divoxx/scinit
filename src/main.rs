@@ -48,7 +48,10 @@ fn run() -> Result<i32> {
 
     // Before any other thread exists, so every thread inherits the mask
     let mut signal_handler = SignalHandler::install()?;
-    debug!("blocked signals {:?} on all threads", signal_handler.handled_signals());
+    debug!(
+        "blocked signals {:?} on all threads",
+        signal_handler.handled_signals()
+    );
 
     debug!("starting tokio runtime");
     let rt = tokio::runtime::Builder::new_multi_thread()

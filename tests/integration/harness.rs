@@ -325,7 +325,10 @@ pub fn let_setup_writes_age() {
 }
 
 /// Copy everything read from `src` into `dst` on a background thread
-pub(crate) fn drain(mut src: impl Read + Send + 'static, dst: Arc<Mutex<String>>) -> JoinHandle<()> {
+pub(crate) fn drain(
+    mut src: impl Read + Send + 'static,
+    dst: Arc<Mutex<String>>,
+) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -403,17 +406,27 @@ impl Scinit {
     }
 
     /// Wait until at least `n` events match `pred`; return the `n`th
-    pub fn wait_for_nth_match<F>(&self, desc: &str, n: usize, timeout: Duration, pred: F) -> Result<Event>
+    pub fn wait_for_nth_match<F>(
+        &self,
+        desc: &str,
+        n: usize,
+        timeout: Duration,
+        pred: F,
+    ) -> Result<Event>
     where
         F: Fn(&Event) -> bool,
     {
-        let events = self.wait_for(desc, timeout, |evs| evs.iter().filter(|e| pred(e)).count() >= n)?;
+        let events = self.wait_for(desc, timeout, |evs| {
+            evs.iter().filter(|e| pred(e)).count() >= n
+        })?;
         Ok(events.into_iter().filter(|e| pred(e)).nth(n - 1).unwrap())
     }
 
     /// Wait until at least `count` events named `name` exist; return the last
     pub fn wait_for_nth(&self, name: &str, count: usize, timeout: Duration) -> Result<Event> {
-        self.wait_for_nth_match(&format!("{} x{}", name, count), count, timeout, |e| e.is(name))
+        self.wait_for_nth_match(&format!("{} x{}", name, count), count, timeout, |e| {
+            e.is(name)
+        })
     }
 
     pub fn wait_for_event(&self, name: &str, timeout: Duration) -> Result<Event> {
@@ -422,8 +435,10 @@ impl Scinit {
 
     /// Wait for the `dump` child to finish reporting; return the events
     pub fn wait_for_dump(&self) -> Vec<Event> {
-        self.wait_for("dump-done", TIMEOUT, |evs| evs.iter().any(|e| e.is("dump-done")))
-            .unwrap()
+        self.wait_for("dump-done", TIMEOUT, |evs| {
+            evs.iter().any(|e| e.is("dump-done"))
+        })
+        .unwrap()
     }
 
     /// Wait for the child to report `started` and return its pid
@@ -459,13 +474,22 @@ impl Scinit {
 
     /// Wait for `pid` to log a received `sig`
     pub fn wait_for_signal(&self, pid: i32, sig: Signal, timeout: Duration) -> Result<Event> {
-        self.wait_for_nth_match(&format!("pid {} to receive {}", pid, sig), 1, timeout, |e| {
-            is_signal(e, pid, sig)
-        })
+        self.wait_for_nth_match(
+            &format!("pid {} to receive {}", pid, sig),
+            1,
+            timeout,
+            |e| is_signal(e, pid, sig),
+        )
     }
 
     /// Wait until `pid` has logged `sig` at least `count` times
-    pub fn wait_for_signal_count(&self, pid: i32, sig: Signal, count: usize, timeout: Duration) -> Result<()> {
+    pub fn wait_for_signal_count(
+        &self,
+        pid: i32,
+        sig: Signal,
+        count: usize,
+        timeout: Duration,
+    ) -> Result<()> {
         self.wait_for_nth_match(
             &format!("pid {} to receive {} x{}", pid, sig, count),
             count,
@@ -490,8 +514,9 @@ impl Scinit {
 
     /// Request `addr` and assert the `listen` child `pid` answered; returns the reply
     pub fn assert_reply_from(&self, addr: &str, pid: i32) -> String {
-        let reply = request(addr)
-            .unwrap_or_else(|e| panic!("request to {} failed: {}\n{}", addr, e, self.diagnostics()));
+        let reply = request(addr).unwrap_or_else(|e| {
+            panic!("request to {} failed: {}\n{}", addr, e, self.diagnostics())
+        });
         assert!(
             reply.starts_with(&format!("pid={} ", pid)),
             "reply {:?} from {} did not come from child {}\n{}",
@@ -603,7 +628,11 @@ impl Drop for Scinit {
         if running {
             let _ = kill(self.pid, Signal::SIGSTOP);
         }
-        let mut groups: Vec<i32> = if running { child_pids(self.pid) } else { Vec::new() };
+        let mut groups: Vec<i32> = if running {
+            child_pids(self.pid)
+        } else {
+            Vec::new()
+        };
         groups.extend(
             self.events_named("started")
                 .iter()

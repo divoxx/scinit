@@ -67,7 +67,10 @@ impl FileWatcher {
 
     /// Waits up to `timeout_duration` for the next event
     #[cfg(test)]
-    pub async fn wait_for_event(&mut self, timeout_duration: Duration) -> Result<Option<FileChangeEvent>> {
+    pub async fn wait_for_event(
+        &mut self,
+        timeout_duration: Duration,
+    ) -> Result<Option<FileChangeEvent>> {
         match tokio::time::timeout(timeout_duration, self.event_rx.recv()).await {
             Ok(Some(event)) => Ok(Some(event)),
             Ok(None) => Ok(None), // Channel closed
@@ -188,7 +191,10 @@ mod tests {
         fs::write(&test_file, "test content").unwrap();
 
         // Wait for the file change event
-        let event = watcher.wait_for_event(Duration::from_millis(1000)).await.unwrap();
+        let event = watcher
+            .wait_for_event(Duration::from_millis(1000))
+            .await
+            .unwrap();
         assert!(event.is_some());
 
         if let Some(FileChangeEvent::FileChanged(path)) = event {
@@ -219,11 +225,17 @@ mod tests {
         }
 
         // Should only get one event due to debouncing
-        let event = watcher.wait_for_event(Duration::from_millis(1000)).await.unwrap();
+        let event = watcher
+            .wait_for_event(Duration::from_millis(1000))
+            .await
+            .unwrap();
         assert!(event.is_some());
 
         // Should not get more events immediately
-        let event2 = watcher.wait_for_event(Duration::from_millis(200)).await.unwrap();
+        let event2 = watcher
+            .wait_for_event(Duration::from_millis(200))
+            .await
+            .unwrap();
         assert!(event2.is_none());
     }
 
@@ -239,7 +251,9 @@ mod tests {
 
         // Test file modification event
         let event = notify::Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Data(notify::event::DataChange::Content)),
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
             paths: vec![test_file],
             attrs: notify::event::EventAttributes::default(),
         };
@@ -251,7 +265,9 @@ mod tests {
         std::fs::create_dir(&test_dir).unwrap();
 
         let event = notify::Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Data(notify::event::DataChange::Content)),
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
             paths: vec![test_dir],
             attrs: notify::event::EventAttributes::default(),
         };
@@ -275,7 +291,9 @@ mod tests {
         };
 
         // Creating an empty file on macOS: Create + Modify(Metadata(Extended))
-        assert!(!FileWatcher::is_relevant_change(&event(EventKind::Create(CreateKind::File))));
+        assert!(!FileWatcher::is_relevant_change(&event(EventKind::Create(
+            CreateKind::File
+        ))));
         assert!(!FileWatcher::is_relevant_change(&event(EventKind::Modify(
             ModifyKind::Metadata(MetadataKind::Extended)
         ))));

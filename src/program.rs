@@ -29,7 +29,10 @@ mod tests {
 
     #[test]
     fn test_resolve_program() {
-        assert_eq!(resolve_program("/bin/sh").unwrap(), PathBuf::from("/bin/sh"));
+        assert_eq!(
+            resolve_program("/bin/sh").unwrap(),
+            PathBuf::from("/bin/sh")
+        );
         assert!(resolve_program("sh").unwrap().ends_with("sh"));
         assert!(resolve_program("scinit-definitely-not-a-command").is_err());
     }

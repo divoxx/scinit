@@ -154,10 +154,12 @@ impl Config {
 
     /// Get file watch configuration if live-reload is enabled
     pub fn file_watch_config(&self) -> Option<FileWatchConfig> {
-        self.live_reload.as_ref().map(|live_reload| FileWatchConfig {
-            watch_path: live_reload.watch_path.clone(),
-            debounce: live_reload.debounce,
-        })
+        self.live_reload
+            .as_ref()
+            .map(|live_reload| FileWatchConfig {
+                watch_path: live_reload.watch_path.clone(),
+                debounce: live_reload.debounce,
+            })
     }
 }
 

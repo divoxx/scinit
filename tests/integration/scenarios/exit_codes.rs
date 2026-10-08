@@ -15,7 +15,10 @@ fn child_exit_zero() {
 /// Child exits 42 → scinit exits 42
 #[test]
 fn child_exit_code_propagates() {
-    let (scinit, status) = Scinit::builder().child(["exit", "42"]).run(TIMEOUT).unwrap();
+    let (scinit, status) = Scinit::builder()
+        .child(["exit", "42"])
+        .run(TIMEOUT)
+        .unwrap();
     scinit.child_pid().unwrap();
     scinit.assert_exit_code(status, 42);
 }
@@ -36,7 +39,11 @@ fn child_self_signal_exits_128_plus_signo() {
         .child(["kill-self", "TERM"])
         .run(TIMEOUT)
         .unwrap();
-    assert!(!scinit.events_named("raise").is_empty(), "{}", scinit.diagnostics());
+    assert!(
+        !scinit.events_named("raise").is_empty(),
+        "{}",
+        scinit.diagnostics()
+    );
     scinit.assert_exit_code(status, 143);
 }
 
@@ -54,7 +61,12 @@ fn child_signal_is_logged_by_name() {
     scinit.assert_exit_code(status, 128 + Signal::SIGUSR1 as i32);
     let expected = format!("terminated by signal {} (SIGUSR1)", Signal::SIGUSR1 as i32);
     let logs = scinit.stdout() + &scinit.stderr();
-    assert!(logs.contains(&expected), "missing {:?}\n{}", expected, scinit.diagnostics());
+    assert!(
+        logs.contains(&expected),
+        "missing {:?}\n{}",
+        expected,
+        scinit.diagnostics()
+    );
 }
 
 /// Repeated clean exits never surface as failures (e.g. the background
@@ -79,7 +91,9 @@ fn repeated_clean_exits_stay_zero() {
 fn sigterm_with_clean_child_exit_exits_zero() {
     let (mut scinit, pid) = Scinit::builder().child(["run"]).start();
     scinit.signal(Signal::SIGTERM).unwrap();
-    scinit.wait_for_signal(pid, Signal::SIGTERM, TIMEOUT).unwrap();
+    scinit
+        .wait_for_signal(pid, Signal::SIGTERM, TIMEOUT)
+        .unwrap();
     let status = scinit.wait_exit(TIMEOUT).unwrap();
     scinit.assert_exit_code(status, 0);
 }

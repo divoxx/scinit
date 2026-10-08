@@ -43,7 +43,13 @@ fn report(event: &str, fields: &str) {
     let line = if fields.is_empty() {
         format!("{} pid={} t={}\n", event, unistd::getpid(), now_micros())
     } else {
-        format!("{} pid={} t={} {}\n", event, unistd::getpid(), now_micros(), fields)
+        format!(
+            "{} pid={} t={} {}\n",
+            event,
+            unistd::getpid(),
+            now_micros(),
+            fields
+        )
     };
     if let Ok(path) = std::env::var("SCINIT_TEST_REPORT") {
         // O_APPEND with a single write keeps lines atomic across processes
@@ -92,7 +98,8 @@ fn last_reported_field(key: &str) -> Option<String> {
 
 /// The argument following `flag`
 fn flag_value<'a>(it: &mut impl Iterator<Item = &'a String>, flag: &str) -> &'a str {
-    it.next().unwrap_or_else(|| panic!("{} needs a value", flag))
+    it.next()
+        .unwrap_or_else(|| panic!("{} needs a value", flag))
 }
 
 fn parse_signal(name: &str) -> Signal {
@@ -342,7 +349,10 @@ fn cmd_dump(args: &[String]) -> ! {
     for (key, value) in std::env::vars_os() {
         let key = key.to_string_lossy();
         if key.starts_with("LISTEN_") || env_keys.iter().any(|k| *k == key) {
-            report("env", &format!("key={} value={}", key, escape_non_utf8(&value)));
+            report(
+                "env",
+                &format!("key={} value={}", key, escape_non_utf8(&value)),
+            );
         }
     }
     for key in &env_keys {
@@ -351,7 +361,10 @@ fn cmd_dump(args: &[String]) -> ! {
         }
     }
 
-    report("fds", &format!("open={} sockets={}", join(&open), join(&sockets)));
+    report(
+        "fds",
+        &format!("open={} sockets={}", join(&open), join(&sockets)),
+    );
 
     let blocked: Vec<&str> = Signal::iterator()
         .filter(|s| mask.contains(*s))

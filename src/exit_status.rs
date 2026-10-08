@@ -40,10 +40,16 @@ fn log_child_exit(status: ExitStatus) {
     if status.success() {
         info!("Child process exited successfully, scinit exiting cleanly");
     } else if let Some(code) = status.code() {
-        info!("Child process exited with error code {}, scinit exiting", code);
+        info!(
+            "Child process exited with error code {}, scinit exiting",
+            code
+        );
     } else if let Some(signal) = status.signal() {
-        info!("Child process terminated by signal {} ({}), scinit exiting",
-              signal, signal_name(signal));
+        info!(
+            "Child process terminated by signal {} ({}), scinit exiting",
+            signal,
+            signal_name(signal)
+        );
     } else {
         info!("Child process terminated by signal, scinit exiting");
     }

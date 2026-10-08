@@ -73,7 +73,9 @@ fn usr1_forwarded_to_grandchild_in_group() {
     scinit
         .wait_for_signal(grandchild.pid(), Signal::SIGUSR1, TIMEOUT)
         .unwrap();
-    scinit.wait_for_signal(pid, Signal::SIGUSR1, TIMEOUT).unwrap();
+    scinit
+        .wait_for_signal(pid, Signal::SIGUSR1, TIMEOUT)
+        .unwrap();
     scinit.assert_running_for(Duration::from_millis(300));
 }
 
@@ -126,7 +128,9 @@ fn sigterm_forwarded_then_scinit_exits() {
     let (mut scinit, pid) = Scinit::builder().child(["run"]).start();
     let start = Instant::now();
     scinit.signal(Signal::SIGTERM).unwrap();
-    scinit.wait_for_signal(pid, Signal::SIGTERM, TIMEOUT).unwrap();
+    scinit
+        .wait_for_signal(pid, Signal::SIGTERM, TIMEOUT)
+        .unwrap();
     let status = scinit.wait_exit(EXIT_BOUND).unwrap();
     assert!(
         start.elapsed() < Duration::from_secs(3),
@@ -166,7 +170,10 @@ fn assert_escalates_to_sigkill(sig: Signal) {
         sig,
         elapsed
     );
-    assert!(scinit.events_named("exit").is_empty(), "child should not exit by itself");
+    assert!(
+        scinit.events_named("exit").is_empty(),
+        "child should not exit by itself"
+    );
 }
 
 #[test]
@@ -189,7 +196,11 @@ fn assert_termination_forwarded(sig: Signal) {
     scinit.signal(sig).unwrap();
     scinit.wait_for_signal(pid, sig, TIMEOUT).unwrap();
     scinit.wait_exit(EXIT_BOUND).unwrap();
-    assert!(wait_for_pid_gone(pid, Duration::from_secs(3)), "child {} still alive", pid);
+    assert!(
+        wait_for_pid_gone(pid, Duration::from_secs(3)),
+        "child {} still alive",
+        pid
+    );
 }
 
 #[test]
@@ -239,7 +250,13 @@ fn child_inherits_ignored_ttin_ttou() {
             .iter()
             .find(|e| e.is("sigdisp") && e.field_is("sig", sig))
             .unwrap_or_else(|| panic!("no sigdisp for {}\n{}", sig, scinit.diagnostics()));
-        assert_eq!(disp.get("ignored"), Some("true"), "{}\n{}", sig, scinit.diagnostics());
+        assert_eq!(
+            disp.get("ignored"),
+            Some("true"),
+            "{}\n{}",
+            sig,
+            scinit.diagnostics()
+        );
     }
 }
 

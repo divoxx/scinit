@@ -147,7 +147,9 @@ fn child_env(overrides: Environment) -> Vec<OsString> {
         env.retain(|(k, _)| k != key.as_str());
         env.push((key.into(), value.into()));
     }
-    env.iter().map(|(key, value)| env_entry(key, value)).collect()
+    env.iter()
+        .map(|(key, value)| env_entry(key, value))
+        .collect()
 }
 
 /// `key=value`, as `execve` expects it

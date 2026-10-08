@@ -96,7 +96,9 @@ fn file_modify_restarts_child() {
 
     let new = scinit.wait_for_nth("started", 2, TIMEOUT).unwrap().pid();
     assert_ne!(old, new, "restart must spawn a new process");
-    scinit.wait_for_signal(old, Signal::SIGTERM, TIMEOUT).unwrap();
+    scinit
+        .wait_for_signal(old, Signal::SIGTERM, TIMEOUT)
+        .unwrap();
     assert!(
         scinit.is_running(),
         "scinit must survive the restart\n{}",
@@ -130,7 +132,9 @@ fn restart_delay_is_respected() {
     modify(&file, "v2");
 
     let exited = scinit
-        .wait_for_nth_match("old child exit", 1, TIMEOUT, |e| e.is("exit") && e.pid() == old)
+        .wait_for_nth_match("old child exit", 1, TIMEOUT, |e| {
+            e.is("exit") && e.pid() == old
+        })
         .unwrap();
     let started = scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
     // From the events' own timestamps, so polling delays don't skew it
@@ -168,7 +172,10 @@ fn burst_of_writes_restarts_once() {
     scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
     // Well past debounce + restart delay: any second restart would show up
     scinit.assert_running_for(QUIET);
-    scinit.assert_start_count(2, "a burst within the debounce window must restart exactly once");
+    scinit.assert_start_count(
+        2,
+        "a burst within the debounce window must restart exactly once",
+    );
 }
 
 /// A change made inside the debounce window that follows a restart must still
@@ -313,7 +320,9 @@ fn hammer(addr: &str, stop: &AtomicBool) -> Vec<Result<String, String>> {
     let mut attempts = Vec::new();
     while !stop.load(Ordering::SeqCst) {
         let addr = addr.to_string();
-        attempts.push(std::thread::spawn(move || request(&addr).map_err(|e| e.to_string())));
+        attempts.push(std::thread::spawn(move || {
+            request(&addr).map_err(|e| e.to_string())
+        }));
         std::thread::sleep(Duration::from_millis(20));
     }
     attempts.into_iter().map(|t| t.join().unwrap()).collect()

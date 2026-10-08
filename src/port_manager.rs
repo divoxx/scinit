@@ -112,7 +112,11 @@ impl PortManager {
     /// The configured ports in `--ports` order, without repeats
     fn unique_ports(&self) -> impl Iterator<Item = u16> + '_ {
         let mut seen = HashSet::new();
-        self.config.ports.iter().copied().filter(move |&port| seen.insert(port))
+        self.config
+            .ports
+            .iter()
+            .copied()
+            .filter(move |&port| seen.insert(port))
     }
 
     /// `LISTEN_FDS` for the child, or nothing if no sockets are bound.
