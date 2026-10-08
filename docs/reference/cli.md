@@ -29,6 +29,7 @@ A misspelled scinit option before the command is still an error (exit 2), not mi
 | `--zombie-reap-interval-ms <N>` | `5000` | Interval of the periodic sweep that reaps orphaned processes. Orphans are also reaped as soon as SIGCHLD arrives, so this is a fallback. Must be at least 1; `0` is a usage error. |
 | `--live-reload` | off | Restart the child when `--watch-path` changes. |
 | `--watch-path <PATH>` | the command's executable | The file, or directory (not recursive), to watch for changes. Without it, scinit watches the executable that `<COMMAND>` refers to, looked up in `PATH` the way exec does, and exits with an error if it can't find it. |
+| `--watch-poll[=<MS>]` | off; `250` when given without a value | Check the watch path for changes every `<MS>` milliseconds instead of using the kernel's file notifications, for setups that don't deliver them (such as bind mounts on podman machine). Must be at least 10. The value needs the `=` (`--watch-poll=1000`). Requires `--live-reload`. |
 | `--debounce-ms <N>` | `500` | How long the watched path has to stay quiet after a change before the restart happens. Every new change starts the wait over. |
 | `--restart-delay-ms <N>` | `1000` | Pause between the old child exiting and the new one starting during a live-reload restart. |
 | `--ports <PORT>[,<PORT>...]` | none | TCP ports to bind and pass to the child as file descriptors 3, 4, ... in the order given. Takes a comma-separated list, and the flag can be repeated (`--ports 8080 --ports 8081` is the same as `--ports 8080,8081`). Each port must be between 0 and 65535. |
@@ -37,7 +38,7 @@ A misspelled scinit option before the command is still an error (exit 2), not mi
 | `-h`, `--help` | | Print help, including a summary of `SCINIT_LOG`, and exit with code 0. |
 | `-V`, `--version` | | Print the version and exit with code 0. |
 
-`--watch-path`, `--debounce-ms` and `--restart-delay-ms` only take effect together with `--live-reload`. Without it they are accepted and ignored: no error, no warning, and nothing is watched. Since a child that exits is never restarted, the restart delay has no use outside live reload either.
+`--watch-path`, `--debounce-ms` and `--restart-delay-ms` only take effect together with `--live-reload`. Without it they are accepted and ignored: no error, no warning, and nothing is watched. Since a child that exits is never restarted, the restart delay has no use outside live reload either. `--watch-poll` without `--live-reload` is a usage error (exit 2).
 
 `--bind-addr` is parsed at startup even when `--ports` is not given, so an invalid address is always an error:
 

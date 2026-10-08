@@ -58,6 +58,34 @@ Directories, and anything in them, are ignored. A symlink counts as the file it 
 
 scinit only reads a file again when its size, modification time, change time or inode differ from the previous snapshot, or when it was modified less than two seconds before that snapshot, since file timestamps are too coarse to tell apart two writes made close together. For an unchanged file, a snapshot costs one `stat`.
 
+## Polling when file notifications don't arrive
+
+By default scinit learns about changes from the kernel's file notifications (inotify on Linux, FSEvents on macOS). Some setups never deliver them for changes made outside the container. On podman machine on macOS, an edit on the Mac to a bind-mounted file changes the file inside the container, but no inotify event arrives, so scinit never restarts the child. Network file systems such as NFS and SMB, and other runtimes that run Linux in a virtual machine, can behave the same way.
+
+`--watch-poll` replaces the notifications with polling. Every interval (250 ms by default, or the value given as `--watch-poll=<MS>`, at least 10), scinit takes a snapshot of the watched path and compares it with the one from the previous poll. A difference arms the debounce timer, exactly as a notification would, and everything after that is the same in both modes: once the path has been quiet for `--debounce-ms`, the snapshot comparison in [What counts as a change](#what-counts-as-a-change) decides whether the child restarts. A `touch` arms the timer but does not restart the child, with or without polling.
+
+```console
+$ SCINIT_LOG=info scinit --live-reload --watch-path /app --watch-poll -- /app/app.sh
+ INFO scinit: scinit starting
+ INFO scinit: init system started, managing subprocess: /app/app.sh
+ INFO scinit::file_watcher: Started watching path: "/app" (polling every 250ms)
+ INFO scinit: File watching started for live-reload
+ ...
+```
+
+The `=` is required for a value (`--watch-poll=1000`), so that `--watch-poll` without one can come right before the command.
+
+Each poll costs one `stat` per watched file, and reads a file's contents only when its `stat` changed or it was modified in the last two seconds. On a bind mount in a virtual machine a `stat` is much slower than on the container's own file system. On podman machine on macOS (virtiofs), it took about 109 µs, against about 0.8 µs on the container's file system, which gives these costs:
+
+| Watched files | One poll on virtiofs | Share of the time at 250 ms | At 1000 ms |
+|---|---|---|---|
+| about 20 (a binary's directory) | about 2 ms | under 1% | about 0.2% |
+| about 1000 | about 110 ms | about 44% | about 11% |
+
+The default suits a directory of a few dozen files. For a large directory on a slow mount, pass a longer interval, such as `--watch-poll=1000`. If a poll takes longer than the interval, the next one starts when it finishes rather than immediately.
+
+Polling adds on average half the interval to the time between a change and the restart (about 125 ms at 250 ms), on top of the debounce and the restart delay. In the same podman setup, an edit on the Mac was visible to `stat` inside the container after about 40 ms.
+
 ## Worked example
 
 This example runs a small shell script, `/app/server`, that prints its config and exits cleanly on SIGTERM. The config lives in `/app/config/app.conf`, so that directory is what we watch. We write the config three times, 200 ms apart, then stop scinit with SIGTERM. The output was captured on Linux, with `SCINIT_LOG=info` to show scinit's own log lines. The lines starting with `server:` come from the child.
@@ -141,7 +169,7 @@ $ echo $?
 
 The restart always sends SIGTERM, and it waits the full graceful timeout for a child that ignores it. With the default of 30 seconds, a server that doesn't handle SIGTERM makes every reload take 30 seconds. In development, either handle SIGTERM or lower `--graceful-timeout-secs`.
 
-`--watch-path`, `--debounce-ms` and `--restart-delay-ms` only take effect with `--live-reload`. Without it they are accepted and silently ignored, so a missing `--live-reload` shows up as "nothing restarts", not as an error.
+`--watch-path`, `--debounce-ms` and `--restart-delay-ms` only take effect with `--live-reload`. Without it they are accepted and silently ignored, so a missing `--live-reload` shows up as "nothing restarts", not as an error. `--watch-poll` is the exception: without `--live-reload` it is a usage error.
 
 Because the debounce is trailing-edge, a path that keeps changing more often than the debounce interval never triggers a restart until it settles. Changes that arrive while a restart is in progress are not lost: they cause one more restart once the current one completes. A consequence is that if your app writes into the directory being watched, for example a log or PID file, every start causes a change and the app restarts in a loop. Keep such files outside the watched path. Editors can cause the same thing: a swap or backup file written next to the file you are editing, such as Vim's `.swp`, counts as a new file in a watched directory.
 
