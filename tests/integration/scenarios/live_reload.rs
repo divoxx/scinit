@@ -1,21 +1,22 @@
 //! Live-reload: file changes restart the child; nothing else does.
 //!
 //! Watching is non-recursive on a single `--watch-path` (file or directory).
-//! Only content changes and renames of regular files count, not
-//! metadata-only changes. Debouncing is trailing-edge: the restart fires once
-//! changes have been quiet for `--debounce-ms`. A restart is SIGTERM to the
-//! child's group, a `--restart-delay-ms` pause, then a fresh spawn that gets
-//! the same listening sockets.
+//! Debouncing is trailing-edge: once events have been quiet for
+//! `--debounce-ms`, scinit compares the regular files against a snapshot of
+//! their contents. A changed, deleted or new non-empty file restarts the
+//! child; a new empty file or a metadata-only change doesn't. A restart is
+//! SIGTERM to the child's group, a `--restart-delay-ms` pause, then a fresh
+//! spawn that gets the same listening sockets.
 //!
-//! macOS FSEvents has delivery latency and can hand the watcher events from
-//! just before it started, so every test waits for the child to start and
-//! then settles briefly before touching the filesystem.
+//! The first snapshot is taken when the watch starts, so tests write their
+//! files right before starting scinit and change them as soon as the child
+//! has started.
 //!
 //! Most tests pass `--zombie-reap-interval-ms 100`;
 //! `restart_is_prompt_with_default_reap_interval` covers the default.
 
 use crate::integration::harness::{
-    free_port, let_setup_writes_age, loopback, request, Scinit, ScinitBuilder, TEST_CHILD, TIMEOUT,
+    free_port, loopback, request, Scinit, ScinitBuilder, TEST_CHILD, TIMEOUT,
 };
 use nix::sys::signal::Signal;
 use std::ffi::OsString;
@@ -23,9 +24,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-/// Time to let FSEvents settle after the child starts, before touching files
-const SETTLE: Duration = Duration::from_millis(500);
 
 /// How long to watch for a restart that must not happen
 const QUIET: Duration = Duration::from_secs(3);
@@ -41,7 +39,6 @@ fn live_reload_with(
     debounce_ms: u64,
     restart_delay_ms: u64,
 ) -> ScinitBuilder {
-    let_setup_writes_age();
     builder
         .watch(watch)
         .args(["--debounce-ms", &debounce_ms.to_string()])
@@ -51,7 +48,6 @@ fn live_reload_with(
 
 /// Live-reload with scinit's default zombie-reap interval
 fn live_reload_default_reap(builder: ScinitBuilder, watch: &Path) -> ScinitBuilder {
-    let_setup_writes_age();
     builder
         .watch(watch)
         .args(["--debounce-ms", "200", "--restart-delay-ms", "100"])
@@ -63,14 +59,6 @@ fn watched_dir(builder: &ScinitBuilder) -> PathBuf {
     let dir = builder.dir().join("watched");
     std::fs::create_dir(&dir).unwrap();
     dir
-}
-
-/// Start scinit and wait for the first child, then let pre-start filesystem
-/// events drain
-fn start_and_settle(builder: ScinitBuilder) -> (Scinit, i32) {
-    let started = builder.start();
-    std::thread::sleep(SETTLE);
-    started
 }
 
 /// Write to an existing file in place (a plain content modification)
@@ -91,7 +79,7 @@ fn file_modify_restarts_child() {
     let dir = watched_dir(&b);
     let file = dir.join("app.conf");
     modify(&file, "v1");
-    let (mut scinit, old) = start_and_settle(live_reload(b, &dir).child(["run"]));
+    let (mut scinit, old) = live_reload(b, &dir).child(["run"]).start();
     modify(&file, "v2");
 
     let new = scinit.wait_for_nth("started", 2, TIMEOUT).unwrap().pid();
@@ -112,7 +100,7 @@ fn watch_single_file_restarts_child() {
     let b = Scinit::builder();
     let file = watched_dir(&b).join("app.conf");
     modify(&file, "v1");
-    let (scinit, old) = start_and_settle(live_reload(b, &file).child(["run"]));
+    let (scinit, old) = live_reload(b, &file).child(["run"]).start();
     modify(&file, "v2");
 
     let new = scinit.wait_for_nth("started", 2, TIMEOUT).unwrap().pid();
@@ -127,8 +115,9 @@ fn restart_delay_is_respected() {
     let dir = watched_dir(&b);
     let file = dir.join("app.conf");
     modify(&file, "v1");
-    let (scinit, old) =
-        start_and_settle(live_reload_with(b, &dir, 200, DELAY.as_millis() as u64).child(["run"]));
+    let (scinit, old) = live_reload_with(b, &dir, 200, DELAY.as_millis() as u64)
+        .child(["run"])
+        .start();
     modify(&file, "v2");
 
     let exited = scinit
@@ -165,7 +154,7 @@ fn sigterm_during_restart_delay_cancels_restart() {
     let dir = watched_dir(&b);
     let file = dir.join("app.conf");
     modify(&file, "v1");
-    let (mut scinit, old) = start_and_settle(live_reload_with(b, &dir, 200, 3000).child(["run"]));
+    let (mut scinit, old) = live_reload_with(b, &dir, 200, 3000).child(["run"]).start();
     modify(&file, "v2");
 
     scinit
@@ -190,11 +179,10 @@ fn sigint_while_old_child_stops_cancels_restart() {
     let file = dir.join("app.conf");
     modify(&file, "v1");
     // Traps SIGTERM without exiting, so the restart's stop keeps waiting
-    let (mut scinit, old) = start_and_settle(
-        live_reload(b, &dir)
-            .args(["--graceful-timeout-secs", "30"])
-            .child(["run", "--exit-on", "SIGINT"]),
-    );
+    let (mut scinit, old) = live_reload(b, &dir)
+        .args(["--graceful-timeout-secs", "30"])
+        .child(["run", "--exit-on", "SIGINT"])
+        .start();
     modify(&file, "v2");
 
     scinit
@@ -217,7 +205,7 @@ fn burst_of_writes_restarts_once() {
     let dir = watched_dir(&b);
     let file = dir.join("app.conf");
     modify(&file, "v0");
-    let (mut scinit, _) = start_and_settle(live_reload_with(b, &dir, 1500, 100).child(["run"]));
+    let (mut scinit, _) = live_reload_with(b, &dir, 1500, 100).child(["run"]).start();
     for i in 1..=5 {
         modify(&file, &format!("v{}", i));
         std::thread::sleep(Duration::from_millis(50));
@@ -241,7 +229,7 @@ fn change_within_debounce_window_is_not_lost() {
     let dir = watched_dir(&b);
     let file = dir.join("app.conf");
     modify(&file, "v0");
-    let (scinit, _) = start_and_settle(live_reload_with(b, &dir, 1000, 100).child(["run"]));
+    let (scinit, _) = live_reload_with(b, &dir, 1000, 100).child(["run"]).start();
     modify(&file, "v1");
     scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
     // Well inside the 1000ms window opened by the v1 change
@@ -258,10 +246,11 @@ fn writes_outside_debounce_window_each_restart() {
     let dir = watched_dir(&b);
     let file = dir.join("app.conf");
     modify(&file, "v0");
-    let (scinit, _) = start_and_settle(live_reload(b, &dir).child(["run"]));
+    let (scinit, _) = live_reload(b, &dir).child(["run"]).start();
     modify(&file, "v1");
     scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
-    std::thread::sleep(SETTLE);
+    // Past the 200 ms debounce window
+    std::thread::sleep(Duration::from_millis(500));
     modify(&file, "v2");
     scinit.wait_for_nth("started", 3, TIMEOUT).unwrap();
 
@@ -277,32 +266,132 @@ fn writes_outside_debounce_window_each_restart() {
     );
 }
 
-/// Creating a new (empty) file in the watched directory is not a modification.
-/// On macOS creation also emits `Modify(Metadata(Extended))` (xattrs), which
-/// `is_relevant_change` ignores as metadata-only.
+/// Creating a new empty file in the watched directory is not a change
 #[test]
-fn creating_file_does_not_restart() {
+fn creating_empty_file_does_not_restart() {
     let b = Scinit::builder();
     let dir = watched_dir(&b);
-    let (mut scinit, _) = start_and_settle(live_reload(b, &dir).child(["run"]));
+    let (mut scinit, _) = live_reload(b, &dir).child(["run"]).start();
     std::fs::File::create(dir.join("new.conf")).unwrap();
 
-    assert_no_restart(&mut scinit, "creating a file");
+    assert_no_restart(&mut scinit, "creating an empty file");
 }
 
-/// Deleting a file in the watched directory does not restart the child
+/// Creating a new file with contents restarts the child, however the backend
+/// reports it (FSEvents can coalesce it into a single create event)
 #[test]
-fn deleting_file_does_not_restart() {
+fn creating_file_with_content_restarts_child() {
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let (scinit, old) = live_reload(b, &dir).child(["run"]).start();
+    modify(&dir.join("new.conf"), "v1");
+
+    let new = scinit.wait_for_nth("started", 2, TIMEOUT).unwrap().pid();
+    assert_ne!(old, new);
+}
+
+/// A file renamed into the watched directory from outside it is a new file
+#[test]
+fn renaming_file_into_place_restarts_child() {
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let staged = b.dir().join("app.conf.staged");
+    modify(&staged, "v1");
+    let (scinit, _) = live_reload(b, &dir).child(["run"]).start();
+    std::fs::rename(&staged, dir.join("app.conf")).unwrap();
+
+    scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
+}
+
+/// Replacing a file by renaming a temporary file over it, as editors save,
+/// restarts the child once
+#[test]
+fn renaming_over_file_restarts_child() {
     let b = Scinit::builder();
     let dir = watched_dir(&b);
     let file = dir.join("app.conf");
     modify(&file, "v1");
-    // Let the creation event age out before the watcher starts
-    std::thread::sleep(SETTLE);
-    let (mut scinit, _) = start_and_settle(live_reload(b, &dir).child(["run"]));
+    let (mut scinit, _) = live_reload(b, &dir).child(["run"]).start();
+    let temp = dir.join(".app.conf.tmp");
+    modify(&temp, "v2");
+    std::fs::rename(&temp, &file).unwrap();
+
+    scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
+    scinit.assert_running_for(QUIET);
+    scinit.assert_start_count(2, "one save must restart exactly once");
+}
+
+/// Deleting a file in the watched directory restarts the child
+#[test]
+fn deleting_file_restarts_child() {
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let file = dir.join("app.conf");
+    modify(&file, "v1");
+    let (scinit, old) = live_reload(b, &dir).child(["run"]).start();
     std::fs::remove_file(&file).unwrap();
 
-    assert_no_restart(&mut scinit, "deleting a file");
+    let new = scinit.wait_for_nth("started", 2, TIMEOUT).unwrap().pid();
+    assert_ne!(old, new);
+}
+
+/// Files written just before scinit starts are part of the first snapshot,
+/// so events the backend delivers late for them (FSEvents does) don't restart
+#[test]
+fn writes_just_before_start_do_not_restart() {
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    modify(&dir.join("app.conf"), "v1");
+    modify(&dir.join("other.conf"), "v1");
+    let (mut scinit, _) = live_reload(b, &dir).child(["run"]).start();
+
+    assert_no_restart(&mut scinit, "writes made before the watch started");
+}
+
+/// Updating a recently written file's timestamps (`touch`) is metadata-only
+#[test]
+fn touching_file_does_not_restart() {
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let file = dir.join("app.conf");
+    modify(&file, "v1");
+    let (mut scinit, _) = live_reload(b, &dir).child(["run"]).start();
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now())
+        .unwrap();
+
+    assert_no_restart(&mut scinit, "touching a file");
+}
+
+/// Changing a recently written file's permissions is metadata-only
+#[test]
+fn chmod_does_not_restart() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let file = dir.join("app.conf");
+    modify(&file, "v1");
+    let (mut scinit, _) = live_reload(b, &dir).child(["run"]).start();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert_no_restart(&mut scinit, "changing a file's permissions");
+}
+
+/// Rewriting a file with the same contents is not a change
+#[test]
+fn rewriting_same_content_does_not_restart() {
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let file = dir.join("app.conf");
+    modify(&file, "v1");
+    let (mut scinit, _) = live_reload(b, &dir).child(["run"]).start();
+    modify(&file, "v1");
+
+    assert_no_restart(&mut scinit, "rewriting the same contents");
 }
 
 /// The watch is non-recursive: edits inside a subdirectory are ignored
@@ -314,8 +403,7 @@ fn modifying_file_in_subdirectory_does_not_restart() {
     std::fs::create_dir(&sub).unwrap();
     let file = sub.join("nested.conf");
     modify(&file, "v1");
-    std::thread::sleep(SETTLE);
-    let (mut scinit, _) = start_and_settle(live_reload(b, &dir).child(["run"]));
+    let (mut scinit, _) = live_reload(b, &dir).child(["run"]).start();
     modify(&file, "v2");
 
     assert_no_restart(&mut scinit, "modifying a file in a subdirectory");
@@ -400,7 +488,6 @@ fn restart_drops_no_connections() {
         .spawn()
         .unwrap();
     scinit.wait_for_event("ready", TIMEOUT).unwrap();
-    std::thread::sleep(SETTLE);
 
     // Keep connecting throughout the restart
     let stop = Arc::new(AtomicBool::new(false));
@@ -445,7 +532,6 @@ fn listener_survives_restart() {
     let old = scinit.child_pid().unwrap();
     scinit.assert_reply_from(&addr, old);
 
-    std::thread::sleep(SETTLE);
     modify(&file, "v2");
     scinit.wait_for_nth("ready", 2, TIMEOUT).unwrap();
     let new = scinit.child_pid().unwrap();
@@ -469,11 +555,11 @@ fn restart_is_prompt_with_default_reap_interval() {
     let file = dir.join("app.conf");
     modify(&file, "v1");
     // Default --zombie-reap-interval-ms (5000)
-    let (scinit, _) = start_and_settle(
-        b.watch(&dir)
-            .args(["--debounce-ms", "200", "--restart-delay-ms", "100"])
-            .child(["run"]),
-    );
+    let (scinit, _) = b
+        .watch(&dir)
+        .args(["--debounce-ms", "200", "--restart-delay-ms", "100"])
+        .child(["run"])
+        .start();
     let modified = Instant::now();
     modify(&file, "v2");
     scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();

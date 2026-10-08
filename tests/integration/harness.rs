@@ -171,8 +171,7 @@ impl ScinitBuilder {
         self.args(["--ports", &list])
     }
 
-    /// `--live-reload --watch-path <path>`. Call `let_setup_writes_age` first
-    /// if the test just wrote files there.
+    /// `--live-reload --watch-path <path>`
     pub fn watch(self, path: &Path) -> Self {
         self.args(["--live-reload", "--watch-path"]).args([path])
     }
@@ -359,12 +358,6 @@ fn canonical(path: &Path) -> PathBuf {
     // macOS temp dirs live under /var, a symlink to /private/var; file
     // watchers report canonical paths
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
-/// FSEvents (macOS) can report writes made just before the watcher starts as
-/// fresh changes. Call right before spawning, after the test set up its files.
-pub fn let_setup_writes_age() {
-    std::thread::sleep(Duration::from_secs(1));
 }
 
 /// Copy everything read from `src` into `dst` on a background thread

@@ -75,18 +75,33 @@ Start with `SCINIT_LOG=info,scinit::file_watcher=debug`. At startup, look for th
 
 If it is missing, live reload isn't on. `--watch-path`, `--debounce-ms` and `--restart-delay-ms` are silently ignored without `--live-reload`. If the path is not the one you expected, remember that without `--watch-path` scinit watches the command's executable, which for an interpreted app is the interpreter.
 
-Then make the change and look at the events. This run on Linux watched `/app/config` and made three changes: a `touch` of `app.conf`, a write to a file in a subdirectory, and a write to `app.conf` itself. The output is shortened to the relevant lines, and the `attr:` fields at the end of each event are cut:
+Then make the change and look at the events, and at what scinit found when it compared the files. This run on macOS watched a `config` directory and made three changes: a `touch` of `app.conf`, a write to a file in a subdirectory, and a write to `app.conf` itself. The output is shortened to the relevant lines, the scratch directory path is shortened to `...`, and the `attr:` fields at the end of each event are cut:
 
 ```text
 + touch config/app.conf
-DEBUG scinit::file_watcher: File system event: Event { kind: Modify(Metadata(Any)), paths: ["/app/config/app.conf"], ...
+DEBUG scinit::file_watcher: File system event: Event { kind: Create(File), paths: [".../config/app.conf"], ...
+DEBUG scinit::file_watcher: File system event: Event { kind: Modify(Metadata(Any)), paths: [".../config/app.conf"], ...
+DEBUG scinit::file_watcher: Debouncing file change
+DEBUG scinit::file_watcher: File system event: Event { kind: Modify(Metadata(Extended)), paths: [".../config/app.conf"], ...
+DEBUG scinit::file_watcher: Debouncing file change
+DEBUG scinit::file_watcher: File system event: Event { kind: Modify(Data(Content)), paths: [".../config/app.conf"], ...
+DEBUG scinit::file_watcher: Debouncing file change
+DEBUG scinit::file_watcher: Metadata since the last snapshot: ".../config/app.conf"
+DEBUG scinit::file_watcher: Nothing changed that restarts the child
 + echo x > config/nested/extra.conf
 + echo v5 > config/app.conf
-DEBUG scinit::file_watcher: File system event: Event { kind: Modify(Data(Any)), paths: ["/app/config/app.conf"], ...
- INFO scinit: File changed: "/app/config/app.conf", triggering restart
+DEBUG scinit::file_watcher: File system event: Event { kind: Create(File), paths: [".../config/app.conf"], ...
+DEBUG scinit::file_watcher: File system event: Event { kind: Modify(Metadata(Any)), paths: [".../config/app.conf"], ...
+DEBUG scinit::file_watcher: Debouncing file change
+DEBUG scinit::file_watcher: File system event: Event { kind: Modify(Metadata(Extended)), paths: [".../config/app.conf"], ...
+DEBUG scinit::file_watcher: Debouncing file change
+DEBUG scinit::file_watcher: File system event: Event { kind: Modify(Data(Content)), paths: [".../config/app.conf"], ...
+DEBUG scinit::file_watcher: Debouncing file change
+DEBUG scinit::file_watcher: Modified since the last snapshot: ".../config/app.conf"
+ INFO scinit: File changed: ".../config/app.conf", triggering restart
 ```
 
-Each case shows one of the reasons a change doesn't cause a restart. The `touch` produced an event, but a metadata-only one, which scinit ignores. The write to `config/nested/extra.conf` produced no event at all, because directories are watched non-recursively. Only the content change to a file directly in the watched directory led to `File changed`. A restart arrives `--debounce-ms` after the last change, so a file that keeps changing delays it.
+Each case shows one of the reasons a change doesn't cause a restart. The `touch` produced events, which FSEvents reported with the flags of the file's earlier creation and write, but the comparison found only a metadata change, which scinit ignores. The write to `config/nested/extra.conf` produced no event at all, because directories are watched non-recursively. Only the content change to a file directly in the watched directory led to `File changed`. The `... since the last snapshot` lines list every difference scinit found, including the ones that don't restart, such as `CreatedEmpty` for a new empty file. A restart arrives `--debounce-ms` after the last event, so a file that keeps changing delays it.
 
 If you see no events at all for a file you are sure changed, and you are watching a single file on Linux, the file may have been replaced by a rename, which loses the watch. Watch the directory instead. The [live reload guide](live-reload.md) covers this and the other cases in detail.
 

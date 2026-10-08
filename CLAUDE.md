@@ -60,6 +60,7 @@ cargo run -- --live-reload --debounce-ms 1000 --restart-delay-ms 500 my-app
 - **`ProcessManager`** (`src/process_manager.rs`): Spawns, monitors, restarts and stops the child, and forwards signals to its process group. The child's lifecycle is a `ChildState` enum (`NotStarted` / `Running(ManagedChild)` / `Exited { status }`). Every spawn hands the terminal to the new child, which takes the foreground itself before exec (`src/terminal.rs`)
 - **`SignalHandler`** (`src/signals.rs`): Receives signals only: masks the handled signals on all threads and consumes them on a dedicated `sigwait` thread, never blocking critical signals (SIGFPE, SIGILL, SIGSEGV, etc.)
 - **`FileWatcher`** (`src/file_watcher.rs`): Live-reload file watching using the `notify` crate, with a trailing-edge debounce
+- **`Snapshot`** (`src/snapshot.rs`): The watched regular files with a hash of their contents; `Snapshot::take`, `rescan` and `diff` decide what changed, independent of event types
 - **`reaper`** (`src/reaper.rs`): Zombie reaping, leaving the managed child to tokio's `Child::wait()`
 - **`exit_status`** (`src/exit_status.rs`): Maps the child's status to scinit's exit code (code, or 128 + signal)
 - **`PortManager`** (`src/port_manager.rs`): Socket inheritance system for zero-downtime restarts, binding each port once and keeping it for scinit's lifetime
@@ -89,7 +90,8 @@ The signal handling follows proper init system semantics:
 ### Live-Reload Architecture
 
 The live-reload system integrates:
-- File system monitoring (non-recursive) with a trailing-edge debounce: each content change or rename re-arms a `--debounce-ms` timer, and the restart fires once changes go quiet. Metadata-only changes and creating empty files are ignored
+- File system monitoring (non-recursive) with a trailing-edge debounce: every event (except reads) re-arms a `--debounce-ms` timer; event types are not used to decide anything
+- When the debounce fires, the watched files are snapshotted (name and content hash, rehashing only files whose stat changed or that were modified just before the last snapshot) and diffed against the previous snapshot, the first taken when the watch starts. Content changed, new non-empty file (including a rename into place) or file deleted restarts; a new empty file or a metadata-only change doesn't
 - File events are a branch of the main loop's `select!`, so a change is acted on as soon as the debounce fires
 - Socket inheritance for zero-downtime restarts: listeners are bound once and the same sockets are passed to every child, so connections queue in the backlog while no child is running
 - Process lifecycle management

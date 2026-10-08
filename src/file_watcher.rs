@@ -1,6 +1,7 @@
+use crate::snapshot::{Change, Snapshot};
 use crate::Result;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
@@ -27,7 +28,9 @@ pub struct FileWatchConfig {
 ///
 /// This watcher uses the `notify` crate for cross-platform file system monitoring
 /// and includes debouncing to prevent excessive restarts when files are being
-/// written or compiled.
+/// written or compiled. Events only say when to look: once they go quiet, the
+/// watched path is compared against a [`Snapshot`] of its contents, which
+/// decides whether anything changed.
 pub struct FileWatcher {
     /// The underlying notify watcher; dropping it stops watching
     _watcher: RecommendedWatcher,
@@ -36,8 +39,9 @@ pub struct FileWatcher {
 }
 
 impl FileWatcher {
-    /// Starts watching `config.watch_path` (non-recursively), with a
-    /// background task that debounces the changes into events
+    /// Starts watching `config.watch_path` (non-recursively) and takes its
+    /// first snapshot, with a background task that debounces the events and
+    /// diffs the snapshots into change events
     pub fn start(config: FileWatchConfig) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (tx, rx) = mpsc::channel(100);
@@ -57,7 +61,12 @@ impl FileWatcher {
         watcher.watch(&watch_path, RecursiveMode::NonRecursive)?;
         info!("Started watching path: {:?}", watch_path);
 
-        tokio::spawn(debounce_events(rx, event_tx, watch_path, config.debounce));
+        // After the watch starts, so a change in between is in the snapshot
+        // or delivered as an event, and before the child spawns, so events
+        // for earlier writes (FSEvents replays some) find nothing changed
+        let snapshot = Snapshot::take(&watch_path)?;
+
+        tokio::spawn(debounce_events(rx, event_tx, snapshot, config.debounce));
 
         Ok(FileWatcher {
             _watcher: watcher,
@@ -84,38 +93,31 @@ impl FileWatcher {
     pub async fn next_event(&mut self) -> Option<FileChangeEvent> {
         self.event_rx.recv().await
     }
+}
 
-    /// Whether a file system event should trigger a restart
-    fn is_relevant_change(event: &notify::Event) -> bool {
-        use notify::event::ModifyKind;
+/// Whether a file system event is only a read (an open, or a close without
+/// writing). Reads can't change the snapshot, and hashing files produces
+/// them on Linux, so they don't arm the debounce.
+fn is_read(event: &notify::Event) -> bool {
+    use notify::event::{AccessKind, AccessMode};
 
-        // Content changes and renames (editors save by renaming over the file)
-        // count; metadata-only changes (permissions, timestamps, xattrs, e.g.
-        // from creating an empty file) don't
-        let content_or_rename = matches!(
-            event.kind,
-            notify::EventKind::Modify(
-                ModifyKind::Data(_) | ModifyKind::Name(_) | ModifyKind::Any | ModifyKind::Other
-            )
-        );
-
-        // Only files count, not directories
-        content_or_rename && event.paths.iter().any(|path| path.is_file())
-    }
+    matches!(event.kind, notify::EventKind::Access(kind)
+        if kind != AccessKind::Close(AccessMode::Write))
 }
 
 /// Turns raw notify events into debounced [`FileChangeEvent`]s.
 ///
-/// Trailing-edge debounce: every relevant change (re)arms the deadline, and
-/// the restart fires once changes have been quiet for `debounce`, so the
-/// last change is never dropped.
+/// Trailing-edge debounce: every event (re)arms the deadline, and once
+/// events have been quiet for `debounce` the watched path is rescanned and
+/// diffed against `snapshot`. A restarting change (see [`Change::restarts`])
+/// emits [`FileChangeEvent::FileChanged`] with its path.
 async fn debounce_events(
     mut rx: mpsc::Receiver<notify::Result<notify::Event>>,
     event_tx: mpsc::UnboundedSender<FileChangeEvent>,
-    watch_path: PathBuf,
+    mut snapshot: Snapshot,
     debounce: Duration,
 ) {
-    let mut pending: Option<PathBuf> = None;
+    let mut pending = false;
     let deadline = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(deadline);
 
@@ -126,11 +128,11 @@ async fn debounce_events(
                 match res {
                     Ok(event) => {
                         debug!("File system event: {:?}", event);
-                        if FileWatcher::is_relevant_change(&event) {
-                            if pending.is_some() {
+                        if !is_read(&event) {
+                            if pending {
                                 debug!("Debouncing file change");
                             }
-                            pending = Some(changed_path(&event, &watch_path));
+                            pending = true;
                             deadline.as_mut().reset(tokio::time::Instant::now() + debounce);
                         }
                     }
@@ -142,9 +144,29 @@ async fn debounce_events(
                     }
                 }
             }
-            _ = &mut deadline, if pending.is_some() => {
-                let path = pending.take().unwrap();
-                if let Err(e) = event_tx.send(FileChangeEvent::FileChanged(path)) {
+            _ = &mut deadline, if pending => {
+                pending = false;
+                let (next, changes) = rescan(snapshot).await;
+                snapshot = next;
+                let event = match changes {
+                    Ok(changes) => {
+                        for change in &changes {
+                            debug!("{:?} since the last snapshot: {:?}", change.kind, change.path);
+                        }
+                        match changes.into_iter().find(Change::restarts) {
+                            Some(change) => FileChangeEvent::FileChanged(change.path),
+                            None => {
+                                debug!("Nothing changed that restarts the child");
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to snapshot the watched path: {}", e);
+                        FileChangeEvent::WatchError(e.to_string())
+                    }
+                };
+                if let Err(e) = event_tx.send(event) {
                     error!("Failed to send file change event: {}", e);
                     break;
                 }
@@ -153,10 +175,19 @@ async fn debounce_events(
     }
 }
 
-/// The event's first path (or `fallback`), canonicalized when possible
-fn changed_path(event: &notify::Event, fallback: &Path) -> PathBuf {
-    let path = event.paths.first().map_or(fallback, PathBuf::as_path);
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+/// Rescans `previous` off the async runtime (hashing can take a while) and
+/// diffs it against the result. Returns the snapshot to diff against next
+/// time: the new one, or `previous` if the scan failed.
+async fn rescan(previous: Snapshot) -> (Snapshot, std::io::Result<Vec<Change>>) {
+    tokio::task::spawn_blocking(move || match previous.rescan() {
+        Ok(next) => {
+            let changes = previous.diff(&next);
+            (next, Ok(changes))
+        }
+        Err(e) => (previous, Err(e)),
+    })
+    .await
+    .expect("snapshot task panicked")
 }
 
 #[cfg(test)]
@@ -198,9 +229,7 @@ mod tests {
         assert!(event.is_some());
 
         if let Some(FileChangeEvent::FileChanged(path)) = event {
-            // The FileWatcher now emits canonical paths, so compare with canonical test file path
-            let canonical_test_file = test_file.canonicalize().unwrap_or(test_file);
-            assert_eq!(path, canonical_test_file);
+            assert_eq!(path, test_file);
         } else {
             panic!("Expected FileChanged event");
         }
@@ -239,70 +268,55 @@ mod tests {
         assert!(event2.is_none());
     }
 
-    #[test]
-    fn test_is_relevant_change() {
-        use notify::EventKind;
-        use tempfile::tempdir;
-
-        // Create a temporary directory and file for testing
+    #[tokio::test]
+    async fn writes_before_start_and_metadata_changes_emit_nothing() {
         let temp_dir = tempdir().unwrap();
         let test_file = temp_dir.path().join("test.txt");
-        std::fs::write(&test_file, "test content").unwrap();
-
-        // Test file modification event
-        let event = notify::Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Data(
-                notify::event::DataChange::Content,
-            )),
-            paths: vec![test_file],
-            attrs: notify::event::EventAttributes::default(),
+        // Written right before the watch starts: FSEvents may still deliver it
+        fs::write(&test_file, "test content").unwrap();
+        let config = FileWatchConfig {
+            watch_path: temp_dir.path().to_path_buf(),
+            debounce: Duration::from_millis(100),
         };
+        let mut watcher = FileWatcher::start(config).unwrap();
 
-        assert!(FileWatcher::is_relevant_change(&event));
+        fs::File::create(temp_dir.path().join("empty.txt")).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&test_file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now())
+            .unwrap();
 
-        // Test directory modification event (should be ignored)
-        let test_dir = temp_dir.path().join("test_dir");
-        std::fs::create_dir(&test_dir).unwrap();
-
-        let event = notify::Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Data(
-                notify::event::DataChange::Content,
-            )),
-            paths: vec![test_dir],
-            attrs: notify::event::EventAttributes::default(),
-        };
-
-        // This should be false because it's a directory
-        assert!(!FileWatcher::is_relevant_change(&event));
+        let event = watcher
+            .wait_for_event(Duration::from_millis(1000))
+            .await
+            .unwrap();
+        assert!(event.is_none(), "unexpected event: {:?}", event);
     }
 
-    #[test]
-    fn test_metadata_and_create_are_not_relevant() {
-        use notify::event::{CreateKind, MetadataKind, ModifyKind, RenameMode};
-        use notify::EventKind;
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let file = temp_dir.path().join("app.conf");
-        std::fs::write(&file, "v1").unwrap();
-        let event = |kind| notify::Event {
-            kind,
-            paths: vec![file.clone()],
-            attrs: notify::event::EventAttributes::default(),
+    #[tokio::test]
+    async fn deleting_a_file_is_a_change() {
+        let temp_dir = tempdir().unwrap();
+        let test_file = temp_dir.path().join("test.txt");
+        fs::write(&test_file, "test content").unwrap();
+        let config = FileWatchConfig {
+            watch_path: temp_dir.path().to_path_buf(),
+            debounce: Duration::from_millis(100),
         };
+        let mut watcher = FileWatcher::start(config).unwrap();
 
-        // Creating an empty file on macOS: Create + Modify(Metadata(Extended))
-        assert!(!FileWatcher::is_relevant_change(&event(EventKind::Create(
-            CreateKind::File
-        ))));
-        assert!(!FileWatcher::is_relevant_change(&event(EventKind::Modify(
-            ModifyKind::Metadata(MetadataKind::Extended)
-        ))));
-        assert!(!FileWatcher::is_relevant_change(&event(EventKind::Modify(
-            ModifyKind::Metadata(MetadataKind::WriteTime)
-        ))));
-        // Editors saving by renaming over the file
-        assert!(FileWatcher::is_relevant_change(&event(EventKind::Modify(
-            ModifyKind::Name(RenameMode::To)
-        ))));
+        fs::remove_file(&test_file).unwrap();
+
+        let event = watcher
+            .wait_for_event(Duration::from_millis(1000))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&event, Some(FileChangeEvent::FileChanged(path)) if *path == test_file),
+            "expected a change for {:?}, got {:?}",
+            test_file,
+            event
+        );
     }
 }

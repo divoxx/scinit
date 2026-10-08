@@ -151,7 +151,7 @@ app started, version 1
 app started, version 2
 ```
 
-Depending on how your editor saves, the `File changed` line can name a temporary file instead of `app.sh`. Press Ctrl-C to end it.
+The `File changed` line names the first changed file in the directory, so if your editor leaves a backup or swap file next to `app.sh`, it can name that file instead. Press Ctrl-C to end it.
 
 ### scinit doesn't move files into the container
 
