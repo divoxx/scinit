@@ -14,7 +14,7 @@ The first process in a container runs as PID 1, and the kernel treats PID 1 diff
 | Reaps zombies | yes | yes | yes |
 | Exits with your program's status | yes | yes | yes |
 | Escalates to SIGKILL after a shutdown timeout | no | no | yes |
-| Restarts your program when its build changes | no | no | yes, with `--live-reload` |
+| Restarts your program when its build changes | no | no | yes, with `--watch` |
 | Holds listening sockets across restarts | no | no | yes, with `--ports` |
 
 Each addition, and most of scinit's design decisions, come from a concrete problem.
@@ -29,7 +29,7 @@ Smaller decisions follow the same reasoning. scinit writes its own logs to stder
 
 ## Use cases
 
-**As the init of production containers.** Use scinit anywhere you would use tini or dumb-init. You get the same guarantees plus a bounded, logged shutdown. Without `--live-reload`, scinit never restarts anything: a crash ends the container, and the orchestrator decides what happens next.
+**As the init of production containers.** Use scinit anywhere you would use tini or dumb-init. You get the same guarantees plus a bounded, logged shutdown. Without `--watch`, scinit never restarts anything: a crash ends the container, and the orchestrator decides what happens next.
 
 **Remote development environments.** This is the use case live reload and socket inheritance were designed for. When a system has too many services to run on a laptop, development moves to a Docker host or Kubernetes cluster. Rather than routing traffic to your laptop, as [Telepresence](https://www.telepresence.io) does, or rebuilding images and re-applying manifests on every change, the deploy loop [Garden](https://garden.io) and [Tilt](https://tilt.dev) are built around, the service then can stay deployed and only the code or binary needs to change. Your edits can be synced into the running pod, a build sidecar can recompile the program into a shared volume, and scinit then swaps the running process for the new build in place while its sockets stay open, so connections from your browser, a `kubectl port-forward` or other services in the cluster are not refused during the restart.
 
@@ -68,10 +68,16 @@ Running a program directly. The `--` ends scinit's own options, so everything af
 scinit -- my-server --config /etc/my-server.toml
 ```
 
-Restarting the program whenever a file in `./config` changes:
+Restarting the program whenever its executable or a file in `./config` changes:
 
 ```bash
-scinit --live-reload --watch-path ./config -- my-server
+scinit --watch --watch-extra ./config -- my-server
+```
+
+Restarting the program only when the build touches `my-server.scinit` next to the executable, once the new binary is fully written:
+
+```bash
+scinit --watch --watch-sentinel -- /app/bin/my-server
 ```
 
 Binding port 8080 on every interface and passing it to the program as file descriptor 3, with `LISTEN_FDS=1` and `LISTEN_PID` set as systemd does:

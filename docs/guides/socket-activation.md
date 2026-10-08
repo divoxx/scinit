@@ -45,10 +45,11 @@ If scinit was itself started with `LISTEN_*` variables, for example by a supervi
 The repository's test fixture, `scinit-test-child listen`, is a tiny server that adopts every inherited socket and answers each connection with its pid, the fd it accepted on and the port. It makes the mechanism easy to see. Here scinit binds two ports, with live reload on and a two-second restart delay so there is time to connect during the restart. All of this was run on macOS.
 
 ```console
-$ SCINIT_LOG=info scinit --live-reload --watch-path config \
+$ SCINIT_LOG=info scinit --watch --watch-extra config \
       --restart-delay-ms 2000 --ports 8080,8081 -- scinit-test-child listen
  INFO scinit: scinit starting
  INFO scinit: init system started, managing subprocess: scinit-test-child
+ INFO scinit::file_watcher: Started watching path: ".../target/debug/scinit-test-child"
  INFO scinit::file_watcher: Started watching path: "config"
  INFO scinit: File watching started for live-reload
  INFO scinit::process_manager: Spawning process: scinit-test-child ["listen"]
@@ -210,7 +211,7 @@ The same collision happens if your app ignores the inherited socket and binds th
 
 scinit does not set `LISTEN_FDNAMES`, so the sockets can only be told apart by their order. Libraries that look sockets up by name won't find them.
 
-Socket activation doesn't depend on live reload. Without `--live-reload` the child still gets its sockets, and there is only ever one child.
+Socket activation doesn't depend on live reload. Without `--watch` the child still gets its sockets, and there is only ever one child.
 
 ## Related
 

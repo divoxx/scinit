@@ -125,11 +125,11 @@ EOF
 chmod +x app/app.sh
 ```
 
-Mount the directory into the container at `/app` and run the script under scinit with `--live-reload`, watching that directory:
+Mount the directory into the container at `/app` and run the script under scinit with `--watch`, which watches the command's executable, here the script:
 
 ```bash
 docker run --rm -e SCINIT_LOG=info -v "$PWD/app:/app" scinit-demo \
-  --live-reload --watch-path /app -- /app/app.sh
+  --watch -- /app/app.sh
 ```
 
 Now edit `app/app.sh` on your machine, changing `version 1` to `version 2`, and save. Half a second after the last change (the `--debounce-ms` default of 500), scinit stops the old process, waits for the `--restart-delay-ms` pause (1 second by default), and starts the new one. This is the real output from a Linux host:
@@ -137,7 +137,7 @@ Now edit `app/app.sh` on your machine, changing `version 1` to `version 2`, and 
 ```
  INFO scinit: scinit starting
  INFO scinit: init system started, managing subprocess: /app/app.sh
- INFO scinit::file_watcher: Started watching path: "/app"
+ INFO scinit::file_watcher: Started watching path: "/app/app.sh"
  INFO scinit: File watching started for live-reload
  INFO scinit::process_manager: Spawning process: /app/app.sh []
  INFO scinit::process_manager: Process spawned with PID: 10
@@ -151,7 +151,7 @@ app started, version 1
 app started, version 2
 ```
 
-Depending on how your editor saves, the `File changed` line can name a temporary file instead of `app.sh`. Press Ctrl-C to end it.
+Press Ctrl-C to end it.
 
 ### scinit doesn't move files into the container
 
@@ -161,13 +161,13 @@ scinit is told about changes by the kernel's file notifications (inotify on Linu
 
 ### What to watch, and what live reload doesn't do
 
-Without `--watch-path`, scinit watches the command's executable, here `/app/app.sh`. A single file is watched through its directory, so it is still seen when an editor saves by writing a new file and renaming it over the old one, or when a build replaces a binary the same way. Watching the directory, as above, also restarts the program when the other files in it change. [Live reload](guides/live-reload.md) explains how to choose.
+`--watch` watches the command's executable, here `/app/app.sh`. It is watched through its directory, so it is still seen when an editor saves by writing a new file and renaming it over the old one, or when a build replaces a binary the same way. Changes to the other files in that directory are ignored; `--watch-extra` adds more files or directories to watch, such as config files or, for an interpreted program, its sources. For builds that take a while to write, `--watch-sentinel` restarts only when the builder touches a sentinel file after the build has finished. [Live reload](guides/live-reload.md) explains both.
 
 Two rules from the container world still apply in this mode. Only file changes cause a restart: if the program exits or crashes on its own, scinit exits with its status instead of starting it again. And a restart briefly leaves nothing running, so a server would refuse connections in that window, unless scinit holds its listening socket. That is what `--ports` is for, here with a server binary built into `./bin` on your machine:
 
 ```bash
 docker run --rm -p 8080:8080 -v "$PWD/bin:/app/bin" scinit-demo \
-  --live-reload --watch-path /app/bin --ports 8080 --bind-addr 0.0.0.0 -- /app/bin/my-server
+  --watch --ports 8080 --bind-addr 0.0.0.0 -- /app/bin/my-server
 ```
 
 With it, scinit binds port 8080 once and hands the same socket to every new process as file descriptor 3. Connections that arrive during a restart wait in the socket's queue until the new process accepts them. `--bind-addr 0.0.0.0` is needed in a container, because the default `127.0.0.1` isn't reachable through the published port. Your program has to pick up the socket instead of binding the port itself, as described in [Socket activation](guides/socket-activation.md).

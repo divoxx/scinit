@@ -23,7 +23,7 @@ flowchart TD
 
 ## The child exits on its own
 
-When the child exits, scinit exits too, with the same code. A child that runs `exit 3` makes scinit exit 3, and a child that finishes successfully makes scinit exit 0. This is true with and without `--live-reload`: scinit never restarts a child that exited or crashed, because in a container a crash should end the container and let the orchestrator decide what to do next.
+When the child exits, scinit exits too, with the same code. A child that runs `exit 3` makes scinit exit 3, and a child that finishes successfully makes scinit exit 0. This is true with and without `--watch`: scinit never restarts a child that exited or crashed, because in a container a crash should end the container and let the orchestrator decide what to do next.
 
 When the child is killed by a signal, there is no exit code to pass on, so scinit uses 128 plus the signal's number. A child killed by SIGKILL (9) gives 137, one that segfaults (SIGSEGV, 11) gives 139, and one killed by SIGTERM (15) gives 143.
 
@@ -57,7 +57,7 @@ exit=137
 
 ## scinit's own errors
 
-When scinit itself can't do its job, it logs an error to stderr and exits 1. That covers failing to start the child, including a command that doesn't exist, failing to bind one of the `--ports`, an invalid `--bind-addr`, a `--live-reload` run whose default watch path can't be found, failing to start the file watcher, and failing to make the child the terminal's foreground process group. A live-reload restart that can't spawn the new child (because the binary is missing at that moment, for example) is also an error that ends scinit with 1.
+When scinit itself can't do its job, it logs an error to stderr and exits 1. That covers failing to start the child, including a command that doesn't exist, failing to bind one of the `--ports`, an invalid `--bind-addr`, a `--watch` run whose executable can't be found, failing to start the file watcher, and failing to make the child the terminal's foreground process group. A live-reload restart that can't spawn the new child (because the binary is missing at that moment, for example) is also an error that ends scinit with 1.
 
 ```console
 $ scinit -- no-such-command; echo "exit=$?"

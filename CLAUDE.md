@@ -40,14 +40,17 @@ scripts/test-linux.sh
 # Basic usage
 cargo run -- echo "hello world"
 
-# Run with live-reload enabled
-cargo run -- --live-reload --watch-path ./my-app my-app
+# Run with live-reload enabled (watches the executable)
+cargo run -- --watch ./my-app
+
+# Restart only when ./my-app.scinit is created or touched, plus on changes to ./config
+cargo run -- --watch --watch-sentinel --watch-extra ./config ./my-app
 
 # Run with port binding for socket inheritance
-cargo run -- --live-reload --ports 8080,8081 --bind-addr 127.0.0.1 my-server
+cargo run -- --watch --ports 8080,8081 --bind-addr 127.0.0.1 my-server
 
 # Run with custom debounce and restart delays
-cargo run -- --live-reload --debounce-ms 1000 --restart-delay-ms 500 my-app
+cargo run -- --watch --debounce-ms 1000 --restart-delay-ms 500 my-app
 ```
 
 ## Architecture Overview
@@ -59,7 +62,7 @@ cargo run -- --live-reload --debounce-ms 1000 --restart-delay-ms 500 my-app
 - **`main` / `run_main_loop`** (`src/main.rs`): Builds the tokio runtime and runs the event loop; dispatches signals (`on_signal`) and file events (`on_file_event`) to the `ProcessManager`
 - **`ProcessManager`** (`src/process_manager.rs`): Spawns, monitors, restarts and stops the child, and forwards signals to its process group. The child's lifecycle is a `ChildState` enum (`NotStarted` / `Running(ManagedChild)` / `Exited { status }`). Every spawn hands the terminal to the new child, which takes the foreground itself before exec (`src/terminal.rs`)
 - **`SignalHandler`** (`src/signals.rs`): Receives signals only: masks the handled signals on all threads and consumes them on a dedicated `sigwait` thread, never blocking critical signals (SIGFPE, SIGILL, SIGSEGV, etc.)
-- **`FileWatcher`** (`src/file_watcher.rs`): Live-reload file watching using the `notify` crate (a single file through its parent directory), with a trailing-edge debounce
+- **`FileWatcher`** (`src/file_watcher.rs`): Live-reload file watching using the `notify` crate: the executable or its sentinel, plus extra paths (a single file through its parent directory), with a trailing-edge debounce
 - **`reaper`** (`src/reaper.rs`): Zombie reaping, leaving the managed child to tokio's `Child::wait()`
 - **`exit_status`** (`src/exit_status.rs`): Maps the child's status to scinit's exit code (code, or 128 + signal)
 - **`PortManager`** (`src/port_manager.rs`): Socket inheritance system for zero-downtime restarts, binding each port once and keeping it for scinit's lifetime
@@ -89,7 +92,8 @@ The signal handling follows proper init system semantics:
 ### Live-Reload Architecture
 
 The live-reload system integrates:
-- File system monitoring (non-recursive; a single file is watched through its parent directory, filtered to its name, so it survives replacement by rename or delete-and-recreate) with a trailing-edge debounce: each content change or rename re-arms a `--debounce-ms` timer, and the restart fires once changes go quiet. Metadata-only changes and creating empty files are ignored
+- CLI: `--watch` watches the child's executable (resolved through `PATH`); `--watch-sentinel` watches `<executable>.scinit` instead (it need not exist at startup); `--watch-extra <path>` (repeatable) adds files or directories that trigger on their own. `--watch-sentinel`, `--watch-extra`, `--debounce-ms` and `--restart-delay-ms` require `--watch` (clap `requires`)
+- File system monitoring (non-recursive; a single file is watched through its parent directory, filtered to its name, so it survives replacement by rename or delete-and-recreate; targets in the same directory share one watch) with a trailing-edge debounce: each content change or rename re-arms a `--debounce-ms` timer, and the restart fires once changes go quiet. Metadata-only changes and creating empty files are ignored, except for the sentinel, whose creation and any change, `touch` included, count (`FileWatcher::is_sentinel_change`)
 - File events are a branch of the main loop's `select!`, so a change is acted on as soon as the debounce fires
 - Socket inheritance for zero-downtime restarts: listeners are bound once and the same sockets are passed to every child, so connections queue in the backlog while no child is running
 - Process lifecycle management

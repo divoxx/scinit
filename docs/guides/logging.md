@@ -73,9 +73,9 @@ Start with `SCINIT_LOG=info,scinit::file_watcher=debug`. At startup, look for th
  INFO scinit::file_watcher: Started watching path: "/app/config"
 ```
 
-If it is missing, live reload isn't on. `--watch-path`, `--debounce-ms` and `--restart-delay-ms` are silently ignored without `--live-reload`. If the path is not the one you expected, remember that without `--watch-path` scinit watches the command's executable, which for an interpreted app is the interpreter.
+If it is missing, live reload isn't on (`--watch`). If the path is not the one you expected, remember that `--watch` watches the command's executable, which for an interpreted app is the interpreter; add your sources with `--watch-extra`. With `--watch-sentinel`, the line reads `Started watching sentinel:` and names `<executable>.scinit`, and changes to the executable itself are ignored.
 
-Then make the change and look at the events. This run on Linux watched `/app/config` and made three changes: a `touch` of `app.conf`, a write to a file in a subdirectory, and a write to `app.conf` itself. The output is shortened to the relevant lines, and the `attr:` fields at the end of each event are cut:
+Then make the change and look at the events. This run on Linux watched `/app/config` (`--watch-extra /app/config`) and made three changes: a `touch` of `app.conf`, a write to a file in a subdirectory, and a write to `app.conf` itself. The output is shortened to the relevant lines, and the `attr:` fields at the end of each event are cut:
 
 ```text
 + touch config/app.conf
@@ -88,7 +88,7 @@ DEBUG scinit::file_watcher: File system event: Event { kind: Modify(Data(Any)), 
 
 Each case shows one of the reasons a change doesn't cause a restart. The `touch` produced an event, but a metadata-only one, which scinit ignores. The write to `config/nested/extra.conf` produced no event at all, because directories are watched non-recursively. Only the content change to a file directly in the watched directory led to `File changed`. A restart arrives `--debounce-ms` after the last change, so a file that keeps changing delays it.
 
-When `--watch-path` is a single file, scinit watches its directory, so these lines also show events for the other files there, which scinit ignores. The [live reload guide](live-reload.md) covers this and the other cases in detail.
+A single watched file, such as the executable, is watched through its directory, so these lines also show events for the other files there, which scinit ignores. The [live reload guide](live-reload.md) covers this and the other cases in detail.
 
 ### The container takes 30 seconds to stop
 

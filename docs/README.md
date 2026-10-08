@@ -26,7 +26,7 @@ The order below starts with getting scinit running and then works from the core 
 
 [Remote development environments](guides/remote-development.md) is the setup live reload and socket inheritance were designed for: a service that then can stay deployed in a cluster while only its code or binary needs to change, where a build sidecar can recompile it in place and scinit then swaps in each new build. It describes the pieces, what scinit is and isn't responsible for, and how one change travels from your editor to the running service.
 
-[Live reload](guides/live-reload.md) covers `--live-reload`: what scinit watches by default, which file system events count as a change, how the trailing-edge debounce turns a burst of saves into one restart, and the sequence scinit follows to stop the old child and start a new one.
+[Live reload](guides/live-reload.md) covers `--watch`: what scinit watches (the executable, a sentinel file next to it, extra paths), which file system events count as a change, how the trailing-edge debounce turns a burst of saves into one restart, and the sequence scinit follows to stop the old child and start a new one.
 
 [Socket activation](guides/socket-activation.md) covers `--ports`: scinit binds the listening sockets once and passes them to each child at file descriptor 3 onwards, following the systemd protocol, so connections wait in the backlog during a restart instead of being refused. It includes short examples of picking the sockets up from an application, and what restarts mean for Kubernetes probes.
 
