@@ -1,6 +1,7 @@
 //! Command-line parsing and argument passthrough
 
 use crate::integration::harness::{Scinit, SCINIT, TEST_CHILD, TIMEOUT};
+use nix::sys::signal::Signal;
 use std::process::{Command, Output};
 use std::time::Duration;
 
@@ -367,6 +368,64 @@ fn misspelled_option_exits_two() {
     scinit.assert_start_count(0, "child must not start after a usage error");
     assert!(
         scinit.stderr().contains("--live-relaod"),
+        "{}",
+        scinit.diagnostics()
+    );
+}
+
+/// Run scinit with `SCINIT_LOG=value` on a command that doesn't exist, and
+/// return its stderr
+fn spawn_failure_stderr(value: &str) -> String {
+    let (scinit, status) = Scinit::builder()
+        .env("SCINIT_LOG", value)
+        .command(["/nonexistent/scinit-no-such-binary"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 1);
+    scinit.stderr()
+}
+
+/// The error that ends scinit is printed whatever SCINIT_LOG says, so exit
+/// code 1 always comes with a reason
+#[test]
+fn fatal_error_is_shown_whatever_scinit_log_says() {
+    for value in ["", "off", "scinit::reaper=debug", "inf"] {
+        let stderr = spawn_failure_stderr(value);
+        assert!(
+            stderr.contains("ERROR scinit: Failed to spawn process"),
+            "no fatal error with SCINIT_LOG={:?}:\n{}",
+            value,
+            stderr
+        );
+    }
+}
+
+/// A bare word that isn't a level (`inf`) is ignored with a warning, and the
+/// default applies, instead of silently matching nothing
+#[test]
+fn mistyped_scinit_log_warns_and_uses_the_default() {
+    let stderr = spawn_failure_stderr("inf");
+    assert!(
+        stderr.contains("WARN scinit::logging: ignoring SCINIT_LOG: \"inf\" is not a level"),
+        "{}",
+        stderr
+    );
+}
+
+/// The default level is warn: a forced kill is reported without SCINIT_LOG
+#[test]
+fn default_level_shows_warnings() {
+    let (mut scinit, _) = Scinit::builder()
+        .args(["--graceful-timeout-secs", "1"])
+        .child(["run", "--ignore", "TERM"])
+        .start();
+    scinit.signal(Signal::SIGTERM).unwrap();
+    let status = scinit.wait_exit(TIMEOUT).unwrap();
+    scinit.assert_exit_code(status, 137);
+    assert!(
+        scinit
+            .stderr()
+            .contains("WARN scinit::process_manager: Graceful shutdown timeout, forcing kill"),
         "{}",
         scinit.diagnostics()
     );

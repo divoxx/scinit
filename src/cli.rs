@@ -21,7 +21,9 @@ Environment:
   SCINIT_LOG  Filter for scinit's own logs, in tracing EnvFilter syntax:
               a level (error, warn, info, debug, trace) and/or per-module
               directives such as scinit::file_watcher=debug.
-              Default: error.
+              Default: warn (also when empty). A bare word that isn't a
+              level, such as a typo like `inf`, is ignored with a warning.
+              The error that ends scinit is printed whatever the filter.
 
               Logs go to stderr only, one event per line, without
               timestamps:

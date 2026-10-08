@@ -2,7 +2,7 @@
 
 An init's own log output shares the container's output streams with your application. Everything the container prints is your application's output, and that is what you want to read. Anything the init adds has to stay out of the way: it must not touch the app's stdout, it must not fill the logs during normal operation, and it must be easy to tell apart from the app's own lines. But when something goes wrong, such as a restart that didn't happen or a shutdown that took 30 seconds, the init is the only one that knows why.
 
-So scinit is quiet by default and detailed on request. It only prints errors unless you ask for more with the `SCINIT_LOG` environment variable. It writes to stderr only, never stdout, and every line names the part of scinit that wrote it.
+So scinit is quiet by default and detailed on request. It only prints warnings and errors unless you ask for more with the `SCINIT_LOG` environment variable. It writes to stderr only, never stdout, and every line names the part of scinit that wrote it.
 
 ```mermaid
 flowchart LR
@@ -33,18 +33,18 @@ There is no timestamp because container log drivers already record one per line,
 
 Output is colored only when stderr is a terminal and the `NO_COLOR` environment variable is unset. Container logs and files never get escape codes, and `NO_COLOR=1` turns color off on a terminal too.
 
-Fatal errors use the same format. When scinit can't start, the reason is a single `ERROR` line and scinit exits with code 1:
+Fatal errors use the same format. When scinit can't start, the reason is a single `ERROR` line and scinit exits with code 1. This line is printed whatever `SCINIT_LOG` says, even `off`, so an exit with code 1 always comes with a reason:
 
 ```console
 $ scinit -- nonexistent-cmd
 ERROR scinit: Failed to spawn process 'nonexistent-cmd': No such file or directory (os error 2)
 ```
 
-Panics, which would be bugs in scinit, are logged the same way, as an `ERROR` line from the `scinit::logging` target that starts with `panic at` followed by the source location and the message, instead of Rust's default panic output.
+Panics, which would be bugs in scinit, are logged the same way, and also whatever `SCINIT_LOG` says, as an `ERROR` line from the `scinit::logging` target that starts with `panic at` followed by the source location and the message, instead of Rust's default panic output.
 
 ## Choosing what to see
 
-`SCINIT_LOG` takes the filter syntax of `tracing`'s `EnvFilter`. The simplest form is a level: `error` (the default), `warn`, `info`, `debug` or `trace`. Each level includes the ones above it.
+`SCINIT_LOG` takes the filter syntax of `tracing`'s `EnvFilter`. The simplest form is a level: `error`, `warn` (the default), `info`, `debug` or `trace`. Each level includes the ones above it. An unset or empty `SCINIT_LOG` means `warn`. At `warn`, a normal run prints nothing; warnings report things such as a child killed after the graceful timeout or a signal that couldn't be forwarded.
 
 `info` is the useful level for watching what scinit does. It shows each spawn, each signal and how it was handled, each restart and the exit code. `debug` adds detail such as every raw file system event, each zombie reaped, and the signal and terminal setup at startup.
 
@@ -54,7 +54,7 @@ You can also set the level per module, by naming the target. Directives are sepa
 SCINIT_LOG=info,scinit::file_watcher=debug
 ```
 
-Include a general level whenever you name a module. A filter made only of module directives, such as `SCINIT_LOG=scinit::file_watcher=debug`, turns off everything else, including errors from other modules.
+Include a general level whenever you name a module. A filter made only of module directives, such as `SCINIT_LOG=scinit::file_watcher=debug`, turns off everything else, including errors from other modules, except the fatal error that ends scinit.
 
 `RUST_LOG` is not read by scinit. It is passed to the child unchanged, so setting it for a Rust application doesn't make scinit verbose, and setting `SCINIT_LOG` doesn't affect your application:
 
@@ -126,7 +126,13 @@ If the lines are there and the bind address is right, the app may be ignoring th
 
 ## Things to know
 
-`SCINIT_LOG` falls back to `error` only when the filter can't be parsed. Some mistakes parse fine and silence everything instead, fatal errors included. `SCINIT_LOG=inf` is read as "show events from a module named `inf`", which matches nothing, and an empty value (`SCINIT_LOG=`) is a filter with no directives at all. In both cases scinit prints nothing, even when it fails to start. If scinit exits with code 1 and no message, check this variable first.
+A mistyped level doesn't silence scinit. In `EnvFilter` syntax, a bare word that isn't a level is a module name, so `SCINIT_LOG=inf` would mean "show events from a module named `inf`" and match nothing. scinit treats a bare word that isn't a level name (other than `scinit` itself) as a mistake instead: it ignores the whole value, uses the default `warn`, and says so once at startup. A value that can't be parsed at all is handled the same way:
+
+```console
+$ SCINIT_LOG=inf scinit -- nonexistent-cmd
+ WARN scinit::logging: ignoring SCINIT_LOG: "inf" is not a level (error, warn, info, debug, trace, off); using warn
+ERROR scinit: Failed to spawn process 'nonexistent-cmd': No such file or directory (os error 2)
+```
 
 scinit has no log file, no JSON output and no syslog support. Its lines go to stderr alongside your application's, and the container runtime collects both.
 

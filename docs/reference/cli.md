@@ -54,7 +54,7 @@ The ports themselves are bound just before the first child is spawned. A port th
 
 | Variable | Effect |
 |---|---|
-| `SCINIT_LOG` | Filter for scinit's own log output on stderr, in [tracing's `EnvFilter` syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html): a level (`error`, `warn`, `info`, `debug`, `trace`) and/or per-module directives such as `scinit::file_watcher=debug`. The default is `error`, which is also used when the value can't be parsed. A value that parses but matches nothing, such as `inf` or an empty string, silences scinit entirely; see [Logging](../guides/logging.md#things-to-know). |
+| `SCINIT_LOG` | Filter for scinit's own log output on stderr, in [tracing's `EnvFilter` syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html): a level (`error`, `warn`, `info`, `debug`, `trace`) and/or per-module directives such as `scinit::file_watcher=debug`. The default is `warn`, used when the variable is unset or empty. A value that can't be parsed, or that has a bare word that isn't a level (such as `inf`), is ignored with a warning and the default applies; see [Logging](../guides/logging.md#things-to-know). The fatal error that ends scinit is printed whatever the filter. |
 | `NO_COLOR` | When set (to any value), scinit's log lines are never colored. Without it, they are colored only when stderr is a terminal. |
 | `PATH` | Used to find `<COMMAND>` when it contains no `/`, both to spawn it and to pick the default `--watch-path`. |
 
@@ -83,7 +83,7 @@ scinit's exit code is designed to be the one your program would have produced if
 | 2 | A usage error reported by the argument parser, such as a missing `<COMMAND>`, an unknown option, or an out-of-range value. |
 | 0 | `--help` or `--version`. |
 
-Because the child's codes pass straight through, a child that itself exits with 1 or 2 can't be told apart from a scinit error by the code alone. scinit's own errors are always logged on stderr as an `ERROR scinit: ...` line, even with the default `SCINIT_LOG`, and usage errors are printed by the parser with a `Usage:` hint.
+Because the child's codes pass straight through, a child that itself exits with 1 or 2 can't be told apart from a scinit error by the code alone. scinit's own errors are always logged on stderr as an `ERROR scinit: ...` line, whatever `SCINIT_LOG` says, and usage errors are printed by the parser with a `Usage:` hint.
 
 ```
 $ scinit -- sh -c 'exit 3'; echo $?
