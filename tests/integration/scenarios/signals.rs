@@ -145,6 +145,42 @@ fn sigterm_forwarded_then_scinit_exits() {
     );
 }
 
+/// The final reap pass runs before scinit exits, both after a termination
+/// signal and when the child exits on its own. Whether it reaps can't be
+/// observed from outside (the zombies it would find are gone with scinit, or
+/// its PID namespace), so this checks that it runs; the unit test in
+/// src/reaper.rs checks that it reaps.
+#[test]
+fn final_reap_runs_on_every_exit_path() {
+    const FINAL_PASS: &str = "Reaping any remaining zombie processes before exit";
+
+    let (mut scinit, pid) = Scinit::builder()
+        .env("SCINIT_LOG", "scinit::reaper=debug")
+        .child(["run"])
+        .start();
+    scinit.signal(Signal::SIGTERM).unwrap();
+    scinit
+        .wait_for_signal(pid, Signal::SIGTERM, TIMEOUT)
+        .unwrap();
+    scinit.wait_exit(EXIT_BOUND).unwrap();
+    assert!(
+        scinit.stderr().contains(FINAL_PASS),
+        "no final reap pass after SIGTERM\n{}",
+        scinit.diagnostics()
+    );
+
+    let (scinit, _) = Scinit::builder()
+        .env("SCINIT_LOG", "scinit::reaper=debug")
+        .child(["exit", "0"])
+        .run(TIMEOUT)
+        .unwrap();
+    assert!(
+        scinit.stderr().contains(FINAL_PASS),
+        "no final reap pass after the child exited\n{}",
+        scinit.diagnostics()
+    );
+}
+
 /// A child that ignores the termination signal is SIGKILLed once
 /// --graceful-timeout-secs expires, not before. The 3s timeout is long enough
 /// that escalating after any shorter fixed delay fails the timing check.

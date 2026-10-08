@@ -51,7 +51,7 @@ fn peek_exited_child() -> Option<Pid> {
 /// Each exited child is peeked at before being reaped, so the managed child
 /// is left for tokio's `child.wait()`. While the managed child is the zombie
 /// returned first, other zombies wait for the next pass; tokio reaps the
-/// managed child promptly and `handle_child_exit` runs a final pass.
+/// managed child promptly and [`reap_before_exit`] runs a final pass.
 pub fn reap_zombies() {
     let mut reaped_count = 0;
 
@@ -106,4 +106,77 @@ fn reap_one(pid: Pid) -> ControlFlow<(), bool> {
 /// Starts a zombie reap pass on a blocking thread, without waiting for it
 pub fn spawn_zombie_reap() {
     tokio::task::spawn_blocking(reap_zombies);
+}
+
+/// The last reap pass, on every exit path. Runs inline, not in the
+/// background: the runtime shuts down right after, so a background reap
+/// might never run (WNOHANG keeps it from blocking)
+pub fn reap_before_exit() {
+    debug!("Reaping any remaining zombie processes before exit");
+    reap_zombies();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::errno::Errno;
+    use std::process::Command;
+
+    /// Set when this test binary runs a single test on its own
+    const ISOLATED: &str = "SCINIT_UNIT_TEST_ISOLATED";
+
+    /// Reruns test `name` alone in a fresh test process, so reaping every
+    /// exited child can't take the children of tests running in parallel.
+    /// Returns whether the caller is that fresh process.
+    fn isolated(name: &str) -> bool {
+        if std::env::var_os(ISOLATED).is_some() {
+            return true;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--test-threads=1"])
+            .env(ISOLATED, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated run of {name} failed:\n{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    /// Blocks until child `pid` has exited, leaving it a zombie
+    fn wait_until_zombie(pid: Pid) {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid.as_raw() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(rc, 0, "waitid: {}", Errno::last());
+    }
+
+    #[test]
+    #[allow(clippy::zombie_processes, reason = "the code under test reaps it")]
+    fn reap_before_exit_reaps_remaining_zombies() {
+        if !isolated("reaper::tests::reap_before_exit_reaps_remaining_zombies") {
+            return;
+        }
+        // An unmanaged child that has exited, like an orphan scinit inherited
+        let orphan = Command::new("true").spawn().unwrap();
+        let pid = Pid::from_raw(orphan.id() as i32);
+        wait_until_zombie(pid);
+
+        // As in scinit: called on the runtime, which shuts down right after
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async { reap_before_exit() });
+        let reaped = waitpid(pid, Some(WaitPidFlag::WNOHANG));
+        runtime.shutdown_background();
+
+        assert_eq!(reaped, Err(Errno::ECHILD), "zombie {pid} was not reaped");
+    }
 }
