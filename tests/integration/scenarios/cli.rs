@@ -1,6 +1,7 @@
 //! Command-line parsing and argument passthrough
 
 use crate::integration::harness::{Scinit, SCINIT, TEST_CHILD, TIMEOUT};
+use nix::sys::signal::Signal;
 use std::process::{Command, Output};
 use std::time::Duration;
 
@@ -367,6 +368,73 @@ fn misspelled_option_exits_two() {
     scinit.assert_start_count(0, "child must not start after a usage error");
     assert!(
         scinit.stderr().contains("--live-relaod"),
+        "{}",
+        scinit.diagnostics()
+    );
+}
+
+/// Run scinit with `SCINIT_LOG=value` on a command that doesn't exist, and
+/// return its stderr
+fn spawn_failure_stderr(value: &str) -> String {
+    let (scinit, status) = Scinit::builder()
+        .env("SCINIT_LOG", value)
+        .command(["/nonexistent/scinit-no-such-binary"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 1);
+    scinit.stderr()
+}
+
+/// The error that ends scinit is printed whatever SCINIT_LOG says, so exit
+/// code 1 always comes with a reason
+#[test]
+fn fatal_error_is_shown_whatever_scinit_log_says() {
+    for value in ["", "off", "scinit::reaper=debug", "inf"] {
+        let stderr = spawn_failure_stderr(value);
+        assert!(
+            stderr.contains("ERROR scinit: Failed to spawn process"),
+            "no fatal error with SCINIT_LOG={:?}:\n{}",
+            value,
+            stderr
+        );
+    }
+}
+
+/// A bare word that isn't a level gets a warning, shown even when the
+/// filter would hide it, but is kept: it may name a target on purpose
+#[test]
+fn bare_word_that_is_not_a_level_warns_and_is_kept() {
+    let stderr = spawn_failure_stderr("inf");
+    assert!(
+        stderr.contains("WARN scinit::logging: SCINIT_LOG: \"inf\" is not a level"),
+        "{}",
+        stderr
+    );
+
+    // The rest of the value still applies
+    let stderr = spawn_failure_stderr("info,deubg");
+    assert!(
+        stderr.contains("\"deubg\" is not a level")
+            && stderr.contains("INFO scinit: scinit starting"),
+        "{}",
+        stderr
+    );
+}
+
+/// The default level is warn: a forced kill is reported without SCINIT_LOG
+#[test]
+fn default_level_shows_warnings() {
+    let (mut scinit, _) = Scinit::builder()
+        .args(["--graceful-timeout-secs", "1"])
+        .child(["run", "--ignore", "TERM"])
+        .start();
+    scinit.signal(Signal::SIGTERM).unwrap();
+    let status = scinit.wait_exit(TIMEOUT).unwrap();
+    scinit.assert_exit_code(status, 137);
+    assert!(
+        scinit
+            .stderr()
+            .contains("WARN scinit::process_manager: Graceful shutdown timeout, forcing kill"),
         "{}",
         scinit.diagnostics()
     );
