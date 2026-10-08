@@ -30,7 +30,7 @@ use file_watcher::{FileChangeEvent, FileWatcher};
 use port_manager::PortManager;
 use process_manager::ProcessManager;
 use reaper::{reap_before_exit, spawn_zombie_reap};
-use signals::{Signal, SignalHandler};
+use signals::{is_termination, Signal, SignalHandler};
 
 fn main() {
     logging::init();
@@ -169,46 +169,37 @@ enum SignalAction {
     Exit,
 }
 
-/// Handles a signal according to init system semantics
+/// Handles a signal according to its policy (src/signals.rs): every signal
+/// the sigwait thread receives is forwarded, and a termination signal also
+/// shuts down
 async fn on_signal(
     signal: Signal,
     process_manager: &mut ProcessManager,
     signal_handler: &mut SignalHandler,
 ) -> SignalAction {
-    match signal {
-        Signal::SIGTERM | Signal::SIGINT | Signal::SIGQUIT => {
-            info!(
-                "received termination signal {:?}, initiating graceful shutdown",
-                signal
-            );
-            // Forward the signal itself, escalating to SIGKILL if the child
-            // outlives the graceful timeout or another termination signal
-            // arrives
-            info!(
-                "Termination signal {:?} received, forwarding to child process (timeout: {}s)",
-                signal,
-                process_manager.graceful_shutdown_timeout().as_secs()
-            );
-            process_manager
-                .shutdown_with_signal(signal, async || signal_handler.wait_for_signal().await)
-                .await;
-
-            info!("scinit exiting due to termination signal {:?}", signal);
-            SignalAction::Exit
-        }
-        Signal::SIGUSR1 | Signal::SIGUSR2 | Signal::SIGHUP => {
-            // These signals should be forwarded to the child process only
-            info!("forwarding signal {:?} to child process", signal);
-            process_manager.try_signal_group(signal);
-            SignalAction::Continue
-        }
-        _ => {
-            // Any other signals we somehow receive should be forwarded
-            debug!("forwarding unexpected signal {:?} to child process", signal);
-            process_manager.try_signal_group(signal);
-            SignalAction::Continue
-        }
+    if !is_termination(signal) {
+        info!("forwarding signal {:?} to child process", signal);
+        process_manager.try_signal_group(signal);
+        return SignalAction::Continue;
     }
+
+    info!(
+        "received termination signal {:?}, initiating graceful shutdown",
+        signal
+    );
+    // Forward the signal itself, escalating to SIGKILL if the child outlives
+    // the graceful timeout or another termination signal arrives
+    info!(
+        "Termination signal {:?} received, forwarding to child process (timeout: {}s)",
+        signal,
+        process_manager.graceful_shutdown_timeout().as_secs()
+    );
+    process_manager
+        .shutdown_with_signal(signal, async || signal_handler.wait_for_signal().await)
+        .await;
+
+    info!("scinit exiting due to termination signal {:?}", signal);
+    SignalAction::Exit
 }
 
 /// Handles one file watcher event, restarting the process on a change.

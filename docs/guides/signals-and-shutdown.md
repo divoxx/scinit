@@ -23,15 +23,24 @@ sequenceDiagram
 
 ## What scinit does with each signal
 
-scinit handles six signals, in two groups.
+scinit forwards every signal it can catch to the child, as tini and dumb-init do, except SIGCHLD, which it needs for itself, the few it ignores, and the ones raised by a fault or an abort in scinit. Each signal has a policy in a table in `src/signals.rs`:
+
+| Policy | Signals |
+| --- | --- |
+| Forward, then shut down | SIGTERM, SIGINT, SIGQUIT |
+| Forward | SIGHUP, SIGUSR1, SIGUSR2, SIGALRM, SIGVTALRM, SIGPROF, SIGWINCH, SIGURG, SIGIO, SIGXCPU, SIGXFSZ, SIGTSTP, SIGCONT; SIGSTKFLT and SIGPWR on Linux; SIGINFO on macOS |
+| Ignore | SIGTTIN, SIGTTOU, SIGPIPE |
+| Left alone | SIGCHLD, SIGKILL, SIGSTOP, SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP, SIGSYS, SIGABRT; SIGEMT on macOS |
+
+Linux realtime signals (SIGRTMIN to SIGRTMAX) are not in the table: they keep their default action and are not forwarded.
 
 SIGTERM, SIGINT and SIGQUIT are termination signals. When scinit receives one, it forwards that same signal to the child's process group, so an application that treats SIGINT differently from SIGTERM (as some servers do for a fast versus a graceful stop) sees the signal that was actually sent. scinit then waits for the child to exit. If it exits within the graceful timeout, scinit exits with the child's status. If it doesn't, or if another termination signal arrives first, scinit sends SIGKILL to the process group, waits briefly for the child to be collected, and exits. Either way, a termination signal always ends scinit.
 
-SIGUSR1, SIGUSR2 and SIGHUP are forwarded to the child's process group and nothing else happens. Applications commonly use these for reloading configuration or reopening log files, and scinit stays out of the way: it doesn't restart anything, and it keeps running.
+Every other forwarded signal is sent to the child's process group and nothing else happens. Applications commonly use SIGUSR1, SIGUSR2 and SIGHUP for reloading configuration or reopening log files, and scinit stays out of the way: it doesn't restart anything, and it keeps running. The same goes for signals whose default action would otherwise end or stop scinit: a SIGALRM or SIGPROF sent to scinit doesn't kill it, and a SIGTSTP doesn't stop it. SIGTSTP stops the child (unless the child handles it) and SIGCONT continues it; scinit keeps running throughout and keeps waiting for the child to exit.
 
-Two signals are explicitly ignored. SIGTTIN and SIGTTOU are sent to a background process that tries to read from or write to its terminal, and their default action is to stop the process. scinit ignores them so that it can never be stopped by a terminal operation, which would freeze the whole container. The child doesn't inherit that: it starts with every signal at its default disposition (see [process isolation](process-isolation.md#default-signal-dispositions)).
+Three signals are ignored. SIGTTIN and SIGTTOU are sent to a background process that tries to read from or write to its terminal, and their default action is to stop the process. scinit ignores them so that it can never be stopped by a terminal operation, which would freeze the whole container. SIGPIPE is raised by a write to a pipe with no reader, such as scinit logging to a stderr that was closed; ignoring it makes the write fail instead of killing scinit (Rust programs ignore it by default). The child doesn't inherit any of this: it starts with every signal at its default disposition (see [process isolation](process-isolation.md#default-signal-dispositions)).
 
-Finally, some signals are deliberately left alone. SIGCHLD, which tells a parent that a child changed state, is used by scinit to reap zombies and to notice the child's exit (see [zombie reaping](zombie-reaping.md)). Synchronous signals that the kernel raises because of a fault in scinit itself, such as SIGSEGV, SIGBUS, SIGFPE and SIGILL, are never blocked or intercepted, so a crash in scinit is a real crash and not a hang.
+Finally, some signals are deliberately left alone. SIGCHLD, which tells a parent that a child changed state, is used by scinit to reap zombies and to notice the child's exit (see [zombie reaping](zombie-reaping.md)). SIGKILL and SIGSTOP can't be caught. Synchronous signals that the kernel raises because of a fault in scinit itself, such as SIGSEGV, SIGBUS, SIGFPE and SIGILL, and SIGABRT, raised when scinit aborts, are never blocked or intercepted, so a crash in scinit is a real crash and not a hang.
 
 ## Why the process group
 
@@ -41,9 +50,11 @@ The [process isolation guide](process-isolation.md#its-own-process-group) shows 
 
 ## How scinit receives signals
 
-The usual way to handle a signal is to install a handler function, but a handler runs at an arbitrary point in the program and may only do a very small set of things safely, which makes it a poor place for "forward this signal and start a timed shutdown". scinit takes a different approach. At startup, before it creates any other thread, it blocks the six signals it handles. Threads inherit the signal mask of the thread that created them, so every thread scinit later starts, including all of tokio's worker threads, has them blocked too. One dedicated thread, named `scinit-sigwait`, then sits in a loop calling `sigwait`, which takes a pending blocked signal off the queue and returns it as an ordinary value. That thread sends each signal over a channel to scinit's main loop, which decides what to do with it alongside the other events it watches.
+The usual way to handle a signal is to install a handler function, but a handler runs at an arbitrary point in the program and may only do a very small set of things safely, which makes it a poor place for "forward this signal and start a timed shutdown". scinit takes a different approach. At startup, before it creates any other thread, it blocks every signal it forwards. Threads inherit the signal mask of the thread that created them, so every thread scinit later starts, including all of tokio's worker threads, has them blocked too. One dedicated thread, named `scinit-sigwait`, then sits in a loop calling `sigwait`, which takes a pending blocked signal off the queue and returns it as an ordinary value. That thread sends each signal over a channel to scinit's main loop, which decides what to do with it alongside the other events it watches.
 
 This design has three properties that matter. A blocked signal is never delivered to a random thread or run as a default action, so there is no window in which a SIGTERM could kill scinit outright. A blocked signal is queued by the kernel rather than discarded, which is what lets scinit receive signals when it is PID 1, where the kernel would drop an unhandled signal. And because signals wait in a channel, a signal that arrives while the main loop is busy, for example in the middle of a live-reload restart, is handled when the loop gets to it rather than lost.
+
+scinit also installs a handler for each of these signals, which never runs because the signals are always blocked. It is there because some systems, macOS among them, discard an ignored signal when it is sent, even while it is blocked, and on macOS that includes signals such as SIGWINCH whose default action is to ignore them. scinit may also have been started with signals ignored. With a handler installed, every forwarded signal stays queued for `sigwait`.
 
 The child doesn't inherit this arrangement. Before the child's program starts, scinit clears its signal mask so that it handles signals normally.
 
@@ -108,13 +119,15 @@ If you want scinit's escalation to be the one that fires, set `--graceful-timeou
 
 ## Things to know
 
-A second termination signal forces the stop. While scinit waits out the graceful timeout, it keeps receiving signals: another SIGTERM, SIGINT or SIGQUIT makes it send SIGKILL to the process group at once, as if the timeout had expired, so pressing Ctrl-C twice or running `kill` twice stops a child that is stuck shutting down. The exit code follows the same rules as a timeout, usually 137. SIGUSR1, SIGUSR2 and SIGHUP received during the wait are forwarded to the stopping child and don't change the timeout.
+A second termination signal forces the stop. While scinit waits out the graceful timeout, it keeps receiving signals: another SIGTERM, SIGINT or SIGQUIT makes it send SIGKILL to the process group at once, as if the timeout had expired, so pressing Ctrl-C twice or running `kill` twice stops a child that is stuck shutting down. The exit code follows the same rules as a timeout, usually 137. Other signals received during the wait, such as SIGUSR1 or SIGHUP, are forwarded to the stopping child and don't change the timeout.
 
-Only the six signals listed above are forwarded. Others, such as SIGWINCH (terminal resize) and SIGTSTP (Ctrl-Z when sent with `kill`), are not passed on to the child; they take their default action on scinit itself. As PID 1 that means they are discarded, but outside a container a SIGTSTP sent to scinit stops scinit, not the child. When you run scinit in a terminal this matters less than it sounds, because keys like Ctrl-C and Ctrl-Z make the terminal signal its foreground process group, and scinit hands the foreground to the child (see [process isolation](process-isolation.md)), so those reach the child without going through scinit.
+Signals sent to scinit explicitly, for example with `docker kill -s WINCH` or `kill -TSTP`, are the ones scinit forwards. Signals the terminal sends, for keys like Ctrl-C and Ctrl-Z or when the window is resized, go to the terminal's foreground process group, and scinit hands the foreground to the child (see [process isolation](process-isolation.md)), so those reach the child without going through scinit and aren't delivered twice.
+
+A SIGTSTP and a SIGCONT sent to scinit in quick succession may reach the child as a SIGCONT alone: the kernel discards a pending stop signal when SIGCONT is sent, and scinit's signals are pending until its sigwait thread takes them.
 
 scinit waits for the managed child, not for the whole group. If the child exits within the graceful timeout but a worker in its group ignored the signal, scinit exits without killing that worker. As PID 1 this doesn't matter, because the kernel kills everything left in the container when scinit exits; outside a container the worker keeps running. The same goes for a process that moves itself into another process group or session, such as a daemon that calls `setsid`: it is not reached by forwarded signals or by the final SIGKILL, and only the end of the PID namespace cleans it up.
 
-A termination signal that arrives during a live-reload restart, before the new child is spawned, cancels the restart. scinit doesn't start a new child: if the old one is still stopping, scinit forwards the signal to it and waits for it as in any shutdown; then scinit exits with the old child's status. SIGUSR1, SIGUSR2 and SIGHUP that arrive during a restart are held and forwarded to the new child once it is spawned, which can be before it has installed its own signal handlers. The [live reload guide](live-reload.md) describes the restart sequence.
+A termination signal that arrives during a live-reload restart, before the new child is spawned, cancels the restart. scinit doesn't start a new child: if the old one is still stopping, scinit forwards the signal to it and waits for it as in any shutdown; then scinit exits with the old child's status. Other signals that arrive during a restart are held and forwarded to the new child once it is spawned, which can be before it has installed its own signal handlers. The [live reload guide](live-reload.md) describes the restart sequence.
 
 The exit status scinit reports after a shutdown is explained in [exit codes](exit-codes.md).
 

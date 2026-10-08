@@ -18,17 +18,37 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
 
-/// Signals scinit consumes on its sigwait thread (src/signals.rs). SIGCHLD is
-/// deliberately not among them: tokio's SIGCHLD handler drives
-/// `Child::wait()`. The same list as the fixture's `DEFAULT_TRAP`
-/// (tests/fixtures/test_child.rs); keep them in sync.
+/// Signals scinit consumes on its sigwait thread: the `Forward*` policies in
+/// src/signals.rs. SIGCHLD is deliberately not among them: tokio's SIGCHLD
+/// handler drives `Child::wait()`. The same list as the fixture's
+/// `DEFAULT_TRAP` (tests/fixtures/test_child.rs), on Linux; keep them in sync.
 const HANDLED: &[Signal] = &[
     Signal::SIGTERM,
     Signal::SIGINT,
     Signal::SIGQUIT,
+    Signal::SIGHUP,
     Signal::SIGUSR1,
     Signal::SIGUSR2,
-    Signal::SIGHUP,
+    Signal::SIGALRM,
+    Signal::SIGVTALRM,
+    Signal::SIGPROF,
+    Signal::SIGWINCH,
+    Signal::SIGURG,
+    Signal::SIGIO,
+    Signal::SIGXCPU,
+    Signal::SIGXFSZ,
+    Signal::SIGTSTP,
+    Signal::SIGCONT,
+    #[cfg(not(any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "sparc64"
+    )))]
+    Signal::SIGSTKFLT,
+    Signal::SIGPWR,
 ];
 
 /// Parse a hex signal-set field (`SigBlk`, `SigIgn`, ...) from the text of a

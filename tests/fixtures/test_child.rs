@@ -26,13 +26,42 @@ use std::os::unix::ffi::OsStrExt;
 use std::str::FromStr;
 use std::time::Duration;
 
+/// The signals scinit forwards (the `Forward*` policies in src/signals.rs).
+/// The same list as `HANDLED` in tests/integration/scenarios/linux.rs; keep
+/// them in sync.
 const DEFAULT_TRAP: &[Signal] = &[
     Signal::SIGTERM,
     Signal::SIGINT,
     Signal::SIGQUIT,
+    Signal::SIGHUP,
     Signal::SIGUSR1,
     Signal::SIGUSR2,
-    Signal::SIGHUP,
+    Signal::SIGALRM,
+    Signal::SIGVTALRM,
+    Signal::SIGPROF,
+    Signal::SIGWINCH,
+    Signal::SIGURG,
+    Signal::SIGIO,
+    Signal::SIGXCPU,
+    Signal::SIGXFSZ,
+    Signal::SIGTSTP,
+    Signal::SIGCONT,
+    #[cfg(all(
+        target_os = "linux",
+        not(any(
+            target_arch = "mips",
+            target_arch = "mips32r6",
+            target_arch = "mips64",
+            target_arch = "mips64r6",
+            target_arch = "sparc",
+            target_arch = "sparc64"
+        ))
+    ))]
+    Signal::SIGSTKFLT,
+    #[cfg(target_os = "linux")]
+    Signal::SIGPWR,
+    #[cfg(target_os = "macos")]
+    Signal::SIGINFO,
 ];
 const DEFAULT_EXIT_ON: &[Signal] = &[Signal::SIGTERM, Signal::SIGINT, Signal::SIGQUIT];
 
@@ -155,11 +184,20 @@ fn signal_loop(trap: &[Signal], exit_on: &[Signal]) -> ! {
 /// are waited for too and re-raised with the default disposition, because on
 /// macOS a default-action signal doesn't terminate a process whose thread is
 /// parked in `sigwait` for other signals.
+///
+/// Each blocked signal gets a handler that never runs, as in scinit: macOS
+/// discards a signal whose default action is to ignore it (SIGWINCH, ...)
+/// even when it is blocked.
 fn block_signals(trap: &[Signal]) -> SigSet {
     let set = sigset(trap.iter().chain(DEFAULT_TRAP).filter(|s| !is_ignored(**s)));
     set.thread_block().expect("failed to block signals");
+    for sig in set.iter() {
+        set_disposition(sig, SigHandler::Handler(never_runs));
+    }
     set
 }
+
+extern "C" fn never_runs(_: libc::c_int) {}
 
 /// Wait on `set` forever: log signals in `trap`, exiting 0 on one in
 /// `exit_on`, and die by the default action of any other
