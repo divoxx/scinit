@@ -34,7 +34,8 @@ A misspelled scinit option before the command is still an error (exit 2), not mi
 | `--ports <PORT>[,<PORT>...]` | none | TCP ports to bind and pass to the child as file descriptors 3, 4, ... in the order given. Takes a comma-separated list, and the flag can be repeated (`--ports 8080 --ports 8081` is the same as `--ports 8080,8081`). Each port must be between 0 and 65535. |
 | `--bind-addr <ADDR>` | `127.0.0.1` | The address `--ports` are bound on. Must be an IP address literal, IPv4 or IPv6 (`0.0.0.0`, `::`, `::1`); a hostname such as `localhost` is rejected. |
 | `--reuse-port` | off | Set `SO_REUSEPORT` on the `--ports` sockets, so other processes that also set it can bind the same ports. `SO_REUSEADDR` is always set. |
-| `-h`, `--help` | | Print help, including a summary of `SCINIT_LOG`, and exit with code 0. |
+| `--log-time` | off | Start each of scinit's log lines with the time in UTC, in RFC 3339 format with microseconds, such as `2026-10-08T14:03:12.123456Z`. Same as `SCINIT_LOG_TIME=1`. See [Logging](../guides/logging.md#timestamps). |
+| `-h`, `--help` | | Print help, including a summary of `SCINIT_LOG` and `SCINIT_LOG_TIME`, and exit with code 0. |
 | `-V`, `--version` | | Print the version and exit with code 0. |
 
 `--watch-path`, `--debounce-ms` and `--restart-delay-ms` only take effect together with `--live-reload`. Without it they are accepted and ignored: no error, no warning, and nothing is watched. Since a child that exits is never restarted, the restart delay has no use outside live reload either.
@@ -55,6 +56,7 @@ The ports themselves are bound just before the first child is spawned. A port th
 | Variable | Effect |
 |---|---|
 | `SCINIT_LOG` | Filter for scinit's own log output on stderr, in [tracing's `EnvFilter` syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html): a level (`error`, `warn`, `info`, `debug`, `trace`) and/or per-module directives such as `scinit::file_watcher=debug`. The default is `warn`. A bare word that isn't a level (such as `inf`) is read as a target name, as `EnvFilter` does, with a warning; a value that can't be parsed is ignored with a warning and the default applies. See [Logging](../guides/logging.md#things-to-know). The fatal error that ends scinit is printed whatever the filter. |
+| `SCINIT_LOG_TIME` | When set to anything other than empty, `0`, `false`, `no` or `off` (in any case), scinit's log lines start with the time in UTC, as with `--log-time`. Unset, there is no timestamp unless `--log-time` is given; the variable can't turn off the flag. |
 | `NO_COLOR` | When set (to any value), scinit's log lines are never colored. Without it, they are colored only when stderr is a terminal or `CLICOLOR_FORCE` is set. |
 | `CLICOLOR_FORCE` | When set to anything other than `0` (or empty), scinit's log lines are colored even when stderr isn't a terminal, unless `NO_COLOR` is set. |
 | `PATH` | Used to find `<COMMAND>` when it contains no `/`, both to spawn it and to pick the default `--watch-path`. |
@@ -103,4 +105,4 @@ For more information, try '--help'.
 
 ## Related
 
-[Signals and shutdown](../guides/signals-and-shutdown.md) explains `--graceful-timeout-secs`, [Exit codes](../guides/exit-codes.md) the table above, [Zombie reaping](../guides/zombie-reaping.md) `--zombie-reap-interval-ms`, [Live reload](../guides/live-reload.md) the watch options, [Socket activation](../guides/socket-activation.md) `--ports`, `--bind-addr` and `--reuse-port`, and [Logging](../guides/logging.md) `SCINIT_LOG`.
+[Signals and shutdown](../guides/signals-and-shutdown.md) explains `--graceful-timeout-secs`, [Exit codes](../guides/exit-codes.md) the table above, [Zombie reaping](../guides/zombie-reaping.md) `--zombie-reap-interval-ms`, [Live reload](../guides/live-reload.md) the watch options, [Socket activation](../guides/socket-activation.md) `--ports`, `--bind-addr` and `--reuse-port`, and [Logging](../guides/logging.md) `SCINIT_LOG`, `--log-time` and `SCINIT_LOG_TIME`.
