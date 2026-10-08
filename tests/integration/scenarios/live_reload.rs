@@ -1,6 +1,8 @@
 //! Live-reload: file changes restart the child; nothing else does.
 //!
 //! Watching is non-recursive on a single `--watch-path` (file or directory).
+//! A file is watched through its parent directory, so it can be replaced by
+//! rename or deleted and recreated.
 //! Only content changes and renames of regular files count, not
 //! metadata-only changes. Debouncing is trailing-edge: the restart fires once
 //! changes have been quiet for `--debounce-ms`. A restart is SIGTERM to the
@@ -117,6 +119,101 @@ fn watch_single_file_restarts_child() {
 
     let new = scinit.wait_for_nth("started", 2, TIMEOUT).unwrap().pid();
     assert_ne!(old, new);
+}
+
+/// Replace `file` the way linkers, `install` and atomic-save editors do: write
+/// a new file next to it and rename it over `file`
+fn replace_by_rename(file: &Path, write: impl FnOnce(&Path)) {
+    let tmp = file.with_file_name(format!(
+        ".{}.new",
+        file.file_name().unwrap().to_string_lossy()
+    ));
+    write(&tmp);
+    std::fs::rename(&tmp, file).unwrap();
+}
+
+/// A single watched file replaced by rename restarts the child, and the watch
+/// survives the replacement: on Linux, inotify would otherwise stay on the
+/// old, deleted inode and miss every later change
+#[test]
+fn watch_single_file_survives_replacement_by_rename() {
+    let b = Scinit::builder();
+    let file = watched_dir(&b).join("app.conf");
+    modify(&file, "v0");
+    let (scinit, _) = start_and_settle(live_reload(b, &file).child(["run"]));
+
+    replace_by_rename(&file, |tmp| modify(tmp, "v1"));
+    scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
+    std::thread::sleep(SETTLE);
+    replace_by_rename(&file, |tmp| modify(tmp, "v2"));
+    scinit
+        .wait_for_nth("started", 3, TIMEOUT)
+        .unwrap_or_else(|e| panic!("the second replacement never caused a restart: {}", e));
+}
+
+/// A single watched file that is deleted and created again restarts the
+/// child, each time
+#[test]
+fn watch_single_file_survives_delete_and_recreate() {
+    let b = Scinit::builder();
+    let file = watched_dir(&b).join("app.conf");
+    modify(&file, "v0");
+    let (scinit, _) = start_and_settle(live_reload(b, &file).child(["run"]));
+
+    for (i, content) in ["v1", "v2"].into_iter().enumerate() {
+        std::fs::remove_file(&file).unwrap();
+        modify(&file, content);
+        scinit.wait_for_nth("started", i + 2, TIMEOUT).unwrap();
+        std::thread::sleep(SETTLE);
+    }
+}
+
+/// A single file is watched through its directory, but changes to the other
+/// files there don't restart the child
+#[test]
+fn watch_single_file_ignores_other_files_in_its_directory() {
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let file = dir.join("app.conf");
+    let other = dir.join("other.conf");
+    modify(&file, "v0");
+    modify(&other, "v0");
+    let (mut scinit, _) = start_and_settle(live_reload(b, &file).child(["run"]));
+    modify(&other, "v1");
+    replace_by_rename(&other, |tmp| modify(tmp, "v2"));
+
+    assert_no_restart(&mut scinit, "changing another file in the directory");
+}
+
+/// The default watch path, the executable, replaced by rename twice (as a
+/// build copying in a fresh binary does) restarts the child twice, running
+/// the new binary each time
+#[test]
+fn default_watch_path_survives_executable_replaced_by_rename() {
+    let b = Scinit::builder();
+    let exe = watched_dir(&b).join("app");
+    std::fs::copy(TEST_CHILD, &exe).unwrap();
+    let_setup_writes_age();
+    let (mut scinit, _) = start_and_settle(
+        b.args(["--live-reload", "--debounce-ms", "200"])
+            .args([
+                "--restart-delay-ms",
+                "100",
+                "--zombie-reap-interval-ms",
+                "100",
+            ])
+            .command([exe.as_os_str(), "run".as_ref()]),
+    );
+
+    for n in 2..=3 {
+        replace_by_rename(&exe, |tmp| {
+            std::fs::copy(TEST_CHILD, tmp).unwrap();
+        });
+        scinit.wait_for_nth("started", n, TIMEOUT).unwrap();
+        std::thread::sleep(SETTLE);
+    }
+    scinit.assert_running_for(QUIET);
+    scinit.assert_start_count(3, "two replacements must restart the child twice");
 }
 
 /// The new child starts no sooner than `--restart-delay-ms` after the old one exits

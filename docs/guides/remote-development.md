@@ -54,8 +54,6 @@ The application container in a development pod and the one you ship can differ o
 
 scinit decides that a build is finished when the files it watches have been quiet for `--debounce-ms`. A binary written slowly in place, or a build that writes several files, can pause longer than that, so scinit may start a half-written build. A trigger file the build sidecar touches when it is done is planned in [#30](https://github.com/divoxx/scinit/issues/30).
 
-On Linux, a single watched file that the build replaces by renaming a new file over it stops being watched after the first replacement, and build tools often write their output that way. Until [#19](https://github.com/divoxx/scinit/issues/19) makes scinit watch a single file through its parent directory, watch the directory the binary is written to instead. [Live reload](live-reload.md) has the details.
-
 When the program exits on its own, scinit exits too, even with live reload on, so a build that crashes at startup ends the container. Waiting for the next change instead is planned in [#22](https://github.com/divoxx/scinit/issues/22).
 
 ## Related

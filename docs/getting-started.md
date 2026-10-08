@@ -161,7 +161,7 @@ scinit is told about changes by the kernel's file notifications (inotify on Linu
 
 ### What to watch, and what live reload doesn't do
 
-Watching the directory rather than `app.sh` itself matters on Linux: many editors save by writing a new file and renaming it over the old one, and a watch on a single file is lost when that happens. Without `--watch-path`, scinit watches the command's executable, which is a single file, so pass the directory your build writes to instead. [Live reload](guides/live-reload.md) explains both.
+Without `--watch-path`, scinit watches the command's executable, here `/app/app.sh`. A single file is watched through its directory, so it is still seen when an editor saves by writing a new file and renaming it over the old one, or when a build replaces a binary the same way. Watching the directory, as above, also restarts the program when the other files in it change. [Live reload](guides/live-reload.md) explains how to choose.
 
 Two rules from the container world still apply in this mode. Only file changes cause a restart: if the program exits or crashes on its own, scinit exits with its status instead of starting it again. And a restart briefly leaves nothing running, so a server would refuse connections in that window, unless scinit holds its listening socket. That is what `--ports` is for, here with a server binary built into `./bin` on your machine:
 

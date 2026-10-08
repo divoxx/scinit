@@ -88,7 +88,7 @@ DEBUG scinit::file_watcher: File system event: Event { kind: Modify(Data(Any)), 
 
 Each case shows one of the reasons a change doesn't cause a restart. The `touch` produced an event, but a metadata-only one, which scinit ignores. The write to `config/nested/extra.conf` produced no event at all, because directories are watched non-recursively. Only the content change to a file directly in the watched directory led to `File changed`. A restart arrives `--debounce-ms` after the last change, so a file that keeps changing delays it.
 
-If you see no events at all for a file you are sure changed, and you are watching a single file on Linux, the file may have been replaced by a rename, which loses the watch. Watch the directory instead. The [live reload guide](live-reload.md) covers this and the other cases in detail.
+When `--watch-path` is a single file, scinit watches its directory, so these lines also show events for the other files there, which scinit ignores. The [live reload guide](live-reload.md) covers this and the other cases in detail.
 
 ### The container takes 30 seconds to stop
 
