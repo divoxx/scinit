@@ -19,10 +19,6 @@ impl Environment {
         self.0.extend(other.0);
     }
 
-    pub fn contains(&self, key: &str) -> bool {
-        self.0.contains_key(key)
-    }
-
     pub fn into_inner(self) -> HashMap<String, String> {
         self.0
     }

@@ -150,7 +150,7 @@ fn fatal_errors_are_logged_as_events() {
         .command(["/nonexistent/scinit-no-such-binary"])
         .run(TIMEOUT)
         .unwrap();
-    scinit.assert_exit_code(status, 1);
+    scinit.assert_exit_code(status, 127);
     let stderr = scinit.stderr();
     assert!(
         stderr.starts_with("ERROR scinit: Failed to spawn process"),
@@ -204,16 +204,6 @@ fn watch_path_without_live_reload_is_ignored() {
         .start();
     scinit.assert_running_for(Duration::from_millis(1000));
     scinit.assert_start_count(1, "--watch-path alone must not restart the child");
-}
-
-/// A command that cannot be executed makes scinit exit 1
-#[test]
-fn nonexistent_command_exits_one() {
-    let (scinit, status) = Scinit::builder()
-        .command(["/nonexistent/scinit-no-such-binary"])
-        .run(TIMEOUT)
-        .unwrap();
-    scinit.assert_exit_code(status, 1);
 }
 
 /// Run scinit with stderr on a pseudo-terminal and return what it wrote there

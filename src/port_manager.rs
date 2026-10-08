@@ -93,7 +93,7 @@ impl PortManager {
         socket.listen(128)?;
 
         // The socket stays close-on-exec (socket2's default): the child gets
-        // a copy at its systemd fd number instead, see socket_activation
+        // a copy at its systemd fd number instead, see child_exec
         self.sockets.insert(port, socket);
 
         info!("Bound port {} to {}", port, socket_addr);
@@ -122,7 +122,7 @@ impl PortManager {
     /// `LISTEN_FDS` for the child, or nothing if no sockets are bound.
     ///
     /// `LISTEN_PID` is not included: only the forked child knows its pid, so
-    /// `socket_activation` fills it in there.
+    /// `child_exec` fills it in there.
     pub fn socket_activation_env(&self) -> Environment {
         let mut env = Environment::new();
         if !self.sockets.is_empty() {

@@ -164,8 +164,12 @@ impl Config {
     }
 }
 
-/// Watch path without `--watch-path`: the executable `command` runs
+/// Watch path without `--watch-path`: the executable `command` runs. A
+/// path is watched as is, even if it doesn't exist yet or isn't executable.
 fn default_watch_path(command: &str) -> Result<PathBuf> {
+    if command.contains('/') {
+        return Ok(PathBuf::from(command));
+    }
     resolve_program(command).map_err(|_| {
         eyre!(
             "--live-reload: cannot find '{}' in PATH to watch; pass --watch-path",

@@ -1,22 +1,25 @@
-//! Exec of a socket-activated child, following the systemd protocol.
+//! The child's exec, done by the forked child itself from a `pre_exec` hook.
 //!
-//! The protocol needs two things only the forked child can provide:
-//! `LISTEN_PID` must be the child's own PID, and the listening sockets must
-//! sit at fds 3, 4, ... in `LISTEN_FDS` order. `std::process::Command` builds
-//! the environment before forking, so the child execs itself from a
-//! `pre_exec` hook instead.
+//! `std::process::Command` only forks and sets up stdio, the process group
+//! and the other `pre_exec` hooks; the last hook execs. This is because the
+//! systemd socket activation protocol needs two things only the forked
+//! child can provide: `LISTEN_PID` must be the child's own PID, and the
+//! listening sockets must sit at fds 3, 4, ... in `LISTEN_FDS` order. Without
+//! sockets the same exec runs, so every child is started the same way.
 //!
-//! Everything is prepared before the fork. The child only runs
-//! async-signal-safe operations: `fcntl`, `dup2`, `getpid`, writing digits
-//! into a preallocated buffer, and `execve`.
+//! Everything is prepared before the fork: the program is resolved against
+//! `PATH` in the parent (`execve` doesn't search it, and `execvp` may
+//! allocate), and argv and the environment are built there. The child only
+//! runs async-signal-safe operations: `fcntl`, `dup2`, `getpid`, writing
+//! digits into a preallocated buffer, and `execve`.
 
 use crate::environment::Environment;
-use crate::program::resolve_program;
 use crate::Result;
 use eyre::eyre;
 use std::ffi::{CString, OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
+use std::path::Path;
 
 /// First fd passed to a socket-activated service (`SD_LISTEN_FDS_START`)
 pub const LISTEN_FDS_START: RawFd = 3;
@@ -29,15 +32,16 @@ const MAX_DIGITS: usize = 20;
 /// Room for any pid's decimal digits plus the terminating NUL
 const PID_DIGITS: usize = MAX_DIGITS + 1;
 
-/// Pre-built `execve` arguments for a socket-activated child
-pub struct SocketActivationExec {
+/// Pre-built `execve` arguments for the child
+pub struct ChildExec {
     program: CString,
     // Own the strings the pointer arrays point into
     _argv: Vec<CString>,
     _envp: Vec<CString>,
     argv_ptrs: Vec<*const libc::c_char>,
     envp_ptrs: Vec<*const libc::c_char>,
-    /// `LISTEN_PID=` followed by space for the digits, filled in by the child
+    /// `LISTEN_PID=` followed by space for the digits, filled in by the
+    /// child; only in the environment when there are sockets
     pid_slot: Vec<u8>,
     listen_fds: Vec<RawFd>,
     /// Scratch space for the temporary duplicates made while remapping
@@ -46,37 +50,37 @@ pub struct SocketActivationExec {
 
 // The raw pointers point into heap buffers owned by this struct, which never
 // move or change outside `exec_in_child` (run in the single-threaded child)
-unsafe impl Send for SocketActivationExec {}
-unsafe impl Sync for SocketActivationExec {}
+unsafe impl Send for ChildExec {}
+unsafe impl Sync for ChildExec {}
 
-impl SocketActivationExec {
-    /// Prepares the exec of `command args` with `listen_fds` passed as the
-    /// activated sockets and `overrides` (`LISTEN_FDS` and the configured
+impl ChildExec {
+    /// Prepares the exec of `program` (`command` resolved) with argv
+    /// `command args`, `listen_fds` passed as the activated sockets (if any)
+    /// and `overrides` (`LISTEN_FDS` with sockets, and the configured
     /// variables) added to scinit's own environment
     pub fn new(
+        program: &Path,
         command: &str,
         args: &[String],
         listen_fds: Vec<RawFd>,
         overrides: Environment,
     ) -> Result<Self> {
-        let program = resolve_program(command)?;
         let env = child_env(overrides);
 
         // execve takes C strings, and the child must not allocate, so they
         // are converted here
         let program = c_string(program)?;
+        // argv[0] stays as typed, as a shell passes it
         let argv = c_strings(std::iter::once(command).chain(args.iter().map(String::as_str)))?;
         let envp = c_strings(env)?;
 
         let mut pid_slot = LISTEN_PID_PREFIX.to_vec();
         pid_slot.resize(LISTEN_PID_PREFIX.len() + PID_DIGITS, 0);
+        let listen_pid =
+            (!listen_fds.is_empty()).then_some(pid_slot.as_ptr() as *const libc::c_char);
 
         let argv_ptrs = null_terminated(argv.iter().map(|s| s.as_ptr()));
-        let envp_ptrs = null_terminated(
-            envp.iter()
-                .map(|s| s.as_ptr())
-                .chain(std::iter::once(pid_slot.as_ptr() as *const libc::c_char)),
-        );
+        let envp_ptrs = null_terminated(envp.iter().map(|s| s.as_ptr()).chain(listen_pid));
 
         Ok(Self {
             program,
@@ -90,34 +94,22 @@ impl SocketActivationExec {
         })
     }
 
-    /// Runs in the forked child: moves the sockets to fds 3.., fills in
-    /// `LISTEN_PID` and execs. Only returns on failure.
+    /// Runs in the forked child, after the other `pre_exec` hooks: moves the
+    /// sockets to fds 3.., fills in `LISTEN_PID` and execs. Only returns on
+    /// failure.
     ///
     /// # Safety
     /// Must only be called in the child between fork and exec.
     pub unsafe fn exec_in_child(&mut self) -> std::io::Error {
-        let n = self.listen_fds.len() as RawFd;
-
-        // Duplicate above the target range first, so no source is clobbered
-        // while the targets are filled. The duplicates are close-on-exec.
-        for (i, &fd) in self.listen_fds.iter().enumerate() {
-            let dup = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, LISTEN_FDS_START + n);
-            if dup < 0 {
-                return std::io::Error::last_os_error();
+        if !self.listen_fds.is_empty() {
+            if let Err(e) = self.move_sockets() {
+                return e;
             }
-            self.scratch_fds[i] = dup;
+            write_decimal(
+                &mut self.pid_slot[LISTEN_PID_PREFIX.len()..],
+                libc::getpid() as u64,
+            );
         }
-        // dup2 clears close-on-exec on the target, so exactly these survive exec
-        for (i, &dup) in self.scratch_fds.iter().enumerate() {
-            if libc::dup2(dup, LISTEN_FDS_START + i as RawFd) < 0 {
-                return std::io::Error::last_os_error();
-            }
-        }
-
-        write_decimal(
-            &mut self.pid_slot[LISTEN_PID_PREFIX.len()..],
-            libc::getpid() as u64,
-        );
 
         libc::execve(
             self.program.as_ptr(),
@@ -125,6 +117,28 @@ impl SocketActivationExec {
             self.envp_ptrs.as_ptr(),
         );
         std::io::Error::last_os_error()
+    }
+
+    /// Moves the sockets to fds 3.., in order
+    unsafe fn move_sockets(&mut self) -> std::io::Result<()> {
+        let n = self.listen_fds.len() as RawFd;
+
+        // Duplicate above the target range first, so no source is clobbered
+        // while the targets are filled. The duplicates are close-on-exec.
+        for (i, &fd) in self.listen_fds.iter().enumerate() {
+            let dup = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, LISTEN_FDS_START + n);
+            if dup < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            self.scratch_fds[i] = dup;
+        }
+        // dup2 clears close-on-exec on the target, so exactly these survive exec
+        for (i, &dup) in self.scratch_fds.iter().enumerate() {
+            if libc::dup2(dup, LISTEN_FDS_START + i as RawFd) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
     }
 }
 

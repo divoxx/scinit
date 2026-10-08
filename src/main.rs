@@ -3,6 +3,7 @@
 
 type Result<T> = eyre::Result<T>;
 
+mod child_exec;
 mod cli;
 mod environment;
 mod exit_status;
@@ -14,7 +15,6 @@ mod process_manager;
 mod program;
 mod reaper;
 mod signals;
-mod socket_activation;
 mod terminal;
 
 use clap::Parser;
@@ -29,6 +29,7 @@ use exit_status::{exit_code, handle_child_exit, signal_exit_code};
 use file_watcher::{FileChangeEvent, FileWatcher};
 use port_manager::PortManager;
 use process_manager::ProcessManager;
+use program::ProgramError;
 use reaper::{reap_before_exit, spawn_zombie_reap};
 use signals::{Signal, SignalHandler};
 
@@ -38,8 +39,16 @@ fn main() {
     // are logged like everything else scinit says: `ERROR scinit: ...`
     std::process::exit(run().unwrap_or_else(|e| {
         error!("{:#}", e);
-        1
+        error_exit_code(&e)
     }))
+}
+
+/// Exit code for an error that ends scinit: 127 or 126 for a command that
+/// is not found or not executable, as shells exit; 1 otherwise
+fn error_exit_code(error: &eyre::Report) -> i32 {
+    error
+        .downcast_ref::<ProgramError>()
+        .map_or(1, ProgramError::exit_code)
 }
 
 /// Runs scinit and returns the exit code to exit with

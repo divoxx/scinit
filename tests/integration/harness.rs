@@ -729,6 +729,18 @@ pub fn free_ports(n: usize) -> Vec<u16> {
     ports
 }
 
+/// `$PATH` with `dir` prepended
+pub fn path_with(dir: &Path) -> OsString {
+    match std::env::var_os("PATH") {
+        Some(p) => {
+            let mut dirs = vec![dir.to_path_buf()];
+            dirs.extend(std::env::split_paths(&p));
+            std::env::join_paths(dirs).unwrap()
+        }
+        None => dir.as_os_str().to_owned(),
+    }
+}
+
 /// `127.0.0.1:<port>`
 pub fn loopback(port: u16) -> String {
     format!("127.0.0.1:{}", port)
