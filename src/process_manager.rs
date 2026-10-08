@@ -122,6 +122,7 @@ impl ProcessManager {
         close_stray_fds_on_exec(&mut command);
         self.install_socket_activation(&mut command, overrides)?;
 
+        prepare_for_fork();
         let child = command
             .spawn()
             .map_err(|e| eyre!("Failed to spawn process '{}': {}", self.config.command, e))?;
@@ -384,6 +385,49 @@ fn remove_inherited_listen_vars(command: &mut Command, overrides: &Environment) 
         if inherited_listen_var && !key.to_str().is_some_and(|k| overrides.contains(k)) {
             command.env_remove(key);
         }
+    }
+}
+
+/// Makes sure a fork can't catch macOS's libnotify half set up (#42).
+///
+/// libnotify, macOS's notification library, sets itself up lazily, the
+/// first time anything in the process uses it, behind a run-once gate. If
+/// one thread is in the middle of that setup when another thread forks,
+/// the child inherits the gate marked "in progress" by a thread that doesn't
+/// exist in the child. libnotify's after-fork hook in the child then detects
+/// the corruption and aborts it, which the kernel delivers as SIGKILL, before
+/// the child reaches our code or exec. Crash reports show:
+///
+/// ```text
+/// fork > libSystem_atfork_child > _notify_fork_child > _os_alloc_once
+///      > _os_once_gate_wait > _os_once_gate_corruption_abort
+/// ```
+///
+/// The other thread can be the file watcher: starting FSEvents goes through
+/// CoreFoundation to `os_log_create`, a first use of libnotify. In the unit
+/// tests the file watcher tests run in parallel with the spawning ones. In
+/// scinit the watcher starts before the first spawn, so the setup is
+/// normally done, but a first use on another thread (FSEvents' own, say)
+/// could still coincide with a spawn.
+///
+/// We fork rather than `posix_spawn`, which skips these hooks, because of
+/// the `pre_exec` hooks (taking the terminal, socket activation's
+/// `LISTEN_PID`), which `posix_spawn` can't replace.
+///
+/// So one call into libnotify before the first fork finishes the setup, or
+/// waits for another thread that is doing it, and no later fork can catch it
+/// half done.
+fn prepare_for_fork() {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            // libnotify (part of libSystem); any call sets up its globals
+            fn notify_is_valid_token(val: libc::c_int) -> bool;
+        }
+        static LIBNOTIFY_READY: std::sync::Once = std::sync::Once::new();
+        LIBNOTIFY_READY.call_once(|| unsafe {
+            notify_is_valid_token(0);
+        });
     }
 }
 
@@ -692,6 +736,74 @@ mod tests {
             "grandchild {} survived the drop",
             grandchild
         );
+    }
+
+    /// Set in the fresh process that runs one fork-race trial
+    #[cfg(target_os = "macos")]
+    const FORK_RACE_TRIAL: &str = "SCINIT_FORK_RACE_TRIAL";
+
+    /// macOS: a spawn survives another thread setting up libnotify at the
+    /// same moment, as FSEvents does when the file watcher starts (#42).
+    /// libnotify sets up once per process, so each trial reruns this test
+    /// alone in a fresh process, with the setup starting at a different
+    /// offset from the fork.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn spawn_survives_concurrent_libnotify_setup() {
+        const TRIALS: u32 = 100;
+        if let Some(offset) = std::env::var_os(FORK_RACE_TRIAL) {
+            return fork_race_trial(offset.to_str().unwrap().parse().unwrap());
+        }
+        for trial in 0..TRIALS {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "process_manager::tests::spawn_survives_concurrent_libnotify_setup",
+                    "--exact",
+                    "--test-threads=1",
+                ])
+                .env(FORK_RACE_TRIAL, (trial % 50).to_string())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "trial {} failed:\n{}{}",
+                trial,
+                stdout,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    /// One trial: libnotify's setup starts on another thread `offset_us`
+    /// microseconds after this thread starts spawning
+    #[cfg(target_os = "macos")]
+    fn fork_race_trial(offset_us: u64) {
+        extern "C" {
+            fn notify_is_valid_token(val: libc::c_int) -> bool;
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let setup = {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let start = std::time::Instant::now();
+                while start.elapsed() < Duration::from_micros(offset_us) {}
+                unsafe { notify_is_valid_token(0) };
+            })
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let status = runtime.block_on(async {
+            let mut manager = manager(command("true", &[]));
+            barrier.wait();
+            manager.spawn_process().await.unwrap();
+            manager.wait_for_exit().await.unwrap()
+        });
+        setup.join().unwrap();
+        assert!(status.success(), "the child died: {:?}", status);
     }
 
     #[tokio::test]
