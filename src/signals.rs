@@ -6,6 +6,7 @@ pub use nix::sys::signal::Signal;
 
 use eyre::eyre;
 use nix::sys::signal::{pthread_sigmask, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow};
+use std::collections::VecDeque;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, error};
 
@@ -24,6 +25,9 @@ pub(super) struct SignalHandler {
     /// Signals consumed by the sigwait thread (blocked on every thread)
     handled_signals: SigSet,
     receiver: UnboundedReceiver<Signal>,
+    /// Signals set aside by `wait_for_termination_signal`, delivered first
+    /// by the next `wait_for_signal`
+    deferred: VecDeque<Signal>,
 }
 
 impl SignalHandler {
@@ -47,6 +51,7 @@ impl SignalHandler {
         Ok(SignalHandler {
             handled_signals,
             receiver,
+            deferred: VecDeque::new(),
         })
     }
 
@@ -60,11 +65,39 @@ impl SignalHandler {
     /// Cancel-safe: dropping the future (e.g. when another `select!` branch
     /// wins) never loses a signal.
     pub async fn wait_for_signal(&mut self) -> Result<Signal> {
+        if let Some(signal) = self.deferred.pop_front() {
+            return Ok(signal);
+        }
+        self.recv().await
+    }
+
+    /// Waits for the next termination signal (SIGTERM, SIGINT, SIGQUIT).
+    /// Other signals received meanwhile are kept, in order, for
+    /// `wait_for_signal`.
+    ///
+    /// Cancel-safe, like `wait_for_signal`.
+    pub async fn wait_for_termination_signal(&mut self) -> Result<Signal> {
+        loop {
+            let signal = self.recv().await?;
+            if is_termination(signal) {
+                return Ok(signal);
+            }
+            debug!("deferring {:?} until the restart is done", signal);
+            self.deferred.push_back(signal);
+        }
+    }
+
+    async fn recv(&mut self) -> Result<Signal> {
         self.receiver
             .recv()
             .await
             .ok_or_else(|| eyre!("signal thread exited"))
     }
+}
+
+/// Whether `signal` makes scinit stop the child and exit
+fn is_termination(signal: Signal) -> bool {
+    matches!(signal, Signal::SIGTERM | Signal::SIGINT | Signal::SIGQUIT)
 }
 
 /// Signals that init should handle synchronously:

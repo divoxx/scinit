@@ -9,10 +9,12 @@ use crate::Result;
 use eyre::eyre;
 use nix::sys::signal::kill;
 use nix::unistd::{getpgid, Pid};
+use std::future::Future;
 use std::os::unix::ffi::OsStrExt;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::process::{Child, Command};
+use tokio::select;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
@@ -276,13 +278,29 @@ impl ProcessManager {
     }
 
     /// Restarts the process after a file change: graceful shutdown, the
-    /// restart delay, then a new spawn
-    pub async fn restart(&mut self) -> Result<()> {
+    /// restart delay, then a new spawn. Returns `None` once the new child is
+    /// spawned.
+    ///
+    /// If `cancel` completes first, gives up without spawning and returns
+    /// its output. The old child may then still be stopping: it has been
+    /// sent SIGTERM, but isn't waited for.
+    pub async fn restart_unless<T>(
+        &mut self,
+        cancel: impl Future<Output = T>,
+    ) -> Result<Option<T>> {
         info!("Restarting process due to file change");
+        tokio::pin!(cancel);
 
-        self.graceful_shutdown().await;
-        sleep(self.config.restart_delay).await;
-        self.spawn_process().await
+        select! {
+            _ = self.graceful_shutdown() => {}
+            output = &mut cancel => return Ok(Some(output)),
+        }
+        select! {
+            _ = sleep(self.config.restart_delay) => {}
+            output = &mut cancel => return Ok(Some(output)),
+        }
+        self.spawn_process().await?;
+        Ok(None)
     }
 
     /// Sends a signal to the running child's process group
@@ -473,8 +491,30 @@ mod tests {
             ..command("echo", &["hello"])
         });
 
-        assert!(manager.restart().await.is_ok());
+        let cancelled = manager.restart_unless(std::future::pending::<()>()).await;
+        assert!(cancelled.unwrap().is_none());
         assert!(manager.is_running());
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_restart_spawns_nothing() {
+        let mut manager = manager(ProcessConfig {
+            restart_delay: Duration::from_secs(10),
+            ..command("sleep", &["10"])
+        });
+        manager.spawn_process().await.unwrap();
+        let old = manager.pid();
+
+        // Cancelled during the restart delay, after the old child exited
+        let cancel = sleep(Duration::from_millis(300));
+        let cancelled = timeout(Duration::from_secs(5), manager.restart_unless(cancel)).await;
+        assert!(cancelled.unwrap().unwrap().is_some());
+        assert!(!manager.is_running());
+        assert_eq!(manager.pid(), old);
+        assert_eq!(
+            manager.exit_status().map(exit_code),
+            Some(128 + Signal::SIGTERM as i32)
+        );
     }
 
     #[tokio::test]
