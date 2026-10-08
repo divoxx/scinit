@@ -47,8 +47,8 @@ The orphan, PID 3, exited and is stuck as a zombie under PID 1. With scinit as P
 $ podman run -d --name z2 -e SCINIT_LOG=scinit::reaper=debug scinit-demo \
     scinit -- sh -c '(sleep 1 &); exec sleep infinity'
 $ podman logs z2
-DEBUG scinit::reaper: reaped zombie process 12 with exit status 0
-DEBUG scinit::reaper: reaped 1 zombie processes
+ [dbg]  scinit::reaper: reaped zombie process 12 with exit status 0
+ [dbg]  scinit::reaper: reaped 1 zombie processes
 $ podman exec z2 ps -eo pid,ppid,stat,comm
     PID    PPID STAT COMMAND
       1       0 Ssl  scinit

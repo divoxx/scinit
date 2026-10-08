@@ -27,6 +27,7 @@ use tracing::{debug, error, info, warn};
 use cli::{Cli, Config};
 use exit_status::{exit_code, handle_child_exit, signal_exit_code};
 use file_watcher::{FileChangeEvent, FileWatcher};
+use logging::ok;
 use port_manager::PortManager;
 use process_manager::ProcessManager;
 use reaper::{reap_before_exit, spawn_zombie_reap};
@@ -35,7 +36,7 @@ use signals::{Signal, SignalHandler};
 fn main() {
     logging::init();
     // Mirror the child's exit status, like other container inits do. Errors
-    // are logged like everything else scinit says: `ERROR scinit: ...`
+    // are logged like everything else scinit says: `[fail]  scinit: ...`
     std::process::exit(run().unwrap_or_else(|e| {
         error!("{:#}", e);
         1
@@ -106,7 +107,7 @@ async fn run_main_loop(
     let mut file_watcher = match config.file_watch_config() {
         Some(watch_config) => {
             let watcher = FileWatcher::start(watch_config)?;
-            info!("File watching started for live-reload");
+            ok!("File watching started for live-reload");
             Some(watcher)
         }
         None => {

@@ -1,5 +1,6 @@
 use crate::environment::Environment;
 use crate::fds;
+use crate::logging::ok;
 use crate::port_manager::PortManager;
 use crate::reaper::{clear_managed_child, set_managed_child};
 use crate::signals::{is_termination, Signal};
@@ -187,7 +188,7 @@ impl ProcessManager {
         let pid = child.pid;
         self.state = ChildState::Running(child);
 
-        info!("Process spawned with PID: {}", pid);
+        ok!("Process spawned with PID: {}", pid);
         Ok(())
     }
 

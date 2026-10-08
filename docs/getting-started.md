@@ -44,7 +44,7 @@ $ scinit -- sh -c 'exit 3'
 $ echo $?
 3
 $ scinit -- no-such-command
-ERROR scinit: Failed to spawn process 'no-such-command': No such file or directory (os error 2)
+[fail]  scinit: Failed to spawn process 'no-such-command': No such file or directory (os error 2)
 $ echo $?
 1
 ```
@@ -89,16 +89,16 @@ The point of an init in a container is what happens when the container is stoppe
 $ docker run -d --name demo -e SCINIT_LOG=info scinit-demo
 $ docker stop demo
 $ docker logs demo
- INFO scinit: scinit starting
- INFO scinit: init system started, managing subprocess: sleep
- INFO scinit::process_manager: Spawning process: sleep ["infinity"]
- INFO scinit::process_manager: Process spawned with PID: 9
- INFO scinit: received termination signal SIGTERM, initiating graceful shutdown
- INFO scinit: Termination signal SIGTERM received, forwarding to child process (timeout: 30s)
- INFO scinit::process_manager: Initiating graceful shutdown of process 9 with SIGTERM
- INFO scinit::process_manager: Process exited gracefully
- INFO scinit: scinit exiting due to termination signal SIGTERM
- INFO scinit: scinit exiting with code 143
+[info]  scinit: scinit starting
+[info]  scinit: init system started, managing subprocess: sleep
+[info]  scinit: Spawning process: sleep ["infinity"]
+  [ok]  scinit: Process spawned with PID: 9
+[info]  scinit: received termination signal SIGTERM, initiating graceful shutdown
+[info]  scinit: Termination signal SIGTERM received, forwarding to child process (timeout: 30s)
+[info]  scinit: Initiating graceful shutdown of process 9 with SIGTERM
+[info]  scinit: Process exited gracefully
+[info]  scinit: scinit exiting due to termination signal SIGTERM
+[info]  scinit: scinit exiting with code 143
 $ docker inspect demo --format '{{.State.ExitCode}}'
 143
 ```
@@ -135,19 +135,19 @@ docker run --rm -e SCINIT_LOG=info -v "$PWD/app:/app" scinit-demo \
 Now edit `app/app.sh` on your machine, changing `version 1` to `version 2`, and save. Half a second after the last change (the `--debounce-ms` default of 500), scinit stops the old process, waits for the `--restart-delay-ms` pause (1 second by default), and starts the new one. This is the real output from a Linux host:
 
 ```
- INFO scinit: scinit starting
- INFO scinit: init system started, managing subprocess: /app/app.sh
- INFO scinit::file_watcher: Started watching path: "/app"
- INFO scinit: File watching started for live-reload
- INFO scinit::process_manager: Spawning process: /app/app.sh []
- INFO scinit::process_manager: Process spawned with PID: 10
+[info]  scinit: scinit starting
+[info]  scinit: init system started, managing subprocess: /app/app.sh
+[info]  scinit: Started watching path: "/app"
+  [ok]  scinit: File watching started for live-reload
+[info]  scinit: Spawning process: /app/app.sh []
+  [ok]  scinit: Process spawned with PID: 10
 app started, version 1
- INFO scinit: File changed: "/app/app.sh", triggering restart
- INFO scinit::process_manager: Restarting process due to file change
- INFO scinit::process_manager: Initiating graceful shutdown of process 10 with SIGTERM
- INFO scinit::process_manager: Process exited gracefully
- INFO scinit::process_manager: Spawning process: /app/app.sh []
- INFO scinit::process_manager: Process spawned with PID: 12
+[info]  scinit: File changed: "/app/app.sh", triggering restart
+[info]  scinit: Restarting process due to file change
+[info]  scinit: Initiating graceful shutdown of process 10 with SIGTERM
+[info]  scinit: Process exited gracefully
+[info]  scinit: Spawning process: /app/app.sh []
+  [ok]  scinit: Process spawned with PID: 12
 app started, version 2
 ```
 

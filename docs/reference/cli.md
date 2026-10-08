@@ -43,7 +43,7 @@ A misspelled scinit option before the command is still an error (exit 2), not mi
 
 ```
 $ scinit --bind-addr localhost --ports 8080 -- my-server
-ERROR scinit: Invalid bind address 'localhost': invalid IP address syntax
+[fail]  scinit: Invalid bind address 'localhost': invalid IP address syntax
 $ echo $?
 1
 ```
@@ -55,7 +55,8 @@ The ports themselves are bound just before the first child is spawned. A port th
 | Variable | Effect |
 |---|---|
 | `SCINIT_LOG` | Filter for scinit's own log output on stderr, in [tracing's `EnvFilter` syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html): a level (`error`, `warn`, `info`, `debug`, `trace`) and/or per-module directives such as `scinit::file_watcher=debug`. The default is `warn`. A bare word that isn't a level (such as `inf`) is read as a target name, as `EnvFilter` does, with a warning; a value that can't be parsed is ignored with a warning and the default applies. See [Logging](../guides/logging.md#things-to-know). The fatal error that ends scinit is printed whatever the filter. |
-| `NO_COLOR` | When set (to any value), scinit's log lines are never colored. Without it, they are colored only when stderr is a terminal. |
+| `NO_COLOR` | When set (to any value), scinit's log lines are never colored. Without it, they are colored only when stderr is a terminal or `CLICOLOR_FORCE` is set. |
+| `CLICOLOR_FORCE` | When set to anything other than `0` (or empty), scinit's log lines are colored even when stderr isn't a terminal, unless `NO_COLOR` is set. |
 | `PATH` | Used to find `<COMMAND>` when it contains no `/`, both to spawn it and to pick the default `--watch-path`. |
 
 scinit does not read `RUST_LOG`. It is passed to the child unchanged, so it configures your program's logging and not scinit's.
@@ -83,7 +84,7 @@ scinit's exit code is designed to be the one your program would have produced if
 | 2 | A usage error reported by the argument parser, such as a missing `<COMMAND>`, an unknown option, or an out-of-range value. |
 | 0 | `--help` or `--version`. |
 
-Because the child's codes pass straight through, a child that itself exits with 1 or 2 can't be told apart from a scinit error by the code alone. scinit's own errors are always logged on stderr as an `ERROR scinit: ...` line, whatever `SCINIT_LOG` says, and usage errors are printed by the parser with a `Usage:` hint.
+Because the child's codes pass straight through, a child that itself exits with 1 or 2 can't be told apart from a scinit error by the code alone. scinit's own errors are always logged on stderr as a `[fail]  scinit: ...` line, whatever `SCINIT_LOG` says, and usage errors are printed by the parser with a `Usage:` hint.
 
 ```
 $ scinit -- sh -c 'exit 3'; echo $?
@@ -91,7 +92,7 @@ $ scinit -- sh -c 'exit 3'; echo $?
 $ scinit -- sh -c 'kill -9 $$'; echo $?
 137
 $ scinit -- no-such-command; echo $?
-ERROR scinit: Failed to spawn process 'no-such-command': No such file or directory (os error 2)
+[fail]  scinit: Failed to spawn process 'no-such-command': No such file or directory (os error 2)
 1
 $ scinit --zombie-reap-interval-ms 0 -- my-server; echo $?
 error: invalid value '0' for '--zombie-reap-interval-ms <ZOMBIE_REAP_INTERVAL_MS>': 0 is not in 1..18446744073709551615

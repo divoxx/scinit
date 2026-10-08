@@ -51,28 +51,28 @@ This example runs a small shell script, `/app/server`, that prints its config an
 
 ```console
 $ SCINIT_LOG=info scinit --live-reload --watch-path /app/config -- server
- INFO scinit: scinit starting
- INFO scinit: init system started, managing subprocess: server
- INFO scinit::file_watcher: Started watching path: "/app/config"
- INFO scinit: File watching started for live-reload
- INFO scinit::process_manager: Spawning process: server []
- INFO scinit::process_manager: Process spawned with PID: 15
+[info]  scinit: scinit starting
+[info]  scinit: init system started, managing subprocess: server
+[info]  scinit: Started watching path: "/app/config"
+  [ok]  scinit: File watching started for live-reload
+[info]  scinit: Spawning process: server []
+  [ok]  scinit: Process spawned with PID: 15
 server: started, pid 15, config v1
- INFO scinit: File changed: "/app/config/app.conf", triggering restart
- INFO scinit::process_manager: Restarting process due to file change
- INFO scinit::process_manager: Initiating graceful shutdown of process 15 with SIGTERM
+[info]  scinit: File changed: "/app/config/app.conf", triggering restart
+[info]  scinit: Restarting process due to file change
+[info]  scinit: Initiating graceful shutdown of process 15 with SIGTERM
 server: got SIGTERM, exiting
- INFO scinit::process_manager: Process exited gracefully
- INFO scinit::process_manager: Spawning process: server []
- INFO scinit::process_manager: Process spawned with PID: 45
+[info]  scinit: Process exited gracefully
+[info]  scinit: Spawning process: server []
+  [ok]  scinit: Process spawned with PID: 45
 server: started, pid 45, config v4
- INFO scinit: received termination signal SIGTERM, initiating graceful shutdown
- INFO scinit: Termination signal SIGTERM received, forwarding to child process (timeout: 30s)
- INFO scinit::process_manager: Initiating graceful shutdown of process 45 with SIGTERM
+[info]  scinit: received termination signal SIGTERM, initiating graceful shutdown
+[info]  scinit: Termination signal SIGTERM received, forwarding to child process (timeout: 30s)
+[info]  scinit: Initiating graceful shutdown of process 45 with SIGTERM
 server: got SIGTERM, exiting
- INFO scinit::process_manager: Process exited gracefully
- INFO scinit: scinit exiting due to termination signal SIGTERM
- INFO scinit: scinit exiting with code 0
+[info]  scinit: Process exited gracefully
+[info]  scinit: scinit exiting due to termination signal SIGTERM
+[info]  scinit: scinit exiting with code 0
 ```
 
 The three writes produced one restart, and the new process saw the last version (`v4`). The pause between `Process exited gracefully` and the next `Spawning process` is the one-second restart delay.
@@ -81,9 +81,9 @@ Without `--watch-path`, the watched path is the resolved executable:
 
 ```console
 $ SCINIT_LOG=info scinit --live-reload -- server
- INFO scinit: scinit starting
- INFO scinit: init system started, managing subprocess: server
- INFO scinit::file_watcher: Started watching path: "/app/server"
+[info]  scinit: scinit starting
+[info]  scinit: init system started, managing subprocess: server
+[info]  scinit: Started watching path: "/app/server"
  ...
 ```
 
@@ -91,7 +91,7 @@ If the command can't be found in `PATH`, scinit refuses to start rather than wat
 
 ```console
 $ scinit --live-reload -- my-app
-ERROR scinit: --live-reload: cannot find 'my-app' in PATH to watch; pass --watch-path
+[fail]  scinit: --live-reload: cannot find 'my-app' in PATH to watch; pass --watch-path
 ```
 
 In a development container, the usual setup mounts the source or build output and watches it, with socket activation so the port stays open:
@@ -114,14 +114,14 @@ If the child exits on its own, whether it crashed or finished cleanly, scinit ex
 
 ```console
 $ SCINIT_LOG=info scinit --live-reload --watch-path config -- sh -c 'exit 3'
- INFO scinit: scinit starting
- INFO scinit: init system started, managing subprocess: sh
- INFO scinit::file_watcher: Started watching path: "config"
- INFO scinit: File watching started for live-reload
- INFO scinit::process_manager: Spawning process: sh ["-c", "exit 3"]
- INFO scinit::process_manager: Process spawned with PID: 95545
- INFO scinit::exit_status: Child process exited with error code 3, scinit exiting
- INFO scinit: scinit exiting with code 3
+[info]  scinit: scinit starting
+[info]  scinit: init system started, managing subprocess: sh
+[info]  scinit: Started watching path: "config"
+  [ok]  scinit: File watching started for live-reload
+[info]  scinit: Spawning process: sh ["-c", "exit 3"]
+  [ok]  scinit: Process spawned with PID: 95545
+[info]  scinit: Child process exited with error code 3, scinit exiting
+[info]  scinit: scinit exiting with code 3
 $ echo $?
 3
 ```

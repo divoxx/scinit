@@ -54,17 +54,17 @@ The examples use `sh -c` scripts as stand-in applications and `SCINIT_LOG=info` 
 ```console
 $ SCINIT_LOG=info scinit -- sh -c 'trap "echo child: got TERM, cleaning up; exit 0" TERM; sleep 1000 & wait' &
 $ kill -TERM %1
- INFO scinit: scinit starting
- INFO scinit: init system started, managing subprocess: sh
- INFO scinit::process_manager: Spawning process: sh ["-c", "trap \"echo child: got TERM, cleaning up; exit 0\" TERM; sleep 1000 & wait"]
- INFO scinit::process_manager: Process spawned with PID: 93372
- INFO scinit: received termination signal SIGTERM, initiating graceful shutdown
- INFO scinit: Termination signal SIGTERM received, forwarding to child process (timeout: 30s)
- INFO scinit::process_manager: Initiating graceful shutdown of process 93372 with SIGTERM
+[info]  scinit: scinit starting
+[info]  scinit: init system started, managing subprocess: sh
+[info]  scinit: Spawning process: sh ["-c", "trap \"echo child: got TERM, cleaning up; exit 0\" TERM; sleep 1000 & wait"]
+  [ok]  scinit: Process spawned with PID: 93372
+[info]  scinit: received termination signal SIGTERM, initiating graceful shutdown
+[info]  scinit: Termination signal SIGTERM received, forwarding to child process (timeout: 30s)
+[info]  scinit: Initiating graceful shutdown of process 93372 with SIGTERM
 child: got TERM, cleaning up
- INFO scinit::process_manager: Process exited gracefully
- INFO scinit: scinit exiting due to termination signal SIGTERM
- INFO scinit: scinit exiting with code 0
+[info]  scinit: Process exited gracefully
+[info]  scinit: scinit exiting due to termination signal SIGTERM
+[info]  scinit: scinit exiting with code 0
 ```
 
 The background `sleep` was in the child's process group, so it received the SIGTERM as well and is gone too. scinit exits 0 because the child did.
@@ -75,15 +75,15 @@ A child that ignores SIGTERM, with the timeout shortened to three seconds:
 $ SCINIT_LOG=info scinit --graceful-timeout-secs 3 -- sh -c 'trap "echo child: ignoring TERM" TERM; while :; do sleep 0.1; done' &
 $ kill -TERM %1
  ...
- INFO scinit: received termination signal SIGTERM, initiating graceful shutdown
- INFO scinit: Termination signal SIGTERM received, forwarding to child process (timeout: 3s)
- INFO scinit::process_manager: Initiating graceful shutdown of process 93260 with SIGTERM
+[info]  scinit: received termination signal SIGTERM, initiating graceful shutdown
+[info]  scinit: Termination signal SIGTERM received, forwarding to child process (timeout: 3s)
+[info]  scinit: Initiating graceful shutdown of process 93260 with SIGTERM
 child: ignoring TERM
- WARN scinit::process_manager: Graceful shutdown timeout, forcing kill
- INFO scinit::process_manager: Force killing process 93260
- INFO scinit::process_manager: Process killed, exit status: ExitStatus(unix_wait_status(9))
- INFO scinit: scinit exiting due to termination signal SIGTERM
- INFO scinit: scinit exiting with code 137
+[warn]  scinit: Graceful shutdown timeout, forcing kill
+[info]  scinit: Force killing process 93260
+[info]  scinit: Process killed, exit status: ExitStatus(unix_wait_status(9))
+[info]  scinit: scinit exiting due to termination signal SIGTERM
+[info]  scinit: scinit exiting with code 137
 ```
 
 Three seconds after the SIGTERM, scinit gave up, killed the group and exited with 137 (128 + 9, killed by SIGKILL).
@@ -94,7 +94,7 @@ A forwarded signal that doesn't stop anything:
 $ SCINIT_LOG=info scinit -- sh -c 'trap "echo child: got HUP, reloading" HUP; trap "exit 0" TERM; while :; do sleep 1000 & wait; done' &
 $ kill -HUP %1
  ...
- INFO scinit: forwarding signal SIGHUP to child process
+[info]  scinit: forwarding signal SIGHUP to child process
 child: got HUP, reloading
 ```
 
