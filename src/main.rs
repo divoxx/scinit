@@ -34,17 +34,20 @@ use reaper::{reap_before_exit, spawn_zombie_reap};
 use signals::{Signal, SignalHandler};
 
 fn main() {
-    logging::init();
+    // Before logging starts, so `--log-time` applies from the first line.
+    // Usage errors, `--help` and `--version` are printed by clap itself.
+    let cli = Cli::parse();
+    logging::init(cli.log_time);
     // Mirror the child's exit status, like other container inits do. Errors
     // are logged like everything else scinit says: `[fail]  scinit: ...`
-    std::process::exit(run().unwrap_or_else(|e| {
+    std::process::exit(run(cli).unwrap_or_else(|e| {
         error!("{:#}", e);
         1
     }))
 }
 
 /// Runs scinit and returns the exit code to exit with
-fn run() -> Result<i32> {
+fn run(cli: Cli) -> Result<i32> {
     info!("scinit starting");
 
     // Before any other thread exists, so every thread inherits the mask
@@ -59,7 +62,7 @@ fn run() -> Result<i32> {
         .enable_all()
         .build()?;
 
-    let result = rt.block_on(app_main(&mut signal_handler));
+    let result = rt.block_on(app_main(cli, &mut signal_handler));
     // Shut down with a timeout on every path: blocking tasks parked in
     // sigwait never finish, so dropping the runtime would block forever
     rt.shutdown_timeout(Duration::from_millis(100));
@@ -67,10 +70,7 @@ fn run() -> Result<i32> {
 }
 
 /// Returns the exit code scinit should exit with
-async fn app_main(signal_handler: &mut SignalHandler) -> Result<i32> {
-    // Parse CLI arguments
-    let cli = Cli::parse();
-
+async fn app_main(cli: Cli, signal_handler: &mut SignalHandler) -> Result<i32> {
     // Convert CLI to configuration
     let config = Config::from_cli(cli)?;
 

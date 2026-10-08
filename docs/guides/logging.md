@@ -15,7 +15,7 @@ flowchart LR
 
 ## The format
 
-Each event is one line without a timestamp: a status tag, `scinit:`, and the message.
+Each event is one line: a status tag, `scinit:`, and the message. By default there is no timestamp (see [Timestamps](#timestamps)).
 
 ```text
 [info]  scinit: Spawning process: server []
@@ -46,8 +46,6 @@ server: started, pid 15, config v1
 
 A message that spans several lines continues on the next ones at column 8, so the extra lines stay visibly part of the event.
 
-There is no timestamp because container log drivers already record one per line, and a second one only adds noise. tini, dumb-init and catatonit leave it out for the same reason.
-
 Output is colored only when stderr is a terminal and the `NO_COLOR` environment variable is unset. Only the tag gets a color; `scinit:` is dimmed and the message is plain. Container logs and files never get escape codes, and `NO_COLOR=1` turns color off on a terminal too. `CLICOLOR_FORCE` set to anything other than `0` turns color on when stderr isn't a terminal, for example when a tool that shows colors reads scinit's output through a pipe; `NO_COLOR` still wins over it.
 
 Fatal errors use the same format. When scinit can't start, the reason is a single `[fail]` line and scinit exits with code 1. This line is printed whatever `SCINIT_LOG` says, even `off`, so an exit with code 1 always comes with a reason:
@@ -58,6 +56,29 @@ $ scinit -- nonexistent-cmd
 ```
 
 Panics, which would be bugs in scinit, are logged the same way, and also whatever `SCINIT_LOG` says, as a `[fail]` line that starts with `panic at` followed by the source location and the message, instead of Rust's default panic output.
+
+## Timestamps
+
+By default scinit's lines have no timestamp. Whatever collects a container's output usually records the time of each line already: Docker's json-file driver, containerd and so Kubernetes, and journald all do. A second timestamp from scinit would only add noise to `docker logs -t` or `kubectl logs --timestamps`, and could disagree with the runtime's. tini, dumb-init and catatonit don't print one either.
+
+When stderr goes to a terminal or a plain file, or logs are copied out without their timestamps, the time is lost. To have scinit add it, pass `--log-time`, or set the `SCINIT_LOG_TIME` environment variable to anything other than empty, `0`, `false`, `no` or `off` (in any case). Either one turns timestamps on; `SCINIT_LOG_TIME=0` doesn't turn off `--log-time`.
+
+Each line then starts with the time in UTC, in RFC 3339 format with microseconds, and a space. The rest of the line is unchanged, and lines of a multi-line message still continue under the message:
+
+```console
+$ SCINIT_LOG=info scinit --log-time -- sh -c 'echo child output'
+2026-10-08T16:01:47.388698Z [info]  scinit: scinit starting
+2026-10-08T16:01:47.389084Z [info]  scinit: init system started, managing subprocess: sh
+2026-10-08T16:01:47.389103Z [info]  scinit: Spawning process: sh ["-c", "echo child output"]
+2026-10-08T16:01:47.397305Z   [ok]  scinit: Process spawned with PID: 28627
+child output
+2026-10-08T16:01:47.400611Z [info]  scinit: Child process exited successfully, scinit exiting cleanly
+2026-10-08T16:01:47.400627Z [info]  scinit: scinit exiting with code 0
+```
+
+Every line scinit logs gets the timestamp, from the first one on, including the `SCINIT_LOG` warning and the fatal error. The child's output on the same streams gets none. On a terminal, the timestamp is dimmed.
+
+Like scinit's other options, `--log-time` goes before the command: after it, the flag is passed to the child.
 
 ## Choosing what to see
 

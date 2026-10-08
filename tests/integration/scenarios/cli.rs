@@ -29,11 +29,14 @@ fn help_exits_zero() {
         "help output missing flags:\n{}",
         stdout
     );
-    assert!(
-        stdout.contains("SCINIT_LOG"),
-        "help output missing SCINIT_LOG:\n{}",
-        stdout
-    );
+    for expected in ["SCINIT_LOG", "SCINIT_LOG_TIME", "--log-time"] {
+        assert!(
+            stdout.contains(expected),
+            "help output missing {}:\n{}",
+            expected,
+            stdout
+        );
+    }
 }
 
 /// `--version` prints the crate version and exits 0
@@ -482,6 +485,104 @@ fn default_level_shows_warnings() {
         scinit
             .stderr()
             .contains("[warn]  scinit: Graceful shutdown timeout, forcing kill"),
+        "{}",
+        scinit.diagnostics()
+    );
+}
+
+/// Whether `line` starts with an RFC 3339 UTC timestamp with microseconds,
+/// such as `2026-10-08T14:03:12.123456Z`, and a space
+fn starts_with_timestamp(line: &str) -> bool {
+    let pattern = "dddd-dd-ddTdd:dd:dd.ddddddZ ";
+    line.len() > pattern.len()
+        && line.bytes().zip(pattern.bytes()).all(|(c, p)| match p {
+            b'd' => c.is_ascii_digit(),
+            _ => c == p,
+        })
+}
+
+/// scinit's stderr at debug level for a run of `true` with these flags and
+/// environment
+fn debug_log(args: &[&str], envs: &[(&str, &str)]) -> String {
+    let mut builder = Scinit::builder()
+        .env("SCINIT_LOG", "debug")
+        .args(args.iter().copied());
+    for (k, v) in envs {
+        builder = builder.env(k, v);
+    }
+    let (scinit, status) = builder.command(["true"]).run(TIMEOUT).unwrap();
+    scinit.assert_exit_code(status, 0);
+    scinit.stderr()
+}
+
+/// `--log-time` and `SCINIT_LOG_TIME` start every line with the time, from
+/// the first one on
+#[test]
+fn log_time_timestamps_every_line() {
+    for (args, envs) in [
+        (&["--log-time"][..], &[][..]),
+        (&[], &[("SCINIT_LOG_TIME", "1")]),
+        (&[], &[("SCINIT_LOG_TIME", "true")]),
+        // The flag turns it on whatever the variable says
+        (&["--log-time"], &[("SCINIT_LOG_TIME", "0")]),
+    ] {
+        let stderr = debug_log(args, envs);
+        let first = stderr.lines().next().unwrap_or_default();
+        assert!(
+            starts_with_timestamp(first) && first.ends_with(" [info]  scinit: scinit starting"),
+            "{:?} {:?}:\n{}",
+            args,
+            envs,
+            stderr
+        );
+        assert!(
+            stderr.lines().count() > 3 && stderr.lines().all(starts_with_timestamp),
+            "a line without a timestamp with {:?} {:?}:\n{}",
+            args,
+            envs,
+            stderr
+        );
+    }
+}
+
+/// Without `--log-time`, and with `SCINIT_LOG_TIME` empty or `0`, lines have
+/// no timestamp
+#[test]
+fn log_lines_have_no_timestamp_by_default() {
+    for envs in [
+        &[][..],
+        &[("SCINIT_LOG_TIME", "0")],
+        &[("SCINIT_LOG_TIME", "")],
+    ] {
+        let stderr = debug_log(&[], envs);
+        assert!(
+            stderr.starts_with("[info]  scinit: scinit starting")
+                && !stderr.lines().any(starts_with_timestamp),
+            "{:?}:\n{}",
+            envs,
+            stderr
+        );
+    }
+}
+
+/// The warning about SCINIT_LOG, logged as logging starts, and the fatal
+/// error get the timestamp too
+#[test]
+fn log_time_applies_to_the_scinit_log_warning_and_the_fatal_error() {
+    let (scinit, status) = Scinit::builder()
+        .env("SCINIT_LOG", "inf")
+        .args(["--log-time"])
+        .command(["/nonexistent/scinit-no-such-binary"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 1);
+    let stderr = scinit.stderr();
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert!(
+        lines.len() == 2
+            && lines.iter().all(|line| starts_with_timestamp(line))
+            && lines[0].contains(" [warn]  scinit: SCINIT_LOG: \"inf\"")
+            && lines[1].contains(" [fail]  scinit: Failed to spawn process"),
         "{}",
         scinit.diagnostics()
     );
