@@ -91,7 +91,7 @@ scinit only takes on the init's duties when it actually is PID 1. It doesn't reg
 
 The kernel's protection of PID 1 also applies to scinit. scinit installs handling for the signals it cares about (SIGTERM, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2 and SIGHUP), so those arrive. Signals outside that set, such as SIGWINCH or SIGTSTP, are not forwarded to the child. They take their default action on scinit itself, which, when scinit is PID 1, means the kernel discards them.
 
-When PID 1 exits, the kernel kills every other process in the container's PID namespace. That is why scinit exiting with the child, rather than staying around, is the right behavior in a container: whatever the child left behind is cleaned up with it.
+When PID 1 exits, the kernel kills every other process in the container's PID namespace. That is why scinit exiting with the child, rather than staying around, is the right behavior in a container: whatever the child left behind is cleaned up with it. The exception is [live reload](live-reload.md#when-the-child-exits), a development feature, where scinit waits for the next file change instead.
 
 ## Related
 

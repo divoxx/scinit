@@ -56,7 +56,7 @@ scinit decides that a build is finished when the files it watches have been quie
 
 On Linux, a single watched file that the build replaces by renaming a new file over it stops being watched after the first replacement, and build tools often write their output that way. Until [#19](https://github.com/divoxx/scinit/issues/19) makes scinit watch a single file through its parent directory, watch the directory the binary is written to instead. [Live reload](live-reload.md) has the details.
 
-When the program exits on its own, scinit exits too, even with live reload on, so a build that crashes at startup ends the container. Waiting for the next change instead is planned in [#22](https://github.com/divoxx/scinit/issues/22).
+When the program exits on its own with live reload on, scinit keeps running with the sockets bound and starts the program again on the next change, so a build that crashes at startup doesn't end the container. The same goes for a restart that finds the binary missing because the build hasn't written it yet. [Live reload](live-reload.md#when-the-child-exits) has the details.
 
 ## Related
 

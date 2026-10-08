@@ -23,7 +23,9 @@ flowchart TD
 
 ## The child exits on its own
 
-When the child exits, scinit exits too, with the same code. A child that runs `exit 3` makes scinit exit 3, and a child that finishes successfully makes scinit exit 0. This is true with and without `--live-reload`: scinit never restarts a child that exited or crashed, because in a container a crash should end the container and let the orchestrator decide what to do next.
+When the child exits, scinit exits too, with the same code. A child that runs `exit 3` makes scinit exit 3, and a child that finishes successfully makes scinit exit 0. scinit never restarts a child because it exited or crashed: in a container a crash should end the container and let the orchestrator decide what to do next.
+
+With `--live-reload`, scinit doesn't exit when the child does. It logs the exit and waits for the next file change to start a new child (see [live reload](live-reload.md#when-the-child-exits)). If scinit receives SIGTERM, SIGINT or SIGQUIT while no child is running, it exits with the last child's status, following the same rules as below: a last child that ran `exit 3` makes scinit exit 3.
 
 When the child is killed by a signal, there is no exit code to pass on, so scinit uses 128 plus the signal's number. A child killed by SIGKILL (9) gives 137, one that segfaults (SIGSEGV, 11) gives 139, and one killed by SIGTERM (15) gives 143.
 
@@ -57,7 +59,7 @@ exit=137
 
 ## scinit's own errors
 
-When scinit itself can't do its job, it logs an error to stderr and exits 1. That covers failing to start the child, including a command that doesn't exist, failing to bind one of the `--ports`, an invalid `--bind-addr`, a `--live-reload` run whose default watch path can't be found, failing to start the file watcher, and failing to make the child the terminal's foreground process group. A live-reload restart that can't spawn the new child (because the binary is missing at that moment, for example) is also an error that ends scinit with 1.
+When scinit itself can't do its job, it logs an error to stderr and exits 1. That covers failing to start the child, including a command that doesn't exist, failing to bind one of the `--ports`, an invalid `--bind-addr`, a `--live-reload` run whose default watch path can't be found, failing to start the file watcher, and failing to make the child the terminal's foreground process group. A live-reload restart that can't spawn the new child (because the binary is missing at that moment, for example) is logged as an error too, but doesn't end scinit: it waits for the next file change and tries again. Only the first spawn ends scinit with 1.
 
 ```console
 $ scinit -- no-such-command; echo "exit=$?"

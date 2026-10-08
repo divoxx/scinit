@@ -27,10 +27,10 @@ A misspelled scinit option before the command is still an error (exit 2), not mi
 |---|---|---|
 | `--graceful-timeout-secs <N>` | `30` | After a termination signal (or a live-reload restart), how many seconds to wait for the child to exit before sending SIGKILL to its process group. |
 | `--zombie-reap-interval-ms <N>` | `5000` | Interval of the periodic sweep that reaps orphaned processes. Orphans are also reaped as soon as SIGCHLD arrives, so this is a fallback. Must be at least 1; `0` is a usage error. |
-| `--live-reload` | off | Restart the child when `--watch-path` changes. |
+| `--live-reload` | off | Restart the child when `--watch-path` changes. A child that exits doesn't end scinit: the next change starts a new one. |
 | `--watch-path <PATH>` | the command's executable | The file, or directory (not recursive), to watch for changes. Without it, scinit watches the executable that `<COMMAND>` refers to, looked up in `PATH` the way exec does, and exits with an error if it can't find it. |
 | `--debounce-ms <N>` | `500` | How long the watched path has to stay quiet after a change before the restart happens. Every new change starts the wait over. |
-| `--restart-delay-ms <N>` | `1000` | Pause between the old child exiting and the new one starting during a live-reload restart. |
+| `--restart-delay-ms <N>` | `1000` | Pause between the old child exiting and the new one starting during a live-reload restart. A change that arrives after the child exited on its own also waits this long before the spawn. |
 | `--ports <PORT>[,<PORT>...]` | none | TCP ports to bind and pass to the child as file descriptors 3, 4, ... in the order given. Takes a comma-separated list, and the flag can be repeated (`--ports 8080 --ports 8081` is the same as `--ports 8080,8081`). Each port must be between 0 and 65535. |
 | `--bind-addr <ADDR>` | `127.0.0.1` | The address `--ports` are bound on. Must be an IP address literal, IPv4 or IPv6 (`0.0.0.0`, `::`, `::1`); a hostname such as `localhost` is rejected. |
 | `--reuse-port` | off | Set `SO_REUSEPORT` on the `--ports` sockets, so other processes that also set it can bind the same ports. `SO_REUSEADDR` is always set. |
@@ -77,9 +77,9 @@ scinit's exit code is designed to be the one your program would have produced if
 
 | Code | When |
 |---|---|
-| The child's exit code | The child exited normally, on its own or after a forwarded signal. |
+| The child's exit code | The child exited normally, on its own or after a forwarded signal. With `--live-reload`, a child's own exit doesn't end scinit; a later termination signal exits with the last child's code. |
 | 128 + signal number | The child was killed by a signal, for example 130 for SIGINT, 137 for SIGKILL, 143 for SIGTERM. Also used when scinit received a termination signal and the child's exit could not be observed even after SIGKILL; the number is then that of the signal scinit received. |
-| 1 | An error in scinit itself: the command could not be found or executed (at startup or on a live-reload restart), `--bind-addr` is not an IP address, a port could not be bound, `--live-reload` found no executable to watch, the watch could not be set up, or the terminal could not be handed to the child. |
+| 1 | An error in scinit itself: the command could not be found or executed at startup (on a live-reload restart, scinit logs the error and waits for the next change), `--bind-addr` is not an IP address, a port could not be bound, `--live-reload` found no executable to watch, the watch could not be set up, or the terminal could not be handed to the child. |
 | 2 | A usage error reported by the argument parser, such as a missing `<COMMAND>`, an unknown option, or an out-of-range value. |
 | 0 | `--help` or `--version`. |
 
