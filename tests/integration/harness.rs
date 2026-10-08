@@ -239,8 +239,9 @@ impl ScinitBuilder {
             .env_remove("LISTEN_FDS")
             .env_remove("LISTEN_PID")
             .env_remove("LISTEN_FDNAMES")
-            // ...and from coloring scinit's logs
+            // ...and from coloring or timestamping scinit's logs
             .env_remove("CLICOLOR_FORCE")
+            .env_remove("SCINIT_LOG_TIME")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

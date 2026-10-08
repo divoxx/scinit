@@ -25,8 +25,9 @@ Environment:
               typo like `inf`, selects a target as usual, with a warning.
               The error that ends scinit is printed whatever the filter.
 
-              Logs go to stderr only, one event per line, without
-              timestamps, as a level tag, `scinit:` and the message:
+              Logs go to stderr only, one event per line, as a level
+              tag, `scinit:` and the message, without a timestamp
+              unless --log-time or SCINIT_LOG_TIME turns it on:
                 [fail]  scinit: Failed to spawn process 'my-app': ...
                 [info]  scinit: Spawning process: ...
                   [ok]  scinit: Process spawned with PID: 42
@@ -36,7 +37,13 @@ Environment:
               other than 0) and NO_COLOR is unset.
 
               scinit does not read RUST_LOG; it reaches the child
-              unchanged.")]
+              unchanged.
+
+  SCINIT_LOG_TIME
+              Set to anything other than empty, 0, false, no or off
+              (in any case) to start each log line with the time in
+              UTC, as --log-time does:
+                2026-10-08T14:03:12.123456Z [info]  scinit: ...")]
 pub struct Cli {
     /// Enable live-reload functionality
     #[arg(long)]
@@ -73,6 +80,10 @@ pub struct Cli {
     /// Zombie reaping interval (ms, at least 1)
     #[arg(long, default_value = "5000", value_parser = clap::value_parser!(u64).range(1..))]
     pub zombie_reap_interval_ms: u64,
+
+    /// Start each of scinit's log lines with the time in UTC (also SCINIT_LOG_TIME)
+    #[arg(long)]
+    pub log_time: bool,
 
     /// Command to execute and its arguments, passed to the child unchanged
     #[arg(required = true, num_args = 1.., trailing_var_arg = true, value_name = "COMMAND")]
