@@ -13,6 +13,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # Fails if cargo fmt would change any file
+      - name: Rustfmt
+        run: cargo fmt --check
+
   clippy:
     name: Clippy (${{ matrix.os }})
     strategy:

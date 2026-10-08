@@ -13,11 +13,14 @@ cargo build --release    # release build: target/release/scinit
 
 Both builds also produce a second binary, `scinit-test-child`, which the integration tests use as scinit's child. It is never installed or shipped; it exists only for testing. The repository's `.cargo/config.toml` adds a compiler flag (`--cfg tokio_unstable`) to every build, so build from the repository root to pick it up.
 
-Before sending a change, run Clippy the way CI does, with warnings treated as errors:
+Before sending a change, format the code and run Clippy the way CI does, with warnings treated as errors:
 
 ```bash
+cargo fmt
 cargo clippy --all-targets -- -D warnings
 ```
+
+CI runs `cargo fmt --check` and fails if formatting would change any file.
 
 This also enforces a crate-level rule: scinit may not use `print!`, `eprintln!` and friends. Everything it says goes through `tracing`, so that every line has the same format and obeys `SCINIT_LOG` (see [Logging](guides/logging.md)).
 
@@ -96,7 +99,7 @@ It builds a test image from `tests/container/Containerfile`, a Debian-based Rust
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs on every pull request and on every push to `main`. It runs Clippy with `-D warnings` on both macOS and Linux, since some code only compiles on one of them, then `cargo test` on a macOS runner and `scripts/test-linux.sh` on an Ubuntu runner. The Linux job therefore runs exactly what you run locally with the script, PID 1 tests included.
+`.github/workflows/ci.yml` runs on every pull request and on every push to `main`. It checks formatting with `cargo fmt --check`, runs Clippy with `-D warnings` on both macOS and Linux, since some code only compiles on one of them, then `cargo test` on a macOS runner and `scripts/test-linux.sh` on an Ubuntu runner. The Linux job therefore runs exactly what you run locally with the script, PID 1 tests included.
 
 ## Known issues
 
