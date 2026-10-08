@@ -52,7 +52,7 @@ The application container in a development pod and the one you ship can differ o
 
 ## Things to know
 
-scinit decides that a build is finished when the files it watches have been quiet for `--debounce-ms`. A binary written slowly in place, or a build that writes several files, can pause longer than that, so scinit may start a half-written build. A trigger file the build sidecar touches when it is done is planned in [#30](https://github.com/divoxx/scinit/issues/30).
+With `--watch` alone, scinit decides that a build is finished when the files it watches have been quiet for `--debounce-ms`. A binary written slowly in place, or a build that writes several files, can pause longer than that, so scinit may start a half-written build. With `--watch-sentinel`, scinit ignores the binary and restarts when the build sidecar touches `<binary>.scinit` next to it after writing the whole build (see [live reload](live-reload.md#waiting-for-the-build-with-a-sentinel-file)).
 
 When the program exits on its own, scinit exits too, even with live reload on, so a build that crashes at startup ends the container. Waiting for the next change instead is planned in [#22](https://github.com/divoxx/scinit/issues/22).
 
