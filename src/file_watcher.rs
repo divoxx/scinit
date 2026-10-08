@@ -1,5 +1,6 @@
 use crate::Result;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -23,11 +24,57 @@ pub struct FileWatchConfig {
     pub debounce: Duration,
 }
 
+/// What is watched for a watch path: a directory itself, or a single file
+/// through its parent directory
+#[derive(Debug)]
+struct WatchTarget {
+    /// The directory passed to the notify watcher
+    dir: PathBuf,
+    /// For a single file, its name: only events for this entry of `dir` count
+    file_name: Option<OsString>,
+}
+
+impl WatchTarget {
+    /// The target for `path`. A file is resolved through symlinks, and its
+    /// parent directory is watched, so the watch survives the file being
+    /// replaced by rename or deleted and recreated (inotify watches an inode,
+    /// which a replacement leaves behind). Anything else is watched as is.
+    fn new(path: &Path) -> Result<Self> {
+        if !path.is_file() {
+            return Ok(WatchTarget {
+                dir: path.to_path_buf(),
+                file_name: None,
+            });
+        }
+        let file = path.canonicalize()?;
+        match (file.parent(), file.file_name()) {
+            (Some(dir), Some(name)) => Ok(WatchTarget {
+                dir: dir.to_path_buf(),
+                file_name: Some(name.to_os_string()),
+            }),
+            _ => Ok(WatchTarget {
+                dir: file,
+                file_name: None,
+            }),
+        }
+    }
+
+    /// Whether an event for `path` concerns the watched file or directory.
+    /// The watch is non-recursive, so every event path is an entry of `dir`
+    /// and only its name needs checking.
+    fn matches(&self, path: &Path) -> bool {
+        self.file_name
+            .as_deref()
+            .is_none_or(|name| path.file_name() == Some(name))
+    }
+}
+
 /// Async file watcher that monitors files for changes and emits events
 ///
 /// This watcher uses the `notify` crate for cross-platform file system monitoring
 /// and includes debouncing to prevent excessive restarts when files are being
-/// written or compiled.
+/// written or compiled. A single file is watched through its parent directory
+/// (see [`WatchTarget::new`]).
 pub struct FileWatcher {
     /// The underlying notify watcher; dropping it stops watching
     _watcher: RecommendedWatcher,
@@ -36,8 +83,9 @@ pub struct FileWatcher {
 }
 
 impl FileWatcher {
-    /// Starts watching `config.watch_path` (non-recursively), with a
-    /// background task that debounces the changes into events
+    /// Starts watching `config.watch_path` (non-recursively, and a single
+    /// file through its parent directory), with a background task that
+    /// debounces the changes into events
     pub fn start(config: FileWatchConfig) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (tx, rx) = mpsc::channel(100);
@@ -54,10 +102,20 @@ impl FileWatcher {
 
         // Start watching the configured path
         let watch_path = config.watch_path;
-        watcher.watch(&watch_path, RecursiveMode::NonRecursive)?;
+        let target = WatchTarget::new(&watch_path)?;
+        watcher.watch(&target.dir, RecursiveMode::NonRecursive)?;
         info!("Started watching path: {:?}", watch_path);
+        if let Some(name) = &target.file_name {
+            debug!("Watching {:?} through directory {:?}", name, target.dir);
+        }
 
-        tokio::spawn(debounce_events(rx, event_tx, watch_path, config.debounce));
+        tokio::spawn(debounce_events(
+            rx,
+            event_tx,
+            watch_path,
+            target,
+            config.debounce,
+        ));
 
         Ok(FileWatcher {
             _watcher: watcher,
@@ -86,7 +144,7 @@ impl FileWatcher {
     }
 
     /// Whether a file system event should trigger a restart
-    fn is_relevant_change(event: &notify::Event) -> bool {
+    fn is_relevant_change(event: &notify::Event, target: &WatchTarget) -> bool {
         use notify::event::ModifyKind;
 
         // Content changes and renames (editors save by renaming over the file)
@@ -99,8 +157,13 @@ impl FileWatcher {
             )
         );
 
-        // Only files count, not directories
-        content_or_rename && event.paths.iter().any(|path| path.is_file())
+        // Only files count, not directories, and for a single-file watch only
+        // that file, not the rest of its directory
+        content_or_rename
+            && event
+                .paths
+                .iter()
+                .any(|path| target.matches(path) && path.is_file())
     }
 }
 
@@ -113,6 +176,7 @@ async fn debounce_events(
     mut rx: mpsc::Receiver<notify::Result<notify::Event>>,
     event_tx: mpsc::UnboundedSender<FileChangeEvent>,
     watch_path: PathBuf,
+    target: WatchTarget,
     debounce: Duration,
 ) {
     let mut pending: Option<PathBuf> = None;
@@ -126,11 +190,11 @@ async fn debounce_events(
                 match res {
                     Ok(event) => {
                         debug!("File system event: {:?}", event);
-                        if FileWatcher::is_relevant_change(&event) {
+                        if FileWatcher::is_relevant_change(&event, &target) {
                             if pending.is_some() {
                                 debug!("Debouncing file change");
                             }
-                            pending = Some(changed_path(&event, &watch_path));
+                            pending = Some(changed_path(&event, &target, &watch_path));
                             deadline.as_mut().reset(tokio::time::Instant::now() + debounce);
                         }
                     }
@@ -153,9 +217,14 @@ async fn debounce_events(
     }
 }
 
-/// The event's first path (or `fallback`), canonicalized when possible
-fn changed_path(event: &notify::Event, fallback: &Path) -> PathBuf {
-    let path = event.paths.first().map_or(fallback, PathBuf::as_path);
+/// The event's first path that `target` matches (or `fallback`),
+/// canonicalized when possible
+fn changed_path(event: &notify::Event, target: &WatchTarget, fallback: &Path) -> PathBuf {
+    let path = event
+        .paths
+        .iter()
+        .find(|path| target.matches(path))
+        .map_or(fallback, PathBuf::as_path);
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -258,7 +327,8 @@ mod tests {
             attrs: notify::event::EventAttributes::default(),
         };
 
-        assert!(FileWatcher::is_relevant_change(&event));
+        let target = WatchTarget::new(temp_dir.path()).unwrap();
+        assert!(FileWatcher::is_relevant_change(&event, &target));
 
         // Test directory modification event (should be ignored)
         let test_dir = temp_dir.path().join("test_dir");
@@ -273,7 +343,7 @@ mod tests {
         };
 
         // This should be false because it's a directory
-        assert!(!FileWatcher::is_relevant_change(&event));
+        assert!(!FileWatcher::is_relevant_change(&event, &target));
     }
 
     #[test]
@@ -284,25 +354,187 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let file = temp_dir.path().join("app.conf");
         std::fs::write(&file, "v1").unwrap();
-        let event = |kind| notify::Event {
-            kind,
-            paths: vec![file.clone()],
-            attrs: notify::event::EventAttributes::default(),
+        let target = WatchTarget::new(temp_dir.path()).unwrap();
+        let relevant = |kind| {
+            let event = notify::Event {
+                kind,
+                paths: vec![file.clone()],
+                attrs: notify::event::EventAttributes::default(),
+            };
+            FileWatcher::is_relevant_change(&event, &target)
         };
 
         // Creating an empty file on macOS: Create + Modify(Metadata(Extended))
-        assert!(!FileWatcher::is_relevant_change(&event(EventKind::Create(
-            CreateKind::File
+        assert!(!relevant(EventKind::Create(CreateKind::File)));
+        assert!(!relevant(EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::Extended
         ))));
-        assert!(!FileWatcher::is_relevant_change(&event(EventKind::Modify(
-            ModifyKind::Metadata(MetadataKind::Extended)
-        ))));
-        assert!(!FileWatcher::is_relevant_change(&event(EventKind::Modify(
-            ModifyKind::Metadata(MetadataKind::WriteTime)
+        assert!(!relevant(EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::WriteTime
         ))));
         // Editors saving by renaming over the file
-        assert!(FileWatcher::is_relevant_change(&event(EventKind::Modify(
-            ModifyKind::Name(RenameMode::To)
+        assert!(relevant(EventKind::Modify(ModifyKind::Name(
+            RenameMode::To
         ))));
+    }
+
+    #[test]
+    fn test_single_file_is_watched_through_parent() {
+        let temp_dir = tempdir().unwrap();
+        let dir = temp_dir.path().canonicalize().unwrap();
+        let file = dir.join("app");
+        fs::write(&file, "v1").unwrap();
+
+        let target = WatchTarget::new(&file).unwrap();
+        assert_eq!(target.dir, dir);
+        assert_eq!(target.file_name.as_deref(), Some("app".as_ref()));
+
+        // A directory is watched itself
+        let target = WatchTarget::new(&dir).unwrap();
+        assert_eq!(target.dir, dir);
+        assert_eq!(target.file_name, None);
+
+        // A symlink to a file is resolved to the file it points to
+        let real = dir.join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("app-1.2"), "v1").unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(real.join("app-1.2"), &link).unwrap();
+        let target = WatchTarget::new(&link).unwrap();
+        assert_eq!(target.dir, real);
+        assert_eq!(target.file_name.as_deref(), Some("app-1.2".as_ref()));
+    }
+
+    #[test]
+    fn test_single_file_ignores_siblings() {
+        use notify::event::{DataChange, ModifyKind, RenameMode};
+        use notify::EventKind;
+
+        let temp_dir = tempdir().unwrap();
+        let file = temp_dir.path().join("app");
+        let sibling = temp_dir.path().join("app.tmp");
+        fs::write(&file, "v1").unwrap();
+        fs::write(&sibling, "v2").unwrap();
+        let target = WatchTarget::new(&file).unwrap();
+        let event = |kind, paths| notify::Event {
+            kind,
+            paths,
+            attrs: notify::event::EventAttributes::default(),
+        };
+        let write = EventKind::Modify(ModifyKind::Data(DataChange::Content));
+
+        assert!(FileWatcher::is_relevant_change(
+            &event(write, vec![file.clone()]),
+            &target
+        ));
+        assert!(!FileWatcher::is_relevant_change(
+            &event(write, vec![sibling.clone()]),
+            &target
+        ));
+        // A rename of the sibling over the file reports both paths
+        let both = event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            vec![sibling.clone(), file.clone()],
+        );
+        assert!(FileWatcher::is_relevant_change(&both, &target));
+        assert_eq!(
+            changed_path(&both, &target, &file),
+            file.canonicalize().unwrap()
+        );
+    }
+
+    /// Discard events until none arrives for a while: FSEvents (macOS) can
+    /// report writes made just before the watcher started
+    async fn settle(watcher: &mut FileWatcher) {
+        while watcher
+            .wait_for_event(Duration::from_millis(500))
+            .await
+            .unwrap()
+            .is_some()
+        {}
+    }
+
+    /// Replace `file` by writing a sibling and renaming it over `file`
+    fn replace_by_rename(file: &Path, content: &str) {
+        let tmp = file.with_extension("new");
+        fs::write(&tmp, content).unwrap();
+        fs::rename(&tmp, file).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_single_file_survives_replacement_by_rename() {
+        let temp_dir = tempdir().unwrap();
+        let file = temp_dir.path().join("app");
+        fs::write(&file, "v0").unwrap();
+        let mut watcher = FileWatcher::start(FileWatchConfig {
+            watch_path: file.clone(),
+            debounce: Duration::from_millis(100),
+        })
+        .unwrap();
+        settle(&mut watcher).await;
+
+        for i in 1..=2 {
+            replace_by_rename(&file, &format!("v{}", i));
+            let event = watcher
+                .wait_for_event(Duration::from_millis(2000))
+                .await
+                .unwrap();
+            match event {
+                Some(FileChangeEvent::FileChanged(path)) => {
+                    assert_eq!(path, file.canonicalize().unwrap())
+                }
+                other => panic!("replacement {}: expected FileChanged, got {:?}", i, other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_single_file_survives_delete_and_recreate() {
+        let temp_dir = tempdir().unwrap();
+        let file = temp_dir.path().join("app");
+        fs::write(&file, "v0").unwrap();
+        let mut watcher = FileWatcher::start(FileWatchConfig {
+            watch_path: file.clone(),
+            debounce: Duration::from_millis(100),
+        })
+        .unwrap();
+        settle(&mut watcher).await;
+
+        for i in 1..=2 {
+            fs::remove_file(&file).unwrap();
+            fs::write(&file, format!("v{}", i)).unwrap();
+            let event = watcher
+                .wait_for_event(Duration::from_millis(2000))
+                .await
+                .unwrap();
+            assert!(
+                matches!(event, Some(FileChangeEvent::FileChanged(_))),
+                "recreation {}: expected FileChanged, got {:?}",
+                i,
+                event
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_single_file_sibling_change_is_ignored() {
+        let temp_dir = tempdir().unwrap();
+        let file = temp_dir.path().join("app");
+        let sibling = temp_dir.path().join("other");
+        fs::write(&file, "v0").unwrap();
+        fs::write(&sibling, "v0").unwrap();
+        let mut watcher = FileWatcher::start(FileWatchConfig {
+            watch_path: file,
+            debounce: Duration::from_millis(100),
+        })
+        .unwrap();
+        settle(&mut watcher).await;
+
+        fs::write(&sibling, "v1").unwrap();
+        let event = watcher
+            .wait_for_event(Duration::from_millis(1000))
+            .await
+            .unwrap();
+        assert!(event.is_none(), "expected no event, got {:?}", event);
     }
 }
