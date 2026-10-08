@@ -29,7 +29,7 @@ use exit_status::{exit_code, handle_child_exit, signal_exit_code};
 use file_watcher::{FileChangeEvent, FileWatcher};
 use port_manager::PortManager;
 use process_manager::ProcessManager;
-use reaper::spawn_zombie_reap;
+use reaper::{reap_before_exit, spawn_zombie_reap};
 use signals::{Signal, SignalHandler};
 
 fn main() {
@@ -78,7 +78,10 @@ async fn app_main(signal_handler: &mut SignalHandler) -> Result<i32> {
     let mut process_manager = ProcessManager::new(config.process_config(), port_manager);
 
     // Run the main event loop
-    let code = run_main_loop(&config, &mut process_manager, signal_handler).await?;
+    let result = run_main_loop(&config, &mut process_manager, signal_handler).await;
+    // However the loop ended: the child's exit, a termination signal or an error
+    reap_before_exit();
+    let code = result?;
 
     info!("scinit exiting with code {}", code);
     Ok(code)

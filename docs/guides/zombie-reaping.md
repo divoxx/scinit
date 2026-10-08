@@ -18,7 +18,7 @@ flowchart TB
 
 ## When scinit reaps
 
-scinit runs a reaping pass at three moments. The main one is SIGCHLD: the kernel sends it to a parent whenever one of its children exits, so an orphan is usually reaped within moments of exiting. As a fallback, scinit also runs a periodic pass every `--zombie-reap-interval-ms` milliseconds (5000 by default), which catches anything a missed or coalesced SIGCHLD left behind. Finally, when the child exits on its own, scinit runs one last pass right before exiting, so that a container ending normally doesn't leave zombies behind it.
+scinit runs a reaping pass at three moments. The main one is SIGCHLD: the kernel sends it to a parent whenever one of its children exits, so an orphan is usually reaped within moments of exiting. As a fallback, scinit also runs a periodic pass every `--zombie-reap-interval-ms` milliseconds (5000 by default), which catches anything a missed or coalesced SIGCHLD left behind. Finally, scinit runs one last pass right before exiting, whether the child exited on its own or scinit stopped it after a termination signal, so a container doesn't leave zombies behind it.
 
 The SIGCHLD and periodic passes run on a background thread so they never hold up the main loop, which may be busy forwarding a signal or restarting the child. The final pass runs inline, because scinit's runtime shuts down immediately afterwards and a background task might never get to run.
 
@@ -75,8 +75,6 @@ $ podman exec z3 ps -eo pid,ppid,stat,comm
 ```
 
 In practice this means: make scinit the container's entrypoint (`ENTRYPOINT ["scinit", "--"]`), and don't also enable the runtime's own init (`docker run --init`), which would take PID 1. Outside a container, orphans go to the host's init or to your session's subreaper, which reap them as usual, so there is nothing for scinit to do.
-
-The final pass at exit only runs when the child exits on its own. When scinit stops because it received a termination signal, it exits without that pass. As PID 1 this makes no difference, because the kernel tears down the whole PID namespace, zombies included, when PID 1 exits.
 
 Lowering `--zombie-reap-interval-ms` is rarely useful, since SIGCHLD already triggers a pass whenever a child exits; the periodic pass is only a safety net. The value must be at least 1.
 
