@@ -57,14 +57,15 @@ cargo run -- --live-reload --debounce-ms 1000 --restart-delay-ms 500 my-app
 **scinit** is a lightweight async init system designed for container environments, built around several key modules:
 
 - **`main` / `run_main_loop`** (`src/main.rs`): Builds the tokio runtime and runs the event loop; dispatches signals (`on_signal`) and file events (`on_file_event`) to the `ProcessManager`
-- **`ProcessManager`** (`src/process_manager.rs`): Spawns, monitors, restarts and stops the child, and forwards signals to its process group. The child's lifecycle is a `ChildState` enum (`NotStarted` / `Running(ManagedChild)` / `Exited { status }`). Every spawn hands the terminal to the new child, which takes the foreground itself before exec (`src/terminal.rs`)
+- **`ProcessManager`** (`src/process_manager.rs`): Spawns (std only forks and sets up stdio, the process group and the `pre_exec` hooks; `ChildExec` execs), monitors, restarts and stops the child, and forwards signals to its process group. The child's lifecycle is a `ChildState` enum (`NotStarted` / `Running(ManagedChild)` / `Exited { status }`). Every spawn hands the terminal to the new child, which takes the foreground itself before exec (`src/terminal.rs`)
 - **`SignalHandler`** (`src/signals.rs`): Receives signals only: masks the handled signals on all threads and consumes them on a dedicated `sigwait` thread, never blocking critical signals (SIGFPE, SIGILL, SIGSEGV, etc.)
 - **`FileWatcher`** (`src/file_watcher.rs`): Live-reload file watching using the `notify` crate, with a trailing-edge debounce
 - **`reaper`** (`src/reaper.rs`): Zombie reaping, leaving the managed child to tokio's `Child::wait()`
 - **`exit_status`** (`src/exit_status.rs`): Maps the child's status to scinit's exit code (code, or 128 + signal)
 - **`PortManager`** (`src/port_manager.rs`): Socket inheritance system for zero-downtime restarts, binding each port once and keeping it for scinit's lifetime
 - **`fds`** (`src/fds.rs`): Marks the fds scinit inherited (other than stdio) close-on-exec in the child, so it only gets stdio and the activated sockets
-- **`SocketActivationExec`** (`src/socket_activation.rs`): Execs a child with sockets from a `pre_exec` hook, so it can move them to fds 3.. and set `LISTEN_PID` to the child's own pid
+- **`ChildExec`** (`src/child_exec.rs`): The child's `execve`, done from its last `pre_exec` hook for every spawn, so with `--ports` it can move the sockets to fds 3.. and set `LISTEN_PID` to the child's own pid. argv and env (one `LISTEN_*` filter) are built before the fork
+- **`program`** (`src/program.rs`): `resolve_program` finds the command's file in the parent like `execvp`; `ProgramError` (not found / not executable, also from the child's `execve` errors) makes scinit exit 127 / 126
 
 ### Key Architecture Principles
 
@@ -125,6 +126,8 @@ The `listen` fixture mode verifies socket inheritance end to end:
 - Bound sockets stay close-on-exec; the child gets `dup2` copies at fds 3.. (which clears the flag), so only those are inherited
 - The child marks every fd above stdio close-on-exec before exec (`src/fds.rs`, before the socket remap), so stray fds scinit itself inherited never reach it
 - Code in the child between fork and exec (`pre_exec`) must be async-signal-safe: build everything before forking, never allocate there
+- `ChildExec`'s exec is the last `pre_exec` hook: hooks registered after it never run. The child's order is: take the terminal, reset dispositions, reset the mask, mark stray fds close-on-exec, move sockets and fill in `LISTEN_PID`, `execve`
+- The command is resolved in the parent (`resolve_program`); argv[0] stays as typed. Not found exits 127, not executable 126 (including a script without `#!`, which is not run with `/bin/sh`)
 - On macOS, `prepare_for_fork` (`src/process_manager.rs`) must run before every fork: it finishes libnotify's lazy setup first, since a fork while another thread is mid-setup (e.g. FSEvents starting the file watcher) makes libnotify's fork handler abort the child with SIGKILL (#42)
 - **Signal masking**: Block handled signals on the main thread before any other thread exists; never block critical/synchronous signals or SIGCHLD
 - **Signal handling**: Consume handled signals only on the dedicated sigwait thread; never call `sigwait` from per-iteration tasks (cancelled waits leave threads that swallow signals)

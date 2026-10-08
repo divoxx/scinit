@@ -44,9 +44,9 @@ $ scinit -- sh -c 'exit 3'
 $ echo $?
 3
 $ scinit -- no-such-command
-ERROR scinit: Failed to spawn process 'no-such-command': No such file or directory (os error 2)
+ERROR scinit: Failed to spawn process 'no-such-command': not found
 $ echo $?
-1
+127
 ```
 
 ### In a container

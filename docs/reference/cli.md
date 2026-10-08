@@ -18,7 +18,7 @@ A misspelled scinit option before the command is still an error (exit 2), not mi
 
 | Argument | Description |
 |---|---|
-| `<COMMAND>` | The program to run as the child. Required. A name without a `/` is looked up in `PATH` when the child is spawned. If it can't be found or executed, scinit logs the error and exits with code 1. |
+| `<COMMAND>` | The program to run as the child. Required. A name without a `/` is looked up in `PATH` when the child is spawned; the child's `argv[0]` is the name as given. If it can't be found, scinit logs the error and exits with code 127; if it can't be executed, with 126. A script needs a `#!` line: one without it is not run with `/bin/sh`, and fails with 126. |
 | `[ARGS]...` | Arguments passed to the child unchanged. |
 
 ## Options
@@ -79,11 +79,13 @@ scinit's exit code is designed to be the one your program would have produced if
 |---|---|
 | The child's exit code | The child exited normally, on its own or after a forwarded signal. |
 | 128 + signal number | The child was killed by a signal, for example 130 for SIGINT, 137 for SIGKILL, 143 for SIGTERM. Also used when scinit received a termination signal and the child's exit could not be observed even after SIGKILL; the number is then that of the signal scinit received. |
-| 1 | An error in scinit itself: the command could not be found or executed (at startup or on a live-reload restart), `--bind-addr` is not an IP address, a port could not be bound, `--live-reload` found no executable to watch, the watch could not be set up, or the terminal could not be handed to the child. |
+| 127 | The command was not found (at startup or on a live-reload restart). |
+| 126 | The command was found but could not be executed: no execute permission, a directory, or a file the kernel can't run, such as a script without a `#!` line (at startup or on a live-reload restart). |
+| 1 | Any other error in scinit itself: the child could not be spawned for another reason, `--bind-addr` is not an IP address, a port could not be bound, `--live-reload` found no executable to watch, the watch could not be set up, or the terminal could not be handed to the child. |
 | 2 | A usage error reported by the argument parser, such as a missing `<COMMAND>`, an unknown option, or an out-of-range value. |
 | 0 | `--help` or `--version`. |
 
-Because the child's codes pass straight through, a child that itself exits with 1 or 2 can't be told apart from a scinit error by the code alone. scinit's own errors are always logged on stderr as an `ERROR scinit: ...` line, even with the default `SCINIT_LOG`, and usage errors are printed by the parser with a `Usage:` hint.
+Because the child's codes pass straight through, a child that itself exits with 1, 2, 126 or 127 can't be told apart from a scinit error by the code alone. scinit's own errors are always logged on stderr as an `ERROR scinit: ...` line, even with the default `SCINIT_LOG`, and usage errors are printed by the parser with a `Usage:` hint.
 
 ```
 $ scinit -- sh -c 'exit 3'; echo $?
@@ -91,8 +93,8 @@ $ scinit -- sh -c 'exit 3'; echo $?
 $ scinit -- sh -c 'kill -9 $$'; echo $?
 137
 $ scinit -- no-such-command; echo $?
-ERROR scinit: Failed to spawn process 'no-such-command': No such file or directory (os error 2)
-1
+ERROR scinit: Failed to spawn process 'no-such-command': not found
+127
 $ scinit --zombie-reap-interval-ms 0 -- my-server; echo $?
 error: invalid value '0' for '--zombie-reap-interval-ms <ZOMBIE_REAP_INTERVAL_MS>': 0 is not in 1..18446744073709551615
 

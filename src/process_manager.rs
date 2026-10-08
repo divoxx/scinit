@@ -1,9 +1,10 @@
+use crate::child_exec::ChildExec;
 use crate::environment::Environment;
 use crate::fds;
 use crate::port_manager::PortManager;
+use crate::program::{resolve_program, ProgramError};
 use crate::reaper::{clear_managed_child, set_managed_child};
 use crate::signals::{is_termination, Signal};
-use crate::socket_activation::SocketActivationExec;
 use crate::terminal;
 use crate::Result;
 use eyre::eyre;
@@ -11,7 +12,7 @@ use nix::sys::signal::{kill, sigaction, SaFlags, SigAction, SigHandler, SigSet};
 use nix::unistd::{getpgid, Pid};
 use std::future::Future;
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::process::{Child, Command};
@@ -99,7 +100,11 @@ impl ProcessManager {
         }
     }
 
-    /// Spawns a new process with port inheritance and proper signal mask reset
+    /// Spawns a new process with port inheritance and proper signal mask reset.
+    ///
+    /// A command that is not found or not executable fails with a
+    /// [`ProgramError`], whether the lookup here or the child's `execve`
+    /// finds out.
     pub async fn spawn_process(&mut self) -> Result<()> {
         info!(
             "Spawning process: {} {:?}",
@@ -109,10 +114,10 @@ impl ProcessManager {
         // Bind ports before spawning
         self.port_manager.bind_ports()?;
 
-        let overrides = self.child_env_overrides();
-        let mut command = self.build_command(&overrides);
-        // These hooks must run before the socket-activation exec, and the
-        // terminal must be taken before the dispositions are reset
+        let program = resolve_program(&self.config.command)?;
+        let mut command = build_command(&program);
+        // These hooks must run before the exec, and the terminal must be
+        // taken before the dispositions are reset
         let tty = terminal::controlling_terminal();
         if let Some(tty) = &tty {
             take_terminal_on_exec(&mut command, tty.as_raw_fd());
@@ -120,12 +125,10 @@ impl ProcessManager {
         reset_signal_dispositions_on_exec(&mut command);
         reset_signal_mask_on_exec(&mut command);
         close_stray_fds_on_exec(&mut command);
-        self.install_socket_activation(&mut command, overrides)?;
+        self.install_exec(&mut command, &program)?;
 
         prepare_for_fork();
-        let child = command
-            .spawn()
-            .map_err(|e| eyre!("Failed to spawn process '{}': {}", self.config.command, e))?;
+        let child = command.spawn().map_err(|e| self.spawn_error(e))?;
         // Close-on-exec, so only scinit held it; the child has its own
         // terminal through stdio
         drop(tty);
@@ -140,47 +143,34 @@ impl ProcessManager {
         overrides
     }
 
-    /// The child's command, in its own process group, with scinit's stdio
-    /// and environment plus `overrides`
-    fn build_command(&self, overrides: &Environment) -> Command {
-        let mut command = Command::new(&self.config.command);
-        command.args(&self.config.args);
-
-        // process_group(0) creates a new process group with child as leader
-        // This isolates the child from scinit's process group for proper signal handling
-        command.process_group(0);
-        command.kill_on_drop(true);
-        command.stdin(Stdio::inherit());
-        command.stdout(Stdio::inherit());
-        command.stderr(Stdio::inherit());
-
-        // Inherited as is (non-UTF-8 variables included), plus the overrides
-        command.envs(overrides.clone().into_inner());
-        remove_inherited_listen_vars(&mut command, overrides);
-        command
-    }
-
-    /// With sockets to pass, makes the child exec itself so it can move them
-    /// to fds 3.. and set LISTEN_PID to its own pid (see socket_activation)
-    fn install_socket_activation(
-        &self,
-        command: &mut Command,
-        overrides: Environment,
-    ) -> Result<()> {
-        let listen_fds = self.port_manager.listen_fds();
-        if listen_fds.is_empty() {
-            return Ok(());
-        }
-        let mut exec = SocketActivationExec::new(
+    /// Makes the child exec `program` itself, as its last `pre_exec` hook,
+    /// with any sockets at fds 3.. and LISTEN_PID set to its own pid (see
+    /// child_exec). Hooks registered after this one would never run.
+    fn install_exec(&self, command: &mut Command, program: &Path) -> Result<()> {
+        let mut exec = ChildExec::new(
+            program,
             &self.config.command,
             &self.config.args,
-            listen_fds,
-            overrides,
+            self.port_manager.listen_fds(),
+            self.child_env_overrides(),
         )?;
         unsafe {
             command.pre_exec(move || Err(exec.exec_in_child()));
         }
         Ok(())
+    }
+
+    /// The error for a failed spawn: a [`ProgramError`] when the child's
+    /// `execve` found the command missing or not executable
+    fn spawn_error(&self, error: std::io::Error) -> eyre::Report {
+        match ProgramError::from_exec_error(&self.config.command, &error) {
+            Some(e) => e.into(),
+            None => eyre!(
+                "Failed to spawn process '{}': {}",
+                self.config.command,
+                error
+            ),
+        }
     }
 
     fn track_child(&mut self, child: Child) -> Result<()> {
@@ -376,16 +366,20 @@ impl ProcessManager {
     }
 }
 
-/// Drops the `LISTEN_*` variables scinit inherited, unless `overrides` sets
-/// them: they describe someone else's sockets, so the child would trust fds
-/// it doesn't have
-fn remove_inherited_listen_vars(command: &mut Command, overrides: &Environment) {
-    for (key, _) in std::env::vars_os() {
-        let inherited_listen_var = key.as_bytes().starts_with(b"LISTEN_");
-        if inherited_listen_var && !key.to_str().is_some_and(|k| overrides.contains(k)) {
-            command.env_remove(key);
-        }
-    }
+/// The command std forks, in its own process group, with scinit's stdio.
+/// The program, argv and environment the child runs with are
+/// [`ChildExec`]'s, since it does the exec.
+fn build_command(program: &Path) -> Command {
+    let mut command = Command::new(program);
+
+    // process_group(0) creates a new process group with child as leader
+    // This isolates the child from scinit's process group for proper signal handling
+    command.process_group(0);
+    command.kill_on_drop(true);
+    command.stdin(Stdio::inherit());
+    command.stdout(Stdio::inherit());
+    command.stderr(Stdio::inherit());
+    command
 }
 
 /// Makes sure a fork can't catch macOS's libnotify half set up (#42).
@@ -411,8 +405,8 @@ fn remove_inherited_listen_vars(command: &mut Command, overrides: &Environment) 
 /// could still coincide with a spawn.
 ///
 /// We fork rather than `posix_spawn`, which skips these hooks, because of
-/// the `pre_exec` hooks (taking the terminal, socket activation's
-/// `LISTEN_PID`), which `posix_spawn` can't replace.
+/// the `pre_exec` hooks (taking the terminal, the exec with socket
+/// activation's `LISTEN_PID`), which `posix_spawn` can't replace.
 ///
 /// So one call into libnotify before the first fork finishes the setup, or
 /// waits for another thread that is doing it, and no later fork can catch it
@@ -472,8 +466,8 @@ fn reset_signal_mask_on_exec(command: &mut Command) {
 }
 
 /// Keeps fds scinit inherited (other than stdio) from reaching the child.
-/// The activated sockets are moved to fds 3.. after this, which clears the
-/// flag on them.
+/// The activated sockets are moved to fds 3.. after this, by the exec hook,
+/// which clears the flag on them.
 fn close_stray_fds_on_exec(command: &mut Command) {
     let limit = fds::open_fd_limit();
     unsafe {

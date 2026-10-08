@@ -33,11 +33,11 @@ There is no timestamp because container log drivers already record one per line,
 
 Output is colored only when stderr is a terminal and the `NO_COLOR` environment variable is unset. Container logs and files never get escape codes, and `NO_COLOR=1` turns color off on a terminal too.
 
-Fatal errors use the same format. When scinit can't start, the reason is a single `ERROR` line and scinit exits with code 1:
+Fatal errors use the same format. When scinit can't start, the reason is a single `ERROR` line and scinit exits with a non-zero code, here 127 because the command doesn't exist (see [exit codes](exit-codes.md#scinits-own-errors)):
 
 ```console
 $ scinit -- nonexistent-cmd
-ERROR scinit: Failed to spawn process 'nonexistent-cmd': No such file or directory (os error 2)
+ERROR scinit: Failed to spawn process 'nonexistent-cmd': not found
 ```
 
 Panics, which would be bugs in scinit, are logged the same way, as an `ERROR` line from the `scinit::logging` target that starts with `panic at` followed by the source location and the message, instead of Rust's default panic output.

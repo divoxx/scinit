@@ -15,10 +15,10 @@
 //! `restart_is_prompt_with_default_reap_interval` covers the default.
 
 use crate::integration::harness::{
-    free_port, let_setup_writes_age, loopback, request, Scinit, ScinitBuilder, TEST_CHILD, TIMEOUT,
+    free_port, let_setup_writes_age, loopback, path_with, request, Scinit, ScinitBuilder,
+    TEST_CHILD, TIMEOUT,
 };
 use nix::sys::signal::Signal;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -557,16 +557,4 @@ fn default_watch_path_unresolvable_command_exits_1() {
         "expected an error naming the command and --watch-path\n{}",
         scinit.diagnostics()
     );
-}
-
-/// `$PATH` with `dir` prepended
-fn path_with(dir: &Path) -> OsString {
-    match std::env::var_os("PATH") {
-        Some(p) => {
-            let mut dirs = vec![dir.to_path_buf()];
-            dirs.extend(std::env::split_paths(&p));
-            std::env::join_paths(dirs).unwrap()
-        }
-        None => dir.as_os_str().to_owned(),
-    }
 }

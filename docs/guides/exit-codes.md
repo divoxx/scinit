@@ -8,7 +8,10 @@ The rule is simple: scinit exits with the child's exit code, or with 128 plus th
 flowchart TD
     start["scinit starts"] --> parse{"Command line valid?"}
     parse -- no --> usage["exit 2: usage error"]
-    parse -- yes --> setup{"Ports bound and child spawned?"}
+    parse -- yes --> found{"Command found and executable?"}
+    found -- "not found" --> e127["exit 127"]
+    found -- "not executable" --> e126["exit 126"]
+    found -- yes --> setup{"Ports bound and child spawned?"}
     setup -- no --> err["exit 1: scinit error"]
     setup -- yes --> how{"What ends the child?"}
     how -- "it exits with code N" --> code["exit N"]
@@ -57,12 +60,24 @@ exit=137
 
 ## scinit's own errors
 
-When scinit itself can't do its job, it logs an error to stderr and exits 1. That covers failing to start the child, including a command that doesn't exist, failing to bind one of the `--ports`, an invalid `--bind-addr`, a `--live-reload` run whose default watch path can't be found, failing to start the file watcher, and failing to make the child the terminal's foreground process group. A live-reload restart that can't spawn the new child (because the binary is missing at that moment, for example) is also an error that ends scinit with 1.
+When scinit itself can't do its job, it logs an error to stderr and exits with a non-zero code.
+
+A command that can't be run gets the codes a shell uses for it. If it doesn't exist, scinit exits 127: a name without a `/` that no directory in `PATH` has, or a path with no file there. If it exists but can't be executed, scinit exits 126: a file without execute permission, a directory, or a file the kernel doesn't know how to run. That last case includes a script without a `#!` line. scinit execs the command directly and doesn't fall back to running such a script with `/bin/sh`, as some shells and `execvp` do, so give your scripts a `#!` line. The same codes apply with and without `--ports`, and the error message is the same.
+
+Every other error exits 1. That covers failing to bind one of the `--ports`, an invalid `--bind-addr`, a `--live-reload` run whose default watch path can't be found in `PATH`, failing to start the file watcher, and failing to make the child the terminal's foreground process group.
+
+A live-reload restart that can't spawn the new child ends scinit the same way as a failed first spawn: with 127 if the binary is missing at that moment, 126 if it isn't executable, and 1 otherwise.
 
 ```console
 $ scinit -- no-such-command; echo "exit=$?"
-ERROR scinit: Failed to spawn process 'no-such-command': No such file or directory (os error 2)
-exit=1
+ERROR scinit: Failed to spawn process 'no-such-command': not found
+exit=127
+$ scinit -- ./notes.txt; echo "exit=$?"
+ERROR scinit: Failed to spawn process './notes.txt': not executable: Permission denied (os error 13)
+exit=126
+$ scinit -- ./script-without-shebang; echo "exit=$?"
+ERROR scinit: Failed to spawn process './script-without-shebang': not executable: Exec format error (os error 8)
+exit=126
 $ scinit --bind-addr localhost -- true; echo "exit=$?"
 ERROR scinit: Invalid bind address 'localhost': invalid IP address syntax
 exit=1
@@ -84,7 +99,7 @@ exit=2
 
 ## Things to know
 
-Exit code 1 is ambiguous. It is what scinit uses for its own errors, and it is also the most common exit code for an application that failed. If the container exits 1 and you need to know which one happened, look at stderr: scinit's errors are always a line starting with `ERROR scinit`, which is logged at the default log level. A mistyped `SCINIT_LOG` can hide it, as [logging](logging.md#things-to-know) explains.
+Exit codes 1, 126 and 127 are ambiguous. scinit uses them for its own errors, and an application can exit with them too: 1 is the most common exit code for an application that failed, and a shell script exits 127 or 126 when a command it runs can't be found or executed. If the container exits with one of them and you need to know which one happened, look at stderr: scinit's errors are always a line starting with `ERROR scinit`, which is logged at the default log level. A mistyped `SCINIT_LOG` can hide it, as [logging](logging.md#things-to-know) explains.
 
 A shell convention is not a guarantee. An application can exit with 137 or 143 on its own, and scinit passes it through, so a code above 128 means "killed by a signal" only by convention. Likewise, the "128 plus the signal scinit received" case reports the shutdown signal even though the child was actually sent SIGKILL.
 
