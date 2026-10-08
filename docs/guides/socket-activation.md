@@ -176,6 +176,14 @@ if (ours && Number(process.env.LISTEN_FDS) >= 1) {
 
 The fallback in the Node example is worth copying in any language: when the variables are absent, bind the port yourself, so the same app runs with or without scinit's `--ports`.
 
+## Running under Kubernetes
+
+Kubernetes probes see a live-reload restart the same way any other client does. The listening socket stays open while no child is running, so an HTTP or TCP probe that arrives mid-restart is not refused: its connection waits in the backlog and gets its answer once the new process starts accepting. That is the behavior you want, but the wait counts against the probe's `timeoutSeconds`, which defaults to one second.
+
+A restart takes as long as the old process needs to exit (up to `--graceful-timeout-secs`), plus `--restart-delay-ms` (one second by default), plus however long your app takes to start accepting. That is easily longer than one second, so a probe or two can fail during a reload. A failed readiness probe only takes the pod out of its Service until the next probe succeeds, which hardly matters in a development environment. A failed liveness probe is different: after `failureThreshold` consecutive failures, Kubernetes restarts the whole container, which throws away the very process scinit is keeping alive.
+
+For development pods that use live reload, give the liveness probe a generous `timeoutSeconds` and `failureThreshold`, or leave it out and rely on readiness alone. A shorter, separate timeout for live-reload restarts is planned in [#20](https://github.com/divoxx/scinit/issues/20), which will make reloads faster but won't remove the gap entirely.
+
 ## Things to know
 
 The default bind address is `127.0.0.1`, which only accepts connections from inside the container's own network namespace. Published ports (`docker run -p`) forward traffic to the container's external interface, so with the default, clients outside the container can't reach your app. In a quick test with rootless podman, `curl` against a published port got `Empty reply from server` with the default and reached the socket with `--bind-addr 0.0.0.0`. Other runtimes may report a refused or reset connection instead. In containers, use `--bind-addr 0.0.0.0`, or `::` for IPv6.

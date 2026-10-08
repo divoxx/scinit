@@ -22,7 +22,7 @@ These pages explain how scinit works and why it behaves the way it does. They ar
 
 [Live reload](guides/live-reload.md) covers `--live-reload`: what scinit watches by default, which file system events count as a change, how the trailing-edge debounce turns a burst of saves into one restart, and the sequence scinit follows to stop the old child and start a new one.
 
-[Socket activation](guides/socket-activation.md) covers `--ports`: scinit binds the listening sockets once and passes them to each child at file descriptor 3 onwards, following the systemd protocol, so connections wait in the backlog during a restart instead of being refused. It includes short examples of picking the sockets up from an application.
+[Socket activation](guides/socket-activation.md) covers `--ports`: scinit binds the listening sockets once and passes them to each child at file descriptor 3 onwards, following the systemd protocol, so connections wait in the backlog during a restart instead of being refused. It includes short examples of picking the sockets up from an application, and what restarts mean for Kubernetes probes.
 
 ## Operating scinit
 
