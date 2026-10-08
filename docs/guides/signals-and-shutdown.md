@@ -116,6 +116,8 @@ scinit waits for the managed child, not for the whole group. If the child exits 
 
 A termination signal that arrives during a live-reload restart, before the new child is spawned, cancels the restart. scinit doesn't start a new child: if the old one is still stopping, scinit forwards the signal to it and waits for it as in any shutdown; then scinit exits with the old child's status. SIGUSR1, SIGUSR2 and SIGHUP that arrive during a restart are held and forwarded to the new child once it is spawned, which can be before it has installed its own signal handlers. The [live reload guide](live-reload.md) describes the restart sequence.
 
+Under live reload, scinit also keeps running after the child exits on its own, until the next file change. A termination signal in that time makes scinit exit at once with the last child's status, since there is nothing to stop. SIGUSR1, SIGUSR2 and SIGHUP are dropped, with a debug log line: there is no process group to send them to, and the next child doesn't receive them.
+
 The exit status scinit reports after a shutdown is explained in [exit codes](exit-codes.md).
 
 ## Related

@@ -57,7 +57,7 @@ cargo run -- --live-reload --debounce-ms 1000 --restart-delay-ms 500 my-app
 **scinit** is a lightweight async init system designed for container environments, built around several key modules:
 
 - **`main` / `run_main_loop`** (`src/main.rs`): Builds the tokio runtime and runs the event loop; dispatches signals (`on_signal`) and file events (`on_file_event`) to the `ProcessManager`
-- **`ProcessManager`** (`src/process_manager.rs`): Spawns, monitors, restarts and stops the child, and forwards signals to its process group. The child's lifecycle is a `ChildState` enum (`NotStarted` / `Running(ManagedChild)` / `Exited { status }`). Every spawn hands the terminal to the new child, which takes the foreground itself before exec (`src/terminal.rs`)
+- **`ProcessManager`** (`src/process_manager.rs`): Spawns, monitors, restarts and stops the child, and forwards signals to its process group. The child's lifecycle is a `ChildState` enum (`NotStarted` / `Running(ManagedChild)` / `Exited(ChildExit)`, the last child's status and run time; under live reload scinit stays in `Exited` until a file change spawns the next child). Every spawn hands the terminal to the new child, which takes the foreground itself before exec (`src/terminal.rs`)
 - **`SignalHandler`** (`src/signals.rs`): Receives signals only: masks the handled signals on all threads and consumes them on a dedicated `sigwait` thread, never blocking critical signals (SIGFPE, SIGILL, SIGSEGV, etc.)
 - **`FileWatcher`** (`src/file_watcher.rs`): Live-reload file watching using the `notify` crate, with a trailing-edge debounce
 - **`reaper`** (`src/reaper.rs`): Zombie reaping, leaving the managed child to tokio's `Child::wait()`
@@ -69,7 +69,7 @@ cargo run -- --live-reload --debounce-ms 1000 --restart-delay-ms 500 my-app
 ### Key Architecture Principles
 
 1. **Async-First Design**: Uses tokio's async runtime throughout, with event-driven signal handling instead of polling
-2. **Container-Optimized**: Only allows file-change restarts, not crash restarts (crashes exit the container)
+2. **Container-Optimized**: Restarts only ever come from file changes, never from a crash. Without live reload, the child's exit (crash or clean) ends scinit and the container; under live reload, scinit logs the exit and waits for the next file change, keeping the sockets bound
 3. **Process Group Management**: Creates isolated process groups and handles terminal control properly
 4. **Socket Inheritance**: Supports binding ports before process spawn and passing them to the child using systemd socket activation: fds 3, 4, ... in `--ports` order, `LISTEN_FDS`, and `LISTEN_PID` set to the child's pid
 5. **Graceful Shutdown**: Implements proper SIGTERM → SIGKILL escalation with configurable timeouts
@@ -93,7 +93,7 @@ The live-reload system integrates:
 - File events are a branch of the main loop's `select!`, so a change is acted on as soon as the debounce fires
 - Socket inheritance for zero-downtime restarts: listeners are bound once and the same sockets are passed to every child, so connections queue in the backlog while no child is running
 - Process lifecycle management
-- Only file-change triggers are allowed (not crashes)
+- Only file-change triggers are allowed (not crashes): a child that exits, or a restart whose spawn fails, leaves scinit waiting for the next change. A termination signal meanwhile exits with the last child's status; USR1/USR2/HUP are dropped while no child runs
 
 ## Testing Infrastructure
 
@@ -119,7 +119,7 @@ The `listen` fixture mode verifies socket inheritance end to end:
 
 ## Critical Implementation Notes
 
-- Never allow crash-based restarts in container environments
+- Never allow crash-based restarts: without live reload a child exit ends scinit; under live reload it waits for a file change (only the initial spawn failing still exits 1)
 - Always use process groups for proper signal forwarding
 - Listening sockets always set `SO_REUSEADDR` (rebinding over TIME_WAIT after a scinit restart); `SO_REUSEPORT` only with `--reuse-port`, since restarts reuse the same sockets and don't need it
 - Bound sockets stay close-on-exec; the child gets `dup2` copies at fds 3.. (which clears the flag), so only those are inherited

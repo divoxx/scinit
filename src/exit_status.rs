@@ -3,7 +3,8 @@
 use nix::sys::signal::Signal;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
-use tracing::info;
+use std::time::Duration;
+use tracing::{info, warn};
 
 /// Shell-style exit code for a child's status: its exit code, or 128 + the
 /// signal number if it was killed by a signal
@@ -19,7 +20,8 @@ pub fn signal_exit_code(signal: i32) -> i32 {
     128 + signal
 }
 
-/// Handles the child's exit, which ends scinit too.
+/// Handles the child's exit, which ends scinit too (without live reload;
+/// see [`log_child_exit_while_watching`]).
 ///
 /// In container environments, scinit's lifecycle is tied to the child process,
 /// so scinit exits with the child's exit code (see [`exit_code`]) and
@@ -45,6 +47,37 @@ fn log_child_exit(status: ExitStatus) {
         );
     } else {
         info!("Child process terminated by signal, scinit exiting");
+    }
+}
+
+/// Logs the child's exit under live reload, where scinit keeps running and
+/// waits for a file change to spawn the next child. A clean exit is logged
+/// at INFO, anything else at WARN.
+pub fn log_child_exit_while_watching(status: ExitStatus, ran_for: Duration) {
+    const WAITING: &str = "waiting for a file change to start it again";
+    if status.success() {
+        info!(
+            "Child process exited successfully after {:.1?}, {}",
+            ran_for, WAITING
+        );
+    } else if let Some(code) = status.code() {
+        warn!(
+            "Child process exited with error code {} after {:.1?}, {}",
+            code, ran_for, WAITING
+        );
+    } else if let Some(signal) = status.signal() {
+        warn!(
+            "Child process terminated by signal {} ({}) after {:.1?}, {}",
+            signal,
+            signal_name(signal),
+            ran_for,
+            WAITING
+        );
+    } else {
+        warn!(
+            "Child process terminated by signal after {:.1?}, {}",
+            ran_for, WAITING
+        );
     }
 }
 

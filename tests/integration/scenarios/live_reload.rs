@@ -1,4 +1,6 @@
-//! Live-reload: file changes restart the child; nothing else does.
+//! Live-reload: file changes restart the child; nothing else does. A child
+//! that exits, or a restart that fails to spawn, leaves scinit running until
+//! the next change.
 //!
 //! Watching is non-recursive on a single `--watch-path` (file or directory).
 //! Only content changes and renames of regular files count, not
@@ -15,10 +17,12 @@
 //! `restart_is_prompt_with_default_reap_interval` covers the default.
 
 use crate::integration::harness::{
-    free_port, let_setup_writes_age, loopback, request, Scinit, ScinitBuilder, TEST_CHILD, TIMEOUT,
+    free_port, let_setup_writes_age, loopback, poll_until, request, Scinit, ScinitBuilder,
+    TEST_CHILD, TIMEOUT,
 };
 use nix::sys::signal::Signal;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -321,49 +325,222 @@ fn modifying_file_in_subdirectory_does_not_restart() {
     assert_no_restart(&mut scinit, "modifying a file in a subdirectory");
 }
 
-/// Only file changes restart: a child that exits on its own ends scinit
-#[test]
-fn child_exit_is_not_restarted() {
-    let b = Scinit::builder();
-    let dir = watched_dir(&b);
-    let (scinit, status) = live_reload_default_reap(b, &dir)
-        .child(["exit", "3"])
-        .run(TIMEOUT)
-        .unwrap();
+/// Logged once scinit has seen the child exit and waits for a file change
+const WAITING: &str = "waiting for a file change to start it again";
 
-    scinit.assert_start_count(1, "an exited child must not be restarted");
-    scinit.assert_exit_code(status, 3);
+/// Logged when a restart's spawn failed and scinit waits for the next change
+const SPAWN_FAILED: &str = "waiting for a file change to try again";
+
+/// Wait until scinit's stderr contains `text` at least `n` times
+fn wait_for_log(scinit: &Scinit, text: &str, n: usize) {
+    poll_until(TIMEOUT, || {
+        (scinit.stderr().matches(text).count() >= n).then_some(())
+    })
+    .unwrap_or_else(|| {
+        panic!(
+            "expected {} log line(s) containing {:?}\n{}",
+            n,
+            text,
+            scinit.diagnostics()
+        )
+    });
 }
 
-/// A child killed by a signal under live-reload is not restarted either
+/// A child that exits on its own is not restarted: scinit logs the exit,
+/// keeps running, and only a file change starts the next child
 #[test]
-fn child_crash_is_not_restarted() {
+fn child_exit_waits_for_file_change() {
     let b = Scinit::builder();
     let dir = watched_dir(&b);
-    let (scinit, status) = live_reload_default_reap(b, &dir)
-        .child(["kill-self", "SEGV"])
-        .run(TIMEOUT)
-        .unwrap();
+    let file = dir.join("app.conf");
+    modify(&file, "v1");
+    let (mut scinit, _) = start_and_settle(
+        live_reload(b, &dir)
+            .env("SCINIT_LOG", "warn")
+            .child(["exit", "3"]),
+    );
 
-    scinit.assert_start_count(1, "a crashed child must not be restarted");
+    wait_for_log(&scinit, WAITING, 1);
+    let stderr = scinit.stderr();
+    assert!(
+        stderr.contains("WARN") && stderr.contains("error code 3 after"),
+        "expected a WARN line with the exit code and run time\n{}",
+        scinit.diagnostics()
+    );
+    assert_no_restart(&mut scinit, "a child's exit");
+
+    modify(&file, "v2");
+    scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
+    wait_for_log(&scinit, WAITING, 2);
+    scinit.assert_running_for(Duration::from_millis(500));
+    scinit.assert_start_count(2, "one file change must start exactly one child");
+}
+
+/// A child killed by a signal is handled the same way, and scinit later
+/// exits with the last child's status
+#[test]
+fn child_crash_waits_for_file_change() {
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let file = dir.join("app.conf");
+    modify(&file, "v1");
+    let (mut scinit, _) = start_and_settle(
+        live_reload(b, &dir)
+            .env("SCINIT_LOG", "warn")
+            .child(["kill-self", "SEGV"]),
+    );
+
+    wait_for_log(&scinit, WAITING, 1);
+    assert!(
+        scinit.stderr().contains("signal 11 (SIGSEGV)"),
+        "expected the crash's signal in the log\n{}",
+        scinit.diagnostics()
+    );
+    scinit.assert_running_for(Duration::from_secs(1));
+    scinit.assert_start_count(1, "a crash must not restart the child");
+
+    modify(&file, "v2");
+    scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
+    wait_for_log(&scinit, WAITING, 2);
+    scinit.signal(Signal::SIGTERM).unwrap();
+    let status = scinit.wait_exit(TIMEOUT).unwrap();
     scinit.assert_exit_code(status, 139);
 }
 
-/// scinit exits without restarting even with a zombie reaper tight enough to
-/// race tokio's `child.wait()` for the child's exit status
+/// A termination signal while waiting for a change exits with the status of
+/// the child that exited
 #[test]
-fn child_exit_with_fast_reaper_is_not_restarted_and_exits() {
+fn sigterm_while_waiting_exits_with_child_status() {
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let mut scinit = live_reload(b, &dir)
+        .env("SCINIT_LOG", "warn")
+        .child(["exit", "3"])
+        .spawn()
+        .unwrap();
+
+    wait_for_log(&scinit, WAITING, 1);
+    scinit.signal(Signal::SIGTERM).unwrap();
+    let status = scinit.wait_exit(TIMEOUT).unwrap();
+
+    scinit.assert_start_count(1, "no child starts without a file change");
+    scinit.assert_exit_code(status, 3);
+}
+
+/// SIGUSR1 while no child is running is dropped: scinit keeps waiting, and
+/// the next child doesn't get it
+#[test]
+fn forwarded_signal_while_waiting_is_dropped() {
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let file = dir.join("app.conf");
+    modify(&file, "v1");
+    let (mut scinit, _) = start_and_settle(
+        live_reload(b, &dir)
+            .env("SCINIT_LOG", "info")
+            .child(["exit", "0"]),
+    );
+
+    wait_for_log(&scinit, WAITING, 1);
+    scinit.signal(Signal::SIGUSR1).unwrap();
+    scinit.assert_running_for(Duration::from_secs(1));
+
+    modify(&file, "v2");
+    scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
+    wait_for_log(&scinit, WAITING, 2);
+    scinit.signal(Signal::SIGTERM).unwrap();
+    let status = scinit.wait_exit(TIMEOUT).unwrap();
+
+    assert!(
+        scinit.events_named("signal").is_empty(),
+        "no child may receive the dropped signal\n{}",
+        scinit.diagnostics()
+    );
+    scinit.assert_exit_code(status, 0);
+}
+
+/// A restart whose spawn fails (the binary is missing mid-build) leaves
+/// scinit waiting; the next change, here the binary coming back, starts it
+#[test]
+fn failed_respawn_waits_for_next_change() {
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let app = dir.join("app");
+    let file = dir.join("app.conf");
+    // Written outside the watched directory and renamed in, as builds do
+    let staged = b.dir().join("app.staged");
+    std::fs::copy(TEST_CHILD, &app).unwrap();
+    modify(&file, "v1");
+    let (mut scinit, old) =
+        start_and_settle(live_reload(b, &dir).command([app.as_os_str(), OsStr::new("run")]));
+
+    std::fs::remove_file(&app).unwrap();
+    modify(&file, "v2");
+    scinit
+        .wait_for_signal(old, Signal::SIGTERM, TIMEOUT)
+        .unwrap();
+    wait_for_log(&scinit, SPAWN_FAILED, 1);
+    scinit.assert_running_for(Duration::from_secs(1));
+    scinit.assert_start_count(1, "the failed spawn must not start a child");
+
+    std::fs::copy(TEST_CHILD, &staged).unwrap();
+    std::fs::rename(&staged, &app).unwrap();
+    scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
+    scinit.signal(Signal::SIGTERM).unwrap();
+    let status = scinit.wait_exit(TIMEOUT).unwrap();
+    scinit.assert_exit_code(status, 0);
+}
+
+/// While waiting for a change, the listening sockets stay bound: clients
+/// queue in the backlog instead of being refused
+#[test]
+fn sockets_stay_bound_while_waiting() {
+    let port = free_port();
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let mut scinit = live_reload(b, &dir)
+        .env("SCINIT_LOG", "warn")
+        .ports(&[port])
+        .child(["exit", "3"])
+        .spawn()
+        .unwrap();
+
+    wait_for_log(&scinit, WAITING, 1);
+    let addr = loopback(port).parse().unwrap();
+    if let Err(e) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+        panic!(
+            "connecting while no child runs failed: {}\n{}",
+            e,
+            scinit.diagnostics()
+        );
+    }
+
+    scinit.signal(Signal::SIGTERM).unwrap();
+    let status = scinit.wait_exit(TIMEOUT).unwrap();
+    scinit.assert_exit_code(status, 3);
+}
+
+/// The child's exit status reaches scinit even with a zombie reaper tight
+/// enough to race tokio's `child.wait()` for it: scinit keeps waiting rather
+/// than failing, and exits with the child's code
+#[test]
+fn child_exit_with_fast_reaper_keeps_status() {
     // The race is timing-dependent; a few attempts with a tight reap timer
     // make losing it near-certain
     for _ in 0..5 {
         let b = Scinit::builder();
         let dir = watched_dir(&b);
-        let (scinit, _status) = live_reload_default_reap(b, &dir)
+        let mut scinit = live_reload_default_reap(b, &dir)
             .args(["--zombie-reap-interval-ms", "10"])
+            .env("SCINIT_LOG", "warn")
             .child(["exit", "3"])
-            .run(Duration::from_secs(3))
+            .spawn()
             .unwrap();
+        wait_for_log(&scinit, WAITING, 1);
+        scinit.signal(Signal::SIGTERM).unwrap();
+        let status = scinit.wait_exit(TIMEOUT).unwrap();
         scinit.assert_start_count(1, "an exited child must not be restarted");
+        scinit.assert_exit_code(status, 3);
     }
 }
 

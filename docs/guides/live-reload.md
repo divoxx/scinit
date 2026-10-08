@@ -12,7 +12,7 @@ Two things happen between a file being written and the new process starting: the
 
 Editors and build tools rarely write a file once. A save can be a truncate followed by several writes, a compiler may write an output in chunks, and a `git checkout` touches many files in a burst. Restarting on the first event would start the new process against a half-written file, and restarting on every event would restart many times for one change. scinit uses a trailing-edge debounce instead. Each relevant change arms a timer of `--debounce-ms` (500 ms by default). Another change before the timer fires re-arms it from zero. Only when the path has been quiet for the full interval does scinit restart, so the restart always sees the last write.
 
-The restart itself reuses scinit's normal shutdown path. scinit sends SIGTERM to the child's process group and waits up to `--graceful-timeout-secs` (30 s by default) for the child to exit. If it is still running, scinit sends SIGKILL. It then waits `--restart-delay-ms` (1000 ms by default) and spawns the command again with the same arguments and environment. A SIGTERM, SIGINT or SIGQUIT that arrives before the new spawn cancels the restart and shuts scinit down instead (see [signals and shutdown](signals-and-shutdown.md)).
+The restart itself reuses scinit's normal shutdown path. scinit sends SIGTERM to the child's process group and waits up to `--graceful-timeout-secs` (30 s by default) for the child to exit. If it is still running, scinit sends SIGKILL. It then waits `--restart-delay-ms` (1000 ms by default) and spawns the command again with the same arguments and environment. If no child is running, because the last one exited (see [When the child exits](#when-the-child-exits)), there is nothing to stop: scinit waits the restart delay and spawns. A SIGTERM, SIGINT or SIGQUIT that arrives before the new spawn cancels the restart and shuts scinit down instead (see [signals and shutdown](signals-and-shutdown.md)).
 
 ```mermaid
 sequenceDiagram
@@ -108,23 +108,47 @@ When a server binds its own port, there is a gap during every restart. The old p
 
 With `--ports`, scinit binds the listening sockets itself, once, and hands the same sockets to every child. While no child is running, the sockets stay open and the kernel keeps accepting connections into their backlog. When the new child starts, it accepts them. The client sees a slower response instead of an error. The [socket activation guide](socket-activation.md) shows a connection made in the middle of a restart being answered by the new process.
 
-## Things to know
+## When the child exits
 
-If the child exits on its own, whether it crashed or finished cleanly, scinit exits with the child's status, even with live reload on. It does not wait for the next file change. This is deliberate: in a container, a crash should end the container so the orchestrator sees it and can restart or report it, rather than leaving a running container with nothing inside. The cost is in development loops, where a syntax error that makes the app exit immediately also stops the container. Let your container runtime restart it, or have your app stay up and report the error instead of exiting.
+With live reload on, a child that exits on its own does not end scinit, whether it crashed, exited with an error or finished cleanly. scinit logs the exit with the exit code or signal and how long the child ran, keeps the `--ports` sockets bound, and waits for the next file change, which starts a new child. The exit itself never starts one, so a program that fails at startup is started once per change, not in a loop. Clients that connect meanwhile wait in the sockets' backlog, as during a restart.
+
+The exit is logged at `WARN`, or at `INFO` for exit code 0. In this example the child prints its config and exits 3; the config is changed once, then scinit is stopped with SIGTERM:
 
 ```console
-$ SCINIT_LOG=info scinit --live-reload --watch-path config -- sh -c 'exit 3'
+$ SCINIT_LOG=info scinit --live-reload --watch-path config -- sh -c 'echo "server: config $(cat config/app.conf)"; exit 3'
  INFO scinit: scinit starting
  INFO scinit: init system started, managing subprocess: sh
  INFO scinit::file_watcher: Started watching path: "config"
  INFO scinit: File watching started for live-reload
- INFO scinit::process_manager: Spawning process: sh ["-c", "exit 3"]
- INFO scinit::process_manager: Process spawned with PID: 95545
- INFO scinit::exit_status: Child process exited with error code 3, scinit exiting
+ INFO scinit::process_manager: Spawning process: sh ["-c", "echo \"server: config $(cat config/app.conf)\"; exit 3"]
+ INFO scinit::process_manager: Process spawned with PID: 40754
+server: config v1
+ WARN scinit::exit_status: Child process exited with error code 3 after 5.7ms, waiting for a file change to start it again
+ INFO scinit: File changed: "/app/config/app.conf", triggering restart
+ INFO scinit::process_manager: Starting process due to file change
+ INFO scinit::process_manager: Spawning process: sh ["-c", "echo \"server: config $(cat config/app.conf)\"; exit 3"]
+ INFO scinit::process_manager: Process spawned with PID: 40803
+server: config v2
+ WARN scinit::exit_status: Child process exited with error code 3 after 10.4ms, waiting for a file change to start it again
+ INFO scinit: received termination signal SIGTERM, initiating graceful shutdown
+ INFO scinit: Termination signal SIGTERM received, forwarding to child process (timeout: 30s)
+ INFO scinit: scinit exiting due to termination signal SIGTERM
  INFO scinit: scinit exiting with code 3
-$ echo $?
-3
 ```
+
+A SIGTERM, SIGINT or SIGQUIT while no child is running makes scinit exit with the status of the last child, here 3, as described in [exit codes](exit-codes.md). SIGUSR1, SIGUSR2 and SIGHUP while no child is running are dropped; the next child doesn't receive them.
+
+A restart that can't spawn the new child, for example because the build has removed the binary and not yet written the new one, is handled the same way. scinit logs the error and waits for the next change, which is usually the build writing the binary:
+
+```console
+ERROR scinit: Failed to spawn process '/app/bin/server': No such file or directory (os error 2); waiting for a file change to try again
+```
+
+Only the first spawn, when scinit starts, ends scinit with exit code 1 if it fails, as without live reload.
+
+Without `--live-reload`, a child that exits ends scinit with the child's status, so in production a crash ends the container and the orchestrator sees it.
+
+## Things to know
 
 The restart always sends SIGTERM, and it waits the full graceful timeout for a child that ignores it. With the default of 30 seconds, a server that doesn't handle SIGTERM makes every reload take 30 seconds. In development, either handle SIGTERM or lower `--graceful-timeout-secs`.
 
