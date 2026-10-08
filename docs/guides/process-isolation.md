@@ -37,15 +37,15 @@ scinit stays in the group of the shell that started it (95934), and the child le
 
 ## An empty signal mask
 
-scinit blocks SIGTERM, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2 and SIGHUP on all of its threads so that one dedicated thread can collect them. The signal mask survives both `fork` and `exec`, so without intervention the child would start with those six signals blocked. A program that installs a SIGTERM handler would still never see a SIGTERM, and one that relies on the default action wouldn't die from it. Blocked signals are rarely something an application checks for, which makes this kind of bug hard to diagnose.
+scinit blocks every signal it forwards (SIGTERM, SIGINT, SIGHUP, SIGUSR1, SIGWINCH and more; [signals and shutdown](signals-and-shutdown.md#what-scinit-does-with-each-signal) lists them) on all of its threads so that one dedicated thread can collect them. The signal mask survives both `fork` and `exec`, so without intervention the child would start with those signals blocked. A program that installs a SIGTERM handler would still never see a SIGTERM, and one that relies on the default action wouldn't die from it. Blocked signals are rarely something an application checks for, which makes this kind of bug hard to diagnose.
 
 Between fork and exec, scinit's child process clears its signal mask, so the application starts with nothing blocked, as it would when started from a shell.
 
 ## Default signal dispositions
 
-A signal's disposition says what happens when it arrives: the default action, a handler, or nothing at all. Handlers are reset by `exec`, but an ignored signal stays ignored. scinit ignores SIGTTIN and SIGTTOU for itself, so that background terminal I/O can never stop the container's init, and scinit itself may have been started with signals ignored: a non-interactive shell starts a background job (`scinit ... &` in a script) with SIGINT and SIGQUIT ignored.
+A signal's disposition says what happens when it arrives: the default action, a handler, or nothing at all. Handlers are reset by `exec`, but an ignored signal stays ignored. scinit ignores SIGTTIN and SIGTTOU for itself, so that background terminal I/O can never stop the container's init, and SIGPIPE. scinit itself may also have been started with signals ignored: a non-interactive shell starts a background job (`scinit ... &` in a script) with SIGINT and SIGQUIT ignored.
 
-So between fork and exec, the child also resets every signal to its default disposition, as tini does. The application starts with nothing ignored, whatever scinit inherited, and a forwarded SIGINT has its usual effect. scinit does the same for the six signals it handles, before it starts waiting for them, so it receives a SIGINT even when it was started with SIGINT ignored.
+So between fork and exec, the child also resets every signal to its default disposition, as tini does. The application starts with nothing ignored, whatever scinit inherited, and a forwarded SIGINT has its usual effect. scinit replaces an ignored disposition for the signals it forwards too, before it starts waiting for them, so it receives a SIGINT even when it was started with SIGINT ignored.
 
 ## The terminal's foreground
 

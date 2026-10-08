@@ -53,6 +53,68 @@ fn hup_forwarded_to_child() {
     assert_forwarded_twice(Signal::SIGHUP);
 }
 
+// Signals that scinit used to leave at their default action: ignored
+// (SIGWINCH, SIGURG) or fatal to scinit (SIGALRM, SIGPROF)
+#[test]
+fn winch_forwarded_to_child() {
+    assert_forwarded_twice(Signal::SIGWINCH);
+}
+
+#[test]
+fn urg_forwarded_to_child() {
+    assert_forwarded_twice(Signal::SIGURG);
+}
+
+#[test]
+fn alrm_forwarded_without_killing_scinit() {
+    assert_forwarded_twice(Signal::SIGALRM);
+}
+
+#[test]
+fn prof_forwarded_without_killing_scinit() {
+    assert_forwarded_twice(Signal::SIGPROF);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pwr_forwarded_to_child() {
+    assert_forwarded_twice(Signal::SIGPWR);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn info_forwarded_to_child() {
+    assert_forwarded_twice(Signal::SIGINFO);
+}
+
+/// SIGTSTP and SIGCONT are forwarded, and SIGTSTP doesn't stop scinit: it
+/// still forwards the signals that follow
+#[test]
+fn tstp_and_cont_forwarded_without_stopping_scinit() {
+    let (mut scinit, pid) = Scinit::builder().child(["run"]).start();
+
+    // One at a time: a pending SIGTSTP is discarded when SIGCONT is sent
+    scinit.signal(Signal::SIGTSTP).unwrap();
+    scinit
+        .wait_for_signal(pid, Signal::SIGTSTP, TIMEOUT)
+        .unwrap();
+    scinit.signal(Signal::SIGCONT).unwrap();
+    scinit
+        .wait_for_signal(pid, Signal::SIGCONT, TIMEOUT)
+        .unwrap();
+
+    scinit.signal(Signal::SIGTSTP).unwrap();
+    scinit
+        .wait_for_signal_count(pid, Signal::SIGTSTP, 2, TIMEOUT)
+        .unwrap();
+    // Only a running scinit forwards this
+    scinit.signal(Signal::SIGUSR1).unwrap();
+    scinit
+        .wait_for_signal(pid, Signal::SIGUSR1, TIMEOUT)
+        .unwrap();
+    scinit.assert_running_for(Duration::from_millis(300));
+}
+
 /// Forwarding targets the whole process group, so a grandchild in the
 /// child's group receives the signal too
 #[test]

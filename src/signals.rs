@@ -46,8 +46,8 @@ impl SignalHandler {
         // After blocking, so none of them can take its default action on
         // scinit: an ignored signal would be discarded instead of reaching
         // sigwait (e.g. SIGINT for a `scinit ... &` from a script)
-        reset_dispositions(handled_signals)?;
-        ignore_tty_signals()?;
+        catch_signals(handled_signals)?;
+        ignore_signals()?;
 
         let (sender, receiver) = unbounded_channel();
         spawn_sigwait_thread(handled_signals, sender)?;
@@ -75,7 +75,7 @@ impl SignalHandler {
         self.recv().await
     }
 
-    /// Waits for the next termination signal (SIGTERM, SIGINT, SIGQUIT).
+    /// Waits for the next termination signal (`Policy::ForwardThenShutdown`).
     /// Other signals received meanwhile are kept, in order, for
     /// `wait_for_signal`.
     ///
@@ -99,45 +99,141 @@ impl SignalHandler {
     }
 }
 
+/// What scinit does with a signal sent to it
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Policy {
+    /// Forwarded to the child's process group; scinit keeps running
+    Forward,
+    /// Forwarded to the child's process group, then scinit stops the child
+    /// and exits
+    ForwardThenShutdown,
+    /// Ignored by scinit (`SIG_IGN`)
+    Ignore,
+    /// Never blocked or handled: left to its default action, or to tokio
+    DefaultAction,
+}
+
+/// The policy for every signal. Signals with a `Forward*` policy are blocked
+/// on every thread and consumed by the sigwait thread.
+///
+/// Linux realtime signals (SIGRTMIN..SIGRTMAX) are not in the table and keep
+/// their default action: `Signal` can't represent them.
+const POLICIES: &[(Signal, Policy)] = &[
+    (Signal::SIGTERM, Policy::ForwardThenShutdown),
+    (Signal::SIGINT, Policy::ForwardThenShutdown),
+    (Signal::SIGQUIT, Policy::ForwardThenShutdown),
+    (Signal::SIGHUP, Policy::Forward),
+    (Signal::SIGUSR1, Policy::Forward),
+    (Signal::SIGUSR2, Policy::Forward),
+    (Signal::SIGALRM, Policy::Forward),
+    (Signal::SIGVTALRM, Policy::Forward),
+    (Signal::SIGPROF, Policy::Forward),
+    (Signal::SIGWINCH, Policy::Forward),
+    (Signal::SIGURG, Policy::Forward),
+    (Signal::SIGIO, Policy::Forward),
+    (Signal::SIGXCPU, Policy::Forward),
+    (Signal::SIGXFSZ, Policy::Forward),
+    // Blocked, so they stop or continue the child but never scinit
+    (Signal::SIGTSTP, Policy::Forward),
+    (Signal::SIGCONT, Policy::Forward),
+    #[cfg(all(
+        target_os = "linux",
+        not(any(
+            target_arch = "mips",
+            target_arch = "mips32r6",
+            target_arch = "mips64",
+            target_arch = "mips64r6",
+            target_arch = "sparc",
+            target_arch = "sparc64"
+        ))
+    ))]
+    (Signal::SIGSTKFLT, Policy::Forward),
+    #[cfg(target_os = "linux")]
+    (Signal::SIGPWR, Policy::Forward),
+    #[cfg(target_os = "macos")]
+    (Signal::SIGINFO, Policy::Forward),
+    // Terminal operations must never stop scinit
+    (Signal::SIGTTIN, Policy::Ignore),
+    (Signal::SIGTTOU, Policy::Ignore),
+    // Raised by scinit's own writes to a closed pipe, which then fail with
+    // EPIPE instead (Rust's runtime ignores it too)
+    (Signal::SIGPIPE, Policy::Ignore),
+    // tokio's SIGCHLD handler drives `Child::wait()`; the main loop observes
+    // it through a tokio signal stream to reap orphans
+    (Signal::SIGCHLD, Policy::DefaultAction),
+    // Can't be caught, blocked or ignored
+    (Signal::SIGKILL, Policy::DefaultAction),
+    (Signal::SIGSTOP, Policy::DefaultAction),
+    // Synchronous: raised by a fault (or abort) in scinit itself, which must
+    // crash scinit rather than hang it
+    (Signal::SIGSEGV, Policy::DefaultAction),
+    (Signal::SIGBUS, Policy::DefaultAction),
+    (Signal::SIGFPE, Policy::DefaultAction),
+    (Signal::SIGILL, Policy::DefaultAction),
+    (Signal::SIGTRAP, Policy::DefaultAction),
+    (Signal::SIGSYS, Policy::DefaultAction),
+    (Signal::SIGABRT, Policy::DefaultAction),
+    #[cfg(target_os = "macos")]
+    (Signal::SIGEMT, Policy::DefaultAction),
+];
+
+/// The policy for `signal`
+fn policy(signal: Signal) -> Policy {
+    POLICIES
+        .iter()
+        .find(|(s, _)| *s == signal)
+        .map_or(Policy::DefaultAction, |(_, policy)| *policy)
+}
+
 /// Whether `signal` makes scinit stop the child and exit
 pub fn is_termination(signal: Signal) -> bool {
-    matches!(signal, Signal::SIGTERM | Signal::SIGINT | Signal::SIGQUIT)
+    policy(signal) == Policy::ForwardThenShutdown
 }
 
-/// Signals that init should handle synchronously:
-/// - SIGTERM, SIGINT, SIGQUIT: Termination signals for graceful shutdown
-/// - SIGUSR1, SIGUSR2: User-defined signals to forward
-/// - SIGHUP: Hangup signal to forward
+/// The signals with one of `policies`
+fn signals_with(policies: &[Policy]) -> SigSet {
+    POLICIES
+        .iter()
+        .filter(|(_, policy)| policies.contains(policy))
+        .map(|(signal, _)| *signal)
+        .collect()
+}
+
+/// Signals consumed by the sigwait thread: every one scinit forwards
 fn handled_signals() -> SigSet {
-    [
-        Signal::SIGTERM,
-        Signal::SIGINT,
-        Signal::SIGQUIT,
-        Signal::SIGUSR1,
-        Signal::SIGUSR2,
-        Signal::SIGHUP,
-    ]
-    .into_iter()
-    .collect()
+    signals_with(&[Policy::Forward, Policy::ForwardThenShutdown])
 }
 
-/// Resets the dispositions of `set` to the default, undoing any `SIG_IGN`
-/// scinit inherited
-fn reset_dispositions(set: SigSet) -> Result<()> {
-    let default_action = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+/// Installs a handler that does nothing for each signal in `set`, undoing any
+/// `SIG_IGN` scinit inherited.
+///
+/// The handler never runs, since `set` is blocked on every thread. It is
+/// there because macOS discards an ignored signal when it is sent, even while
+/// it is blocked, and that includes `SIG_DFL` for a signal whose default
+/// action is to ignore it (SIGWINCH, SIGURG, SIGINFO). With a handler, every
+/// signal in `set` stays pending for sigwait.
+fn catch_signals(set: SigSet) -> Result<()> {
+    let catch_action = SigAction::new(
+        SigHandler::Handler(never_runs),
+        SaFlags::empty(),
+        SigSet::empty(),
+    );
     for signal in set.iter() {
-        unsafe { nix::sys::signal::sigaction(signal, &default_action)? };
+        unsafe { nix::sys::signal::sigaction(signal, &catch_action)? };
     }
     Ok(())
 }
 
-/// Ignores SIGTTIN and SIGTTOU, so terminal operations can't stop scinit.
-/// This is critical for init systems running in containers.
-fn ignore_tty_signals() -> Result<()> {
+/// The handler `catch_signals` installs
+extern "C" fn never_runs(_: libc::c_int) {}
+
+/// Ignores the signals with the `Ignore` policy. Ignoring SIGTTIN and SIGTTOU
+/// means terminal operations can't stop scinit, which is critical for init
+/// systems running in containers.
+fn ignore_signals() -> Result<()> {
     let ignore_action = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
-    unsafe {
-        nix::sys::signal::sigaction(Signal::SIGTTIN, &ignore_action)?;
-        nix::sys::signal::sigaction(Signal::SIGTTOU, &ignore_action)?;
+    for signal in signals_with(&[Policy::Ignore]).iter() {
+        unsafe { nix::sys::signal::sigaction(signal, &ignore_action)? };
     }
     Ok(())
 }
@@ -160,4 +256,72 @@ fn spawn_sigwait_thread(set: SigSet, sender: UnboundedSender<Signal>) -> Result<
             }
         })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_signal_has_one_policy() {
+        for signal in Signal::iterator() {
+            let entries = POLICIES.iter().filter(|(s, _)| *s == signal).count();
+            assert_eq!(entries, 1, "{:?} has {} policies", signal, entries);
+        }
+    }
+
+    #[test]
+    fn termination_signals_are_term_int_quit() {
+        let termination: Vec<Signal> = Signal::iterator().filter(|s| is_termination(*s)).collect();
+        assert_eq!(
+            termination,
+            [Signal::SIGINT, Signal::SIGQUIT, Signal::SIGTERM]
+        );
+    }
+
+    #[test]
+    fn forwards_asynchronous_signals() {
+        let handled = handled_signals();
+        for signal in [
+            Signal::SIGHUP,
+            Signal::SIGUSR1,
+            Signal::SIGUSR2,
+            Signal::SIGALRM,
+            Signal::SIGWINCH,
+            Signal::SIGURG,
+            Signal::SIGTSTP,
+            Signal::SIGCONT,
+        ] {
+            assert_eq!(policy(signal), Policy::Forward, "{:?}", signal);
+            assert!(handled.contains(signal), "{:?} isn't handled", signal);
+        }
+    }
+
+    #[test]
+    fn never_blocks_sigchld_uncatchable_or_fault_signals() {
+        let handled = handled_signals();
+        for signal in [
+            Signal::SIGCHLD,
+            Signal::SIGKILL,
+            Signal::SIGSTOP,
+            Signal::SIGSEGV,
+            Signal::SIGBUS,
+            Signal::SIGFPE,
+            Signal::SIGILL,
+            Signal::SIGTRAP,
+            Signal::SIGSYS,
+            Signal::SIGABRT,
+        ] {
+            assert_eq!(policy(signal), Policy::DefaultAction, "{:?}", signal);
+            assert!(!handled.contains(signal), "{:?} is handled", signal);
+        }
+    }
+
+    #[test]
+    fn ignores_tty_signals_and_sigpipe() {
+        for signal in [Signal::SIGTTIN, Signal::SIGTTOU, Signal::SIGPIPE] {
+            assert_eq!(policy(signal), Policy::Ignore, "{:?}", signal);
+        }
+        assert!(!handled_signals().contains(Signal::SIGTTOU));
+    }
 }

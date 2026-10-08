@@ -77,14 +77,16 @@ cargo run -- --live-reload --debounce-ms 1000 --restart-delay-ms 500 my-app
 ### Signal Flow Architecture
 
 The signal handling follows proper init system semantics:
-1. **Signal Blocking**: `SignalHandler::install()` blocks SIGTERM, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2 and SIGHUP on the main thread before the tokio runtime starts, so every thread inherits the mask, then resets them to `SIG_DFL` (an inherited `SIG_IGN` would discard them)
-2. **Signal Detection**: One dedicated `scinit-sigwait` thread loops on `sigwait()` and forwards signals over a channel to the main loop's `select!` (cancel-safe, so no signal is lost while the loop is busy)
-3. **Signal Categories**:
-   - **Termination signals** (SIGTERM, SIGINT, SIGQUIT): Forward to child, then graceful shutdown
-   - **Forwarding signals** (SIGUSR1, SIGUSR2, SIGHUP): Forward to child process group only
+1. **Signal Policy**: `POLICIES` in `src/signals.rs` gives every signal a `Policy` (`Forward`, `ForwardThenShutdown`, `Ignore`, `DefaultAction`); the blocked/sigwaited set, the ignored set and `is_termination` are derived from it. Every catchable asynchronous signal is forwarded, like tini/dumb-init; Linux realtime signals aren't in the table (nix's `Signal` can't represent them)
+2. **Signal Blocking**: `SignalHandler::install()` blocks the forwarded signals on the main thread before the tokio runtime starts, so every thread inherits the mask, then installs a no-op handler for them (an inherited `SIG_IGN`, or on macOS `SIG_DFL` for a default-ignore signal like SIGWINCH, would discard them although blocked)
+3. **Signal Detection**: One dedicated `scinit-sigwait` thread loops on `sigwait()` and forwards signals over a channel to the main loop's `select!` (cancel-safe, so no signal is lost while the loop is busy)
+4. **Signal Categories**:
+   - **Termination signals** (`ForwardThenShutdown`: SIGTERM, SIGINT, SIGQUIT): Forward to child, then graceful shutdown
+   - **Forwarding signals** (`Forward`: SIGHUP, SIGUSR1, SIGUSR2, SIGALRM, SIGWINCH, SIGTSTP, SIGCONT, ...): Forward to child process group only; SIGTSTP never stops scinit since it is blocked
+   - **Ignored signals** (`Ignore`: SIGTTIN, SIGTTOU, SIGPIPE): `SIG_IGN` in scinit
    - **Child signals** (SIGCHLD): Never blocked. tokio's SIGCHLD handler drives `Child::wait()`; the main loop observes SIGCHLD through a tokio signal stream to reap orphans. The reaper skips the managed child (marked while a `ManagedChild` guard exists) so tokio gets its exit status
-   - **Critical signals** (SIGFPE, SIGILL, SIGSEGV, etc.): Never blocked, cause immediate termination
-4. **Signal Forwarding**: Sent to entire process group using negative PID
+   - **Critical signals** (SIGFPE, SIGILL, SIGSEGV, SIGBUS, SIGTRAP, SIGSYS, SIGABRT, etc.): Never blocked, cause immediate termination
+5. **Signal Forwarding**: Sent to entire process group using negative PID
 
 ### Live-Reload Architecture
 
@@ -129,5 +131,5 @@ The `listen` fixture mode verifies socket inheritance end to end:
 - **Signal masking**: Block handled signals on the main thread before any other thread exists; never block critical/synchronous signals or SIGCHLD
 - **Signal handling**: Consume handled signals only on the dedicated sigwait thread; never call `sigwait` from per-iteration tasks (cancelled waits leave threads that swallow signals)
 - Zombie reaping runs in background tasks to avoid blocking main loop, except the final pass before scinit exits (`reap_before_exit`, on every exit path), which runs inline so it completes before the runtime shuts down
-- Terminal signals (SIGTTIN, SIGTTOU) are ignored in scinit to prevent blocking in containers. The child resets every disposition to `SIG_DFL` before exec, after taking the terminal's foreground itself (which needs SIGTTOU still ignored)
+- Terminal signals (SIGTTIN, SIGTTOU) are ignored in scinit to prevent blocking in containers (and SIGPIPE, so a write to a closed pipe fails instead). The child resets every disposition to `SIG_DFL` before exec, after taking the terminal's foreground itself (which needs SIGTTOU still ignored)
 - scinit's own logs (`src/logging.rs`) go to stderr only, in tracing's standard format without timestamps (`LEVEL scinit::module: message`; color only on a terminal), filtered by `SCINIT_LOG` (default `error`); never read `RUST_LOG`, which belongs to the child. Fatal errors are logged the same way
