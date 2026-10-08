@@ -40,7 +40,7 @@ Signal numbers are not the same on every platform. The common ones (SIGHUP, SIGI
 
 ## The child is stopped by a signal sent to scinit
 
-When scinit receives SIGTERM, SIGINT or SIGQUIT, it forwards the signal to the child's process group and waits up to `--graceful-timeout-secs` (see [signals and shutdown](signals-and-shutdown.md)). The exit code then depends on how the child responded.
+When scinit receives SIGTERM, SIGINT or SIGQUIT, it forwards the signal to the child's process group and waits up to the graceful timeout, `--graceful-timeout-secs` or a default for the detected runtime (see [signals and shutdown](signals-and-shutdown.md#choosing-the-graceful-timeout)). The exit code then depends on how the child responded.
 
 If the child exits within the timeout, scinit exits with the child's status exactly as above. A child that catches SIGTERM and exits 0 makes scinit exit 0, which is how a clean shutdown should look. A child that doesn't handle SIGTERM dies from it, and scinit exits 143. Both are normal outcomes of `docker stop`; which one you get depends on your application, not on scinit.
 
@@ -88,7 +88,7 @@ Exit code 1 is ambiguous. It is what scinit uses for its own errors, and it is a
 
 A shell convention is not a guarantee. An application can exit with 137 or 143 on its own, and scinit passes it through, so a code above 128 means "killed by a signal" only by convention. Likewise, the "128 plus the signal scinit received" case reports the shutdown signal even though the child was actually sent SIGKILL.
 
-If the runtime's own stop timeout is shorter than `--graceful-timeout-secs`, the runtime kills scinit before scinit's escalation runs, and the container's exit status comes from the runtime, typically 137. [Signals and shutdown](signals-and-shutdown.md) explains how to line the two timeouts up.
+If the runtime's own stop timeout is shorter than scinit's graceful timeout, the runtime kills scinit before scinit's escalation runs, and the container's exit status comes from the runtime, typically 137. [Signals and shutdown](signals-and-shutdown.md) explains how to line the two timeouts up.
 
 ## Related
 

@@ -282,6 +282,44 @@ fn zero_zombie_reap_interval_exits_two() {
     );
 }
 
+/// An invalid `SCINIT_GRACEFUL_TIMEOUT_SECS` fails config validation (exit 1)
+/// before the child starts
+#[test]
+fn invalid_graceful_timeout_env_var_exits_one() {
+    let (scinit, status) = Scinit::builder()
+        .env("SCINIT_GRACEFUL_TIMEOUT_SECS", "10s")
+        .child(["exit", "0"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 1);
+    scinit.assert_start_count(0, "child must not start with an invalid config");
+    assert!(
+        scinit
+            .stderr()
+            .contains("Invalid SCINIT_GRACEFUL_TIMEOUT_SECS '10s'"),
+        "{}",
+        scinit.diagnostics()
+    );
+}
+
+/// `--restart-timeout-secs` only applies to live-reload restarts, so it is
+/// a usage error (exit 2) without `--live-reload`
+#[test]
+fn restart_timeout_without_live_reload_exits_two() {
+    let (scinit, status) = Scinit::builder()
+        .args(["--restart-timeout-secs", "1"])
+        .child(["exit", "0"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 2);
+    scinit.assert_start_count(0, "child must not start with an invalid config");
+    assert!(
+        scinit.stderr().contains("--live-reload"),
+        "{}",
+        scinit.diagnostics()
+    );
+}
+
 /// Write a script to `dir` that prints each of its arguments on its own line
 fn print_args_script(dir: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;

@@ -8,6 +8,7 @@ mod environment;
 mod exit_status;
 mod fds;
 mod file_watcher;
+mod graceful_timeout;
 mod logging;
 mod port_manager;
 mod process_manager;
@@ -71,7 +72,8 @@ async fn app_main(signal_handler: &mut SignalHandler) -> Result<i32> {
     let cli = Cli::parse();
 
     // Convert CLI to configuration
-    let config = Config::from_cli(cli)?;
+    let config = Config::from_cli(cli, &graceful_timeout::ProcessHostEnv)?;
+    info!("graceful timeout {}", config.graceful_timeout);
 
     // Setup components
     let port_manager = PortManager::new(config.port_binding.clone());

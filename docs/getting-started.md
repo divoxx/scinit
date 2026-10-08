@@ -90,11 +90,12 @@ $ docker run -d --name demo -e SCINIT_LOG=info scinit-demo
 $ docker stop demo
 $ docker logs demo
  INFO scinit: scinit starting
+ INFO scinit: graceful timeout 8s (detected: docker)
  INFO scinit: init system started, managing subprocess: sleep
  INFO scinit::process_manager: Spawning process: sleep ["infinity"]
  INFO scinit::process_manager: Process spawned with PID: 9
  INFO scinit: received termination signal SIGTERM, initiating graceful shutdown
- INFO scinit: Termination signal SIGTERM received, forwarding to child process (timeout: 30s)
+ INFO scinit: Termination signal SIGTERM received, forwarding to child process (timeout: 8s)
  INFO scinit::process_manager: Initiating graceful shutdown of process 9 with SIGTERM
  INFO scinit::process_manager: Process exited gracefully
  INFO scinit: scinit exiting due to termination signal SIGTERM
@@ -105,7 +106,7 @@ $ docker inspect demo --format '{{.State.ExitCode}}'
 
 The stop returned immediately. The runtime sent SIGTERM to scinit, scinit forwarded it to the process group of `sleep`, `sleep` died from it, and scinit exited with 143, which is 128 plus SIGTERM's number 15: the code a shell reports for a process killed by SIGTERM. Run the same image with `--entrypoint sleep` so that `sleep` itself is PID 1, and `docker stop` hangs for its full 10 second timeout before falling back to SIGKILL, because PID 1 gets no default action for SIGTERM. [Why a container needs an init](guides/why-an-init.md) explains why.
 
-If your program handles SIGTERM itself and takes a while to finish, scinit waits for it, up to `--graceful-timeout-secs` (30 seconds by default), before it sends SIGKILL to the whole process group. The runtime has a stop timeout of its own, 10 seconds for Docker and podman, and whichever runs out first wins. Under Docker's default, set scinit's a few seconds lower, for example `--graceful-timeout-secs 8`, so that scinit's escalation is the one that happens. [Signals and shutdown](guides/signals-and-shutdown.md#choosing-the-graceful-timeout) explains the trade-off, including Kubernetes.
+If your program handles SIGTERM itself and takes a while to finish, scinit waits for it, up to the graceful timeout, before it sends SIGKILL to the whole process group. The runtime has a stop timeout of its own, 10 seconds for Docker and podman, and whichever runs out first wins. scinit detects the runtime and defaults to a little less, here 8 seconds, as the `graceful timeout 8s (detected: docker)` line shows, so that scinit's escalation is the one that happens. If you raise the runtime's timeout (`docker stop -t`, `docker run --stop-timeout`), raise scinit's with `--graceful-timeout-secs` or `SCINIT_GRACEFUL_TIMEOUT_SECS` too. [Signals and shutdown](guides/signals-and-shutdown.md#choosing-the-graceful-timeout) explains the defaults, including Kubernetes.
 
 The same applies to Ctrl-C in a terminal. When scinit runs attached to a terminal, it makes your program's process group the terminal's foreground group, so Ctrl-C sends SIGINT straight to your program, and scinit exits with your program's status (130 for a program killed by SIGINT).
 
@@ -136,6 +137,7 @@ Now edit `app/app.sh` on your machine, changing `version 1` to `version 2`, and 
 
 ```
  INFO scinit: scinit starting
+ INFO scinit: graceful timeout 8s (detected: docker)
  INFO scinit: init system started, managing subprocess: /app/app.sh
  INFO scinit::file_watcher: Started watching path: "/app"
  INFO scinit: File watching started for live-reload

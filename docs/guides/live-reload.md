@@ -12,7 +12,7 @@ Two things happen between a file being written and the new process starting: the
 
 Editors and build tools rarely write a file once. A save can be a truncate followed by several writes, a compiler may write an output in chunks, and a `git checkout` touches many files in a burst. Restarting on the first event would start the new process against a half-written file, and restarting on every event would restart many times for one change. scinit uses a trailing-edge debounce instead. Each relevant change arms a timer of `--debounce-ms` (500 ms by default). Another change before the timer fires re-arms it from zero. Only when the path has been quiet for the full interval does scinit restart, so the restart always sees the last write.
 
-The restart itself reuses scinit's normal shutdown path. scinit sends SIGTERM to the child's process group and waits up to `--graceful-timeout-secs` (30 s by default) for the child to exit. If it is still running, scinit sends SIGKILL. It then waits `--restart-delay-ms` (1000 ms by default) and spawns the command again with the same arguments and environment. A SIGTERM, SIGINT or SIGQUIT that arrives before the new spawn cancels the restart and shuts scinit down instead (see [signals and shutdown](signals-and-shutdown.md)).
+The restart stops the old child the way a shutdown does, but with its own timeout. scinit sends SIGTERM to the child's process group and waits up to `--restart-timeout-secs` (2 s by default) for the child to exit. If it is still running, scinit sends SIGKILL. It then waits `--restart-delay-ms` (1000 ms by default) and spawns the command again with the same arguments and environment. A SIGTERM, SIGINT or SIGQUIT that arrives before the new spawn cancels the restart and shuts scinit down instead (see [signals and shutdown](signals-and-shutdown.md)).
 
 ```mermaid
 sequenceDiagram
@@ -28,7 +28,7 @@ sequenceDiagram
     Note over W: 500 ms with no further changes
     W->>S: file changed
     S->>Old: SIGTERM to process group
-    alt exits within --graceful-timeout-secs
+    alt exits within --restart-timeout-secs
         Old-->>S: exited
     else still running
         S->>Old: SIGKILL to process group
@@ -52,6 +52,7 @@ This example runs a small shell script, `/app/server`, that prints its config an
 ```console
 $ SCINIT_LOG=info scinit --live-reload --watch-path /app/config -- server
  INFO scinit: scinit starting
+ INFO scinit: graceful timeout 8s (detected: docker)
  INFO scinit: init system started, managing subprocess: server
  INFO scinit::file_watcher: Started watching path: "/app/config"
  INFO scinit: File watching started for live-reload
@@ -67,7 +68,7 @@ server: got SIGTERM, exiting
  INFO scinit::process_manager: Process spawned with PID: 45
 server: started, pid 45, config v4
  INFO scinit: received termination signal SIGTERM, initiating graceful shutdown
- INFO scinit: Termination signal SIGTERM received, forwarding to child process (timeout: 30s)
+ INFO scinit: Termination signal SIGTERM received, forwarding to child process (timeout: 8s)
  INFO scinit::process_manager: Initiating graceful shutdown of process 45 with SIGTERM
 server: got SIGTERM, exiting
  INFO scinit::process_manager: Process exited gracefully
@@ -82,6 +83,7 @@ Without `--watch-path`, the watched path is the resolved executable:
 ```console
 $ SCINIT_LOG=info scinit --live-reload -- server
  INFO scinit: scinit starting
+ INFO scinit: graceful timeout 8s (detected: docker)
  INFO scinit: init system started, managing subprocess: server
  INFO scinit::file_watcher: Started watching path: "/app/server"
  ...
@@ -115,6 +117,7 @@ If the child exits on its own, whether it crashed or finished cleanly, scinit ex
 ```console
 $ SCINIT_LOG=info scinit --live-reload --watch-path config -- sh -c 'exit 3'
  INFO scinit: scinit starting
+ INFO scinit: graceful timeout 8s (no runtime detected)
  INFO scinit: init system started, managing subprocess: sh
  INFO scinit::file_watcher: Started watching path: "config"
  INFO scinit: File watching started for live-reload
@@ -126,9 +129,9 @@ $ echo $?
 3
 ```
 
-The restart always sends SIGTERM, and it waits the full graceful timeout for a child that ignores it. With the default of 30 seconds, a server that doesn't handle SIGTERM makes every reload take 30 seconds. In development, either handle SIGTERM or lower `--graceful-timeout-secs`.
+The restart always sends SIGTERM, and it waits the full restart timeout for a child that ignores it, so a server that doesn't handle SIGTERM makes every reload take 2 seconds longer by default. The restart timeout is separate from the graceful timeout, which a termination signal uses, and doesn't depend on the runtime: a server that drains its connections for 25 seconds on a real shutdown would otherwise take that long on every rebuild. Raise `--restart-timeout-secs` if your program needs longer to stop cleanly between builds.
 
-`--watch-path`, `--debounce-ms` and `--restart-delay-ms` only take effect with `--live-reload`. Without it they are accepted and silently ignored, so a missing `--live-reload` shows up as "nothing restarts", not as an error.
+`--watch-path`, `--debounce-ms` and `--restart-delay-ms` only take effect with `--live-reload`. Without it they are accepted and silently ignored, so a missing `--live-reload` shows up as "nothing restarts", not as an error. `--restart-timeout-secs` without `--live-reload` is a usage error.
 
 Because the debounce is trailing-edge, a path that keeps changing more often than the debounce interval never triggers a restart until it settles. Changes that arrive while a restart is in progress are not lost: they cause one more restart once the current one completes. A consequence is that if your app writes into the directory being watched, for example a log or PID file, every start causes a change and the app restarts in a loop. Keep such files outside the watched path. Editors can cause the same thing: a swap or backup file written next to the file you are editing, such as Vim's `.swp`, counts as a content change in a watched directory.
 

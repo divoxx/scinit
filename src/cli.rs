@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::environment::Environment;
 use crate::file_watcher::FileWatchConfig;
+use crate::graceful_timeout::{self, GracefulTimeout, HostEnv};
 use crate::port_manager::PortBindingConfig;
 use crate::process_manager::ProcessConfig;
 use crate::program::resolve_program;
@@ -30,7 +31,11 @@ Environment:
               Colored only when stderr is a terminal and NO_COLOR is unset.
 
               scinit does not read RUST_LOG; it reaches the child
-              unchanged.")]
+              unchanged.
+
+  SCINIT_GRACEFUL_TIMEOUT_SECS
+              Graceful timeout in seconds when --graceful-timeout-secs
+              isn't given. An invalid value is an error.")]
 pub struct Cli {
     /// Enable live-reload functionality
     #[arg(long)]
@@ -60,9 +65,27 @@ pub struct Cli {
     #[arg(long, default_value = "1000")]
     pub restart_delay_ms: u64,
 
-    /// Graceful shutdown timeout (seconds)
-    #[arg(long, default_value = "30")]
-    pub graceful_timeout_secs: u64,
+    /// How long a live-reload restart waits for the old child to exit before SIGKILL (seconds, needs --live-reload)
+    #[arg(long, default_value = "2", requires = "live_reload")]
+    pub restart_timeout_secs: u64,
+
+    /// Graceful shutdown timeout (seconds) [default: by runtime, 8 if none detected]
+    ///
+    /// How long to wait for the child to exit after a termination signal
+    /// before sending SIGKILL to its process group.
+    ///
+    /// Without this flag, SCINIT_GRACEFUL_TIMEOUT_SECS is used; without that,
+    /// a default for the detected container runtime. The runtime's
+    /// configured stop timeout isn't visible inside the container, so each
+    /// default is a little below that runtime's default stop timeout,
+    /// letting scinit's SIGKILL come first:
+    ///   25  Kubernetes (KUBERNETES_SERVICE_HOST is set): default
+    ///       terminationGracePeriodSeconds is 30
+    ///    8  podman (/run/.containerenv exists): podman stop waits 10
+    ///    8  Docker (/.dockerenv exists): docker stop waits 10
+    ///    8  no runtime detected
+    #[arg(long, verbatim_doc_comment)]
+    pub graceful_timeout_secs: Option<u64>,
 
     /// Zombie reaping interval (ms, at least 1)
     #[arg(long, default_value = "5000", value_parser = clap::value_parser!(u64).range(1..))]
@@ -82,8 +105,8 @@ pub struct Config {
     pub args: Vec<String>,
     /// Zombie reaping interval
     pub zombie_reap_interval: Duration,
-    /// Graceful shutdown timeout (with or without live reload)
-    pub graceful_timeout: Duration,
+    /// Timeout for shutdowns after a termination signal
+    pub graceful_timeout: GracefulTimeout,
     /// Live-reload configuration, `None` when disabled
     pub live_reload: Option<LiveReloadConfig>,
     /// Port binding configuration
@@ -95,11 +118,14 @@ pub struct LiveReloadConfig {
     pub watch_path: PathBuf,
     pub debounce: Duration,
     pub restart_delay: Duration,
+    /// Timeout for stopping the old child on a restart
+    pub restart_timeout: Duration,
 }
 
 impl Config {
-    /// Parse command line arguments into configuration
-    pub fn from_cli(cli: Cli) -> Result<Self> {
+    /// Parse command line arguments into configuration, with defaults that
+    /// depend on the environment taken from `host`
+    pub fn from_cli(cli: Cli, host: &dyn HostEnv) -> Result<Self> {
         let mut command = cli.command.into_iter();
         let program = command.next().expect("clap requires a command");
         let args: Vec<String> = command.collect();
@@ -119,6 +145,7 @@ impl Config {
                 watch_path,
                 debounce: Duration::from_millis(cli.debounce_ms),
                 restart_delay: Duration::from_millis(cli.restart_delay_ms),
+                restart_timeout: Duration::from_secs(cli.restart_timeout_secs),
             })
         } else {
             None
@@ -128,7 +155,7 @@ impl Config {
             command: program,
             args,
             zombie_reap_interval: Duration::from_millis(cli.zombie_reap_interval_ms),
-            graceful_timeout: Duration::from_secs(cli.graceful_timeout_secs),
+            graceful_timeout: graceful_timeout::resolve(cli.graceful_timeout_secs, host)?,
             live_reload,
             port_binding: PortBindingConfig {
                 ports: cli.ports,
@@ -140,15 +167,19 @@ impl Config {
 
     /// Configuration for the managed child
     pub fn process_config(&self) -> ProcessConfig {
+        // Restarts only happen with live reload
+        let (restart_delay, restart_timeout) = self
+            .live_reload
+            .as_ref()
+            .map_or((Duration::ZERO, Duration::ZERO), |live_reload| {
+                (live_reload.restart_delay, live_reload.restart_timeout)
+            });
         ProcessConfig {
             command: self.command.clone(),
             args: self.args.clone(),
-            // Restarts only happen with live reload
-            restart_delay: self
-                .live_reload
-                .as_ref()
-                .map_or(Duration::ZERO, |live_reload| live_reload.restart_delay),
-            graceful_shutdown_timeout: self.graceful_timeout,
+            restart_delay,
+            restart_timeout,
+            graceful_shutdown_timeout: self.graceful_timeout.duration,
             environment: Environment::new(),
         }
     }

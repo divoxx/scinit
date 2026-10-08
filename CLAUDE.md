@@ -61,6 +61,7 @@ cargo run -- --live-reload --debounce-ms 1000 --restart-delay-ms 500 my-app
 - **`SignalHandler`** (`src/signals.rs`): Receives signals only: masks the handled signals on all threads and consumes them on a dedicated `sigwait` thread, never blocking critical signals (SIGFPE, SIGILL, SIGSEGV, etc.)
 - **`FileWatcher`** (`src/file_watcher.rs`): Live-reload file watching using the `notify` crate, with a trailing-edge debounce
 - **`reaper`** (`src/reaper.rs`): Zombie reaping, leaving the managed child to tokio's `Child::wait()`
+- **`graceful_timeout`** (`src/graceful_timeout.rs`): Resolves the graceful timeout: `--graceful-timeout-secs`, then `SCINIT_GRACEFUL_TIMEOUT_SECS`, then the first matching `RuntimeProfile` (Kubernetes 25s, podman 8s, Docker 8s, detected through the `HostEnv` trait so tests can fake env vars and files), then 8s
 - **`exit_status`** (`src/exit_status.rs`): Maps the child's status to scinit's exit code (code, or 128 + signal)
 - **`PortManager`** (`src/port_manager.rs`): Socket inheritance system for zero-downtime restarts, binding each port once and keeping it for scinit's lifetime
 - **`fds`** (`src/fds.rs`): Marks the fds scinit inherited (other than stdio) close-on-exec in the child, so it only gets stdio and the activated sockets
@@ -72,7 +73,7 @@ cargo run -- --live-reload --debounce-ms 1000 --restart-delay-ms 500 my-app
 2. **Container-Optimized**: Only allows file-change restarts, not crash restarts (crashes exit the container)
 3. **Process Group Management**: Creates isolated process groups and handles terminal control properly
 4. **Socket Inheritance**: Supports binding ports before process spawn and passing them to the child using systemd socket activation: fds 3, 4, ... in `--ports` order, `LISTEN_FDS`, and `LISTEN_PID` set to the child's pid
-5. **Graceful Shutdown**: Implements proper SIGTERM → SIGKILL escalation with configurable timeouts
+5. **Graceful Shutdown**: Implements proper SIGTERM → SIGKILL escalation with configurable timeouts: the graceful timeout (runtime-aware default) for termination signals, `--restart-timeout-secs` (default 2s) for live-reload restarts
 
 ### Signal Flow Architecture
 
@@ -92,14 +93,14 @@ The live-reload system integrates:
 - File system monitoring (non-recursive) with a trailing-edge debounce: each content change or rename re-arms a `--debounce-ms` timer, and the restart fires once changes go quiet. Metadata-only changes and creating empty files are ignored
 - File events are a branch of the main loop's `select!`, so a change is acted on as soon as the debounce fires
 - Socket inheritance for zero-downtime restarts: listeners are bound once and the same sockets are passed to every child, so connections queue in the backlog while no child is running
-- Process lifecycle management
+- Process lifecycle management: a restart sends SIGTERM, SIGKILLs after `--restart-timeout-secs` (not the graceful timeout), waits `--restart-delay-ms`, then spawns
 - Only file-change triggers are allowed (not crashes)
 
 ## Testing Infrastructure
 
 - **Unit Tests**: Individual component testing in each module
 - **Fixture child** (`tests/fixtures/test_child.rs`, bin `scinit-test-child`): purpose-built child that scinit runs in tests. It appends events (`started`, `signal`, `env`, `fds`, `sigmask`, `exit`, ...) to the file in `$SCINIT_TEST_REPORT`. Subcommands: `run` (trap/ignore signals), `exit <code>`, `kill-self <SIG>`, `dump` (argv, `LISTEN_*` env, fds, signal mask), `listen` (answers on inherited sockets), `spawn-orphan` (PID 1 reaping check)
-- **Harness** (`tests/integration/harness.rs`): `Scinit::builder()` spawns the real scinit binary with the fixture as child (with only stdio open), captures stdout/stderr, and offers builder shortcuts (`start`, `spawn_dump`, `ports`, `watch`), polling helpers (`wait_for`, `wait_for_nth_match`, `wait_exit`, `poll_until`) and assertions (`assert_exit_code`, `assert_start_count`, `assert_reply_from`) instead of fixed sleeps. Plain `#[test]`, no tokio
+- **Harness** (`tests/integration/harness.rs`): `Scinit::builder()` spawns the real scinit binary with the fixture as child (with only stdio open, and without `KUBERNETES_SERVICE_HOST` or `SCINIT_GRACEFUL_TIMEOUT_SECS`), captures stdout/stderr, and offers builder shortcuts (`start`, `spawn_dump`, `ports`, `watch`), polling helpers (`wait_for`, `wait_for_nth_match`, `wait_exit`, `poll_until`) and assertions (`assert_exit_code`, `assert_start_count`, `assert_reply_from`) instead of fixed sleeps. Plain `#[test]`, no tokio
 - **Scenarios** (`tests/integration/scenarios/`): `cli`, `exit_codes`, `signals`, `sockets`, `live_reload`, and `linux` (Linux only: `/proc` checks and scinit as PID 1 via `unshare`). All compile into the single `integration_test` target
 - **Linux runner** (`scripts/test-linux.sh`, `tests/container/Containerfile`): builds a test image and runs `cargo test` in rootless podman (args pass through), with the permissions the `linux` PID-1 tests need; `SCINIT_REQUIRE_PID1=1` makes them fail rather than skip
 - **CI** (`.github/workflows/ci.yml`): on every PR and push to `main`, runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` on macOS and Linux, `cargo test` on a macOS runner and `scripts/test-linux.sh` on an Ubuntu runner

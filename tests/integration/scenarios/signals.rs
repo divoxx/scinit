@@ -1,8 +1,11 @@
 //! Signal handling: forwarding to the child's process group, termination and
 //! SIGKILL escalation, and the signal state the child inherits.
 
-use crate::integration::harness::{let_setup_writes_age, wait_for_pid_gone, Scinit, TIMEOUT};
+use crate::integration::harness::{
+    let_setup_writes_age, wait_for_pid_gone, Scinit, ScinitBuilder, TIMEOUT,
+};
 use nix::sys::signal::Signal;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// Generous upper bound for scinit to exit after a termination signal
@@ -292,6 +295,106 @@ fn usr1_forwarded_during_graceful_shutdown() {
     scinit.signal(Signal::SIGUSR2).unwrap();
     let status = scinit.wait_exit(EXIT_BOUND).unwrap();
     scinit.assert_exit_code(status, 0);
+}
+
+/// The graceful timeout scinit logs at startup for `builder`, e.g.
+/// `8s (no runtime detected)`
+fn logged_graceful_timeout(builder: ScinitBuilder) -> String {
+    let (scinit, status) = builder
+        .env("SCINIT_LOG", "info")
+        .child(["exit", "0"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 0);
+    let stderr = scinit.stderr();
+    let line = stderr
+        .lines()
+        .find_map(|line| line.split_once("INFO scinit: graceful timeout "))
+        .unwrap_or_else(|| panic!("no graceful timeout logged\n{}", scinit.diagnostics()));
+    line.1.to_string()
+}
+
+/// Without the flag, the variable or a detected runtime, the graceful
+/// timeout is 8s. The harness clears `KUBERNETES_SERVICE_HOST`, but a
+/// container's marker files can't be hidden; those runtimes default to 8s too.
+#[test]
+fn default_graceful_timeout_is_8s() {
+    let expected = if Path::new("/run/.containerenv").exists() {
+        "8s (detected: podman)"
+    } else if Path::new("/.dockerenv").exists() {
+        "8s (detected: docker)"
+    } else {
+        "8s (no runtime detected)"
+    };
+    assert_eq!(logged_graceful_timeout(Scinit::builder()), expected);
+}
+
+/// `KUBERNETES_SERVICE_HOST` selects the Kubernetes default, which wins over
+/// any marker file
+#[test]
+fn kubernetes_graceful_timeout_is_25s() {
+    let builder = Scinit::builder().env("KUBERNETES_SERVICE_HOST", "10.0.0.1");
+    assert_eq!(
+        logged_graceful_timeout(builder),
+        "25s (detected: kubernetes)"
+    );
+}
+
+/// `SCINIT_GRACEFUL_TIMEOUT_SECS` wins over the detected runtime
+#[test]
+fn graceful_timeout_env_var_wins_over_detection() {
+    let builder = Scinit::builder()
+        .env("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+        .env("SCINIT_GRACEFUL_TIMEOUT_SECS", "12");
+    assert_eq!(
+        logged_graceful_timeout(builder),
+        "12s (SCINIT_GRACEFUL_TIMEOUT_SECS)"
+    );
+}
+
+/// Sends SIGTERM to a child that ignores it and returns how long scinit
+/// took to exit
+fn time_sigkill_escalation(builder: ScinitBuilder) -> Duration {
+    let (mut scinit, pid) = builder.child(["run", "--ignore", "SIGTERM"]).start();
+    let start = Instant::now();
+    scinit.signal(Signal::SIGTERM).unwrap();
+    let status = scinit.wait_exit(EXIT_BOUND).unwrap();
+    let elapsed = start.elapsed();
+    assert!(
+        wait_for_pid_gone(pid, Duration::from_secs(3)),
+        "child {} survived the escalation\n{}",
+        pid,
+        scinit.diagnostics()
+    );
+    scinit.assert_exit_code(status, 137);
+    elapsed
+}
+
+/// The escalation waits for `SCINIT_GRACEFUL_TIMEOUT_SECS`
+#[test]
+fn graceful_timeout_env_var_is_honoured() {
+    let elapsed =
+        time_sigkill_escalation(Scinit::builder().env("SCINIT_GRACEFUL_TIMEOUT_SECS", "2"));
+    assert!(
+        elapsed >= Duration::from_millis(1900) && elapsed <= Duration::from_secs(5),
+        "escalation took {:?}, expected ~2s from SCINIT_GRACEFUL_TIMEOUT_SECS",
+        elapsed
+    );
+}
+
+/// `--graceful-timeout-secs` wins over `SCINIT_GRACEFUL_TIMEOUT_SECS`
+#[test]
+fn graceful_timeout_flag_wins_over_env_var() {
+    let elapsed = time_sigkill_escalation(
+        Scinit::builder()
+            .env("SCINIT_GRACEFUL_TIMEOUT_SECS", "30")
+            .args(["--graceful-timeout-secs", "1"]),
+    );
+    assert!(
+        elapsed >= Duration::from_millis(900) && elapsed <= Duration::from_secs(5),
+        "escalation took {:?}, expected ~1s from --graceful-timeout-secs",
+        elapsed
+    );
 }
 
 fn assert_termination_forwarded(sig: Signal) {

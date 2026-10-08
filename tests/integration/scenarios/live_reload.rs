@@ -192,7 +192,7 @@ fn sigint_while_old_child_stops_cancels_restart() {
     // Traps SIGTERM without exiting, so the restart's stop keeps waiting
     let (mut scinit, old) = start_and_settle(
         live_reload(b, &dir)
-            .args(["--graceful-timeout-secs", "30"])
+            .args(["--restart-timeout-secs", "30"])
             .child(["run", "--exit-on", "SIGINT"]),
     );
     modify(&file, "v2");
@@ -208,6 +208,66 @@ fn sigint_while_old_child_stops_cancels_restart() {
 
     scinit.assert_start_count(1, "a cancelled restart must not start a child");
     scinit.assert_exit_code(status, 0);
+}
+
+/// A restart SIGKILLs an old child that outlives `--restart-timeout-secs`,
+/// while a termination signal still waits for `--graceful-timeout-secs`
+#[test]
+fn restart_timeout_applies_to_restarts_only() {
+    const RESTART_TIMEOUT: Duration = Duration::from_secs(1);
+    const GRACEFUL_TIMEOUT: Duration = Duration::from_secs(4);
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let file = dir.join("app.conf");
+    modify(&file, "v1");
+    // Traps SIGTERM without exiting, so only SIGKILL stops it
+    let (mut scinit, old) = start_and_settle(
+        live_reload(b, &dir)
+            .args([
+                "--restart-timeout-secs",
+                "1",
+                "--graceful-timeout-secs",
+                "4",
+            ])
+            .child(["run", "--exit-on", "SIGINT"]),
+    );
+    modify(&file, "v2");
+
+    let sigterm = scinit
+        .wait_for_signal(old, Signal::SIGTERM, TIMEOUT)
+        .unwrap();
+    let started = scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
+    // From the events' own timestamps, so polling delays don't skew it
+    let gap = started.time().saturating_sub(sigterm.time());
+    assert!(
+        gap >= RESTART_TIMEOUT && gap < GRACEFUL_TIMEOUT - Duration::from_millis(500),
+        "new child started {:?} after SIGTERM, expected ~{:?} restart timeout\n{}",
+        gap,
+        RESTART_TIMEOUT,
+        scinit.diagnostics()
+    );
+    assert!(
+        !scinit.events_named("exit").iter().any(|e| e.pid() == old),
+        "the old child must be killed, not exit by itself\n{}",
+        scinit.diagnostics()
+    );
+
+    let new = started.pid();
+    let start = Instant::now();
+    scinit.signal(Signal::SIGTERM).unwrap();
+    scinit
+        .wait_for_signal(new, Signal::SIGTERM, TIMEOUT)
+        .unwrap();
+    let status = scinit.wait_exit(TIMEOUT).unwrap();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= GRACEFUL_TIMEOUT - Duration::from_millis(100),
+        "shutdown took {:?}, expected the {:?} graceful timeout\n{}",
+        elapsed,
+        GRACEFUL_TIMEOUT,
+        scinit.diagnostics()
+    );
+    scinit.assert_exit_code(status, 137);
 }
 
 /// A burst of writes inside the debounce window causes exactly one restart
