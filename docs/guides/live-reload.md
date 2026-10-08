@@ -8,9 +8,9 @@ scinit already sits between the container runtime and your application, so it do
 
 ## How a change becomes a restart
 
-Two things happen between a file being written and the new process starting: the change is debounced, then the child is restarted.
+Three things happen between a file being written and the new process starting: the change is debounced, scinit checks what changed, then the child is restarted.
 
-Editors and build tools rarely write a file once. A save can be a truncate followed by several writes, a compiler may write an output in chunks, and a `git checkout` touches many files in a burst. Restarting on the first event would start the new process against a half-written file, and restarting on every event would restart many times for one change. scinit uses a trailing-edge debounce instead. Each relevant change arms a timer of `--debounce-ms` (500 ms by default). Another change before the timer fires re-arms it from zero. Only when the path has been quiet for the full interval does scinit restart, so the restart always sees the last write.
+Editors and build tools rarely write a file once. A save can be a truncate followed by several writes, a compiler may write an output in chunks, and a `git checkout` touches many files in a burst. Restarting on the first event would start the new process against a half-written file, and restarting on every event would restart many times for one change. scinit uses a trailing-edge debounce instead. Each file system event under the watched path arms a timer of `--debounce-ms` (500 ms by default). Another event before the timer fires re-arms it from zero. Only when the path has been quiet for the full interval does scinit compare the watched files with what they were before (see [What counts as a change](#what-counts-as-a-change)), and it restarts the child if one changed. The comparison therefore always sees the last write.
 
 The restart itself reuses scinit's normal shutdown path. scinit sends SIGTERM to the child's process group and waits up to `--graceful-timeout-secs` (30 s by default) for the child to exit. If it is still running, scinit sends SIGKILL. It then waits `--restart-delay-ms` (1000 ms by default) and spawns the command again with the same arguments and environment. A SIGTERM, SIGINT or SIGQUIT that arrives before the new spawn cancels the restart and shuts scinit down instead (see [signals and shutdown](signals-and-shutdown.md)).
 
@@ -26,7 +26,8 @@ sequenceDiagram
     FS->>W: write (re-arms timer)
     FS->>W: write (re-arms timer)
     Note over W: 500 ms with no further changes
-    W->>S: file changed
+    W->>S: compare files with the last snapshot
+    Note over S: a file's contents changed
     S->>Old: SIGTERM to process group
     alt exits within --graceful-timeout-secs
         Old-->>S: exited
@@ -43,7 +44,19 @@ sequenceDiagram
 
 Directories are watched non-recursively. scinit sees changes to files directly inside the directory, but not in its subdirectories. If your code lives in a tree, point `--watch-path` at the directory whose files change, such as the build output directory, rather than at the project root.
 
-Not every event counts. A change triggers a restart if it modifies a file's contents or renames a file. Renames matter because many editors save by writing a temporary file and renaming it over the original. Creating an empty file, deleting one, and metadata-only changes such as `touch`, `chmod` or a new timestamp do not count. scinit also checks that the path in the event is a regular file when the event arrives, so changes to directories, and to files that are already gone, are ignored.
+### What counts as a change
+
+scinit does not decide on the file system events themselves, which differ between inotify on Linux and FSEvents on macOS: the same change can arrive as different events, and FSEvents can report writes made before scinit started. An event only tells scinit when to look. When the debounce timer fires, scinit takes a snapshot of the watched regular files (the watched file, or the files directly inside the watched directory), recording each file's name and a hash of its contents, and compares it with the previous snapshot. The first snapshot is taken when the watch starts, before the child is spawned, so files written before scinit started never count as changed. Compared with the previous snapshot:
+
+- A file whose contents changed restarts the child, whether it was written in place or replaced by renaming another file over it, which is how many editors save.
+- A new file with contents restarts the child, including a file renamed into the directory.
+- A deleted file restarts the child.
+- A new empty file does not.
+- A change to metadata only does not: `touch`, `chmod`, or rewriting a file with the same contents.
+
+Directories, and anything in them, are ignored. A symlink counts as the file it points to. A temporary file that is created and renamed away within the debounce interval is never in a snapshot, so it doesn't count either.
+
+scinit only reads a file again when its size, modification time, change time or inode differ from the previous snapshot, or when it was modified less than two seconds before that snapshot, since file timestamps are too coarse to tell apart two writes made close together. For an unchanged file, a snapshot costs one `stat`.
 
 ## Worked example
 
@@ -130,11 +143,11 @@ The restart always sends SIGTERM, and it waits the full graceful timeout for a c
 
 `--watch-path`, `--debounce-ms` and `--restart-delay-ms` only take effect with `--live-reload`. Without it they are accepted and silently ignored, so a missing `--live-reload` shows up as "nothing restarts", not as an error.
 
-Because the debounce is trailing-edge, a path that keeps changing more often than the debounce interval never triggers a restart until it settles. Changes that arrive while a restart is in progress are not lost: they cause one more restart once the current one completes. A consequence is that if your app writes into the directory being watched, for example a log or PID file, every start causes a change and the app restarts in a loop. Keep such files outside the watched path. Editors can cause the same thing: a swap or backup file written next to the file you are editing, such as Vim's `.swp`, counts as a content change in a watched directory.
+Because the debounce is trailing-edge, a path that keeps changing more often than the debounce interval never triggers a restart until it settles. Changes that arrive while a restart is in progress are not lost: they cause one more restart once the current one completes. A consequence is that if your app writes into the directory being watched, for example a log or PID file, every start causes a change and the app restarts in a loop. Keep such files outside the watched path. Editors can cause the same thing: a swap or backup file written next to the file you are editing, such as Vim's `.swp`, counts as a new file in a watched directory.
 
-Watching a single file is fragile on Linux when the file is replaced by renaming a new one over it, which is how many editors save and how some build tools write their output. inotify watches the file itself, not its name, so after the rename the watch follows the old, deleted file. In our tests on Linux, replacing a watched file this way caused no restart, and later changes to the new file were not seen either. This also applies to the default watch path, which is the executable and so a single file. Watching the containing directory does not have this problem, so on Linux watch a directory: the directory your source or config files live in, or the one your build writes its output to. Watching a single file through its parent directory, so it survives replacement, is planned in [#19](https://github.com/divoxx/scinit/issues/19).
+Watching a single file is fragile on Linux when the file is replaced by renaming a new one over it, which is how many editors save and how some build tools write their output. inotify watches the file itself, not its name, so after the rename the watch follows the old, deleted file, and changes to the new file are not seen. This also applies to the default watch path, which is the executable and so a single file. Watching the containing directory does not have this problem, so on Linux watch a directory: the directory your source or config files live in, or the one your build writes its output to. Watching a single file through its parent directory, so it survives replacement, is planned in [#19](https://github.com/divoxx/scinit/issues/19).
 
-On macOS, file events come from FSEvents, which does not always report exactly what happened. It can report a file written shortly before scinit started as changed, which causes one restart right after startup. In our tests it also reported earlier writes along with later metadata-only changes, so a `touch` or `chmod` on a recently written file could restart the child, which doesn't happen on Linux. Inside a Linux container, even on a Mac host, you get inotify's behavior.
+Because a deleted file counts as a change, a build that deletes its output and writes the new one later than `--debounce-ms` afterwards restarts the child while the file is missing. If the missing file is the executable, the spawn fails and scinit exits with code 1. Writing the new file under a temporary name and renaming it over the old one avoids this, and also means the child never starts from a half-written file. Waiting for the next change when the child exits under live reload is planned in [#22](https://github.com/divoxx/scinit/issues/22).
 
 ## Related
 
