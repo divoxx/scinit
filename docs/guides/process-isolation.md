@@ -55,14 +55,14 @@ So on each spawn, the child makes its own process group the terminal's foregroun
 
 ```console
 $ SCINIT_LOG=info scinit -- sh -c 'trap "echo child: got INT; exit 130" INT; echo running; sleep 1000 & wait'
- INFO scinit: scinit starting
- INFO scinit: init system started, managing subprocess: sh
- INFO scinit::process_manager: Spawning process: sh ["-c", "trap \"echo child: got INT; exit 130\" INT; echo running; sleep 1000 & wait"]
- INFO scinit::process_manager: Process spawned with PID: 93628
+[info]  scinit: scinit starting
+[info]  scinit: init system started, managing subprocess: sh
+[info]  scinit: Spawning process: sh ["-c", "trap \"echo child: got INT; exit 130\" INT; echo running; sleep 1000 & wait"]
+  [ok]  scinit: Process spawned with PID: 93628
 running
 ^Cchild: got INT
- INFO scinit::exit_status: Child process exited with error code 130, scinit exiting
- INFO scinit: scinit exiting with code 130
+[info]  scinit: Child process exited with error code 130, scinit exiting
+[info]  scinit: scinit exiting with code 130
 ```
 
 scinit never logs a SIGINT here: the terminal delivered it to the child directly, the child exited with 130, and scinit exited with the child's code. Because the handoff happens on every spawn, Ctrl-C keeps working after a live-reload restart.

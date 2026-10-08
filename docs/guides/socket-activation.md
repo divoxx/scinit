@@ -47,16 +47,16 @@ The repository's test fixture, `scinit-test-child listen`, is a tiny server that
 ```console
 $ SCINIT_LOG=info scinit --live-reload --watch-path config \
       --restart-delay-ms 2000 --ports 8080,8081 -- scinit-test-child listen
- INFO scinit: scinit starting
- INFO scinit: init system started, managing subprocess: scinit-test-child
- INFO scinit::file_watcher: Started watching path: "config"
- INFO scinit: File watching started for live-reload
- INFO scinit::process_manager: Spawning process: scinit-test-child ["listen"]
- INFO scinit::port_manager: Binding 2 ports to 127.0.0.1
- INFO scinit::port_manager: Bound port 8080 to 127.0.0.1:8080
- INFO scinit::port_manager: Bound port 8081 to 127.0.0.1:8081
- INFO scinit::port_manager: Successfully bound 2 ports
- INFO scinit::process_manager: Process spawned with PID: 95658
+[info]  scinit: scinit starting
+[info]  scinit: init system started, managing subprocess: scinit-test-child
+[info]  scinit: Started watching path: "config"
+  [ok]  scinit: File watching started for live-reload
+[info]  scinit: Spawning process: scinit-test-child ["listen"]
+[info]  scinit: Binding 2 ports to 127.0.0.1
+[info]  scinit: Bound port 8080 to 127.0.0.1:8080
+[info]  scinit: Bound port 8081 to 127.0.0.1:8081
+  [ok]  scinit: Successfully bound 2 ports
+  [ok]  scinit: Process spawned with PID: 95658
 ```
 
 From another terminal, each port answers on the fd its position in `--ports` predicts:
@@ -80,14 +80,14 @@ real 1.31
 The connection was not refused. It waited in the backlog for about a second and was answered by the new child, pid 95666, on the same fd. scinit's log shows that the restart reused the sockets instead of binding again (the long scratch directory path is shortened here):
 
 ```console
- INFO scinit: File changed: ".../config/app.conf", triggering restart
- INFO scinit::process_manager: Restarting process due to file change
- INFO scinit::process_manager: Initiating graceful shutdown of process 95658 with SIGTERM
- INFO scinit::process_manager: Process exited gracefully
- INFO scinit::process_manager: Spawning process: scinit-test-child ["listen"]
- INFO scinit::port_manager: Binding 2 ports to 127.0.0.1
- INFO scinit::port_manager: Successfully bound 2 ports
- INFO scinit::process_manager: Process spawned with PID: 95666
+[info]  scinit: File changed: ".../config/app.conf", triggering restart
+[info]  scinit: Restarting process due to file change
+[info]  scinit: Initiating graceful shutdown of process 95658 with SIGTERM
+[info]  scinit: Process exited gracefully
+[info]  scinit: Spawning process: scinit-test-child ["listen"]
+[info]  scinit: Binding 2 ports to 127.0.0.1
+  [ok]  scinit: Successfully bound 2 ports
+  [ok]  scinit: Process spawned with PID: 95666
 ```
 
 The fixture's `dump` mode shows what the child received. Here a duplicated port and a stale `LISTEN_FDNAMES` in scinit's own environment are both dropped. The fixture reports what it sees on stderr (and in the file named by `$SCINIT_TEST_REPORT`); only the relevant lines are shown, with the pid and timestamp fields shortened to `...`:
@@ -192,7 +192,7 @@ The default bind address is `127.0.0.1`, which only accepts connections from ins
 
 ```console
 $ scinit --ports 8080 --bind-addr localhost -- true
-ERROR scinit: Invalid bind address 'localhost': invalid IP address syntax
+[fail]  scinit: Invalid bind address 'localhost': invalid IP address syntax
 ```
 
 For IPv6, pass the bare address, such as `::` or `::1`, without brackets. scinit doesn't set `IPV6_V6ONLY`, so whether a socket bound to `::` also accepts IPv4 connections follows the operating system's default. On macOS, and on Linux with the usual `net.ipv6.bindv6only=0`, it does: in our test on macOS, a socket bound to `::` answered both `::1` and `127.0.0.1`. There is one bind address for all ports.
@@ -203,7 +203,7 @@ Ports are bound when the first child is spawned. If a port is taken, scinit exit
 
 ```console
 $ scinit --ports 8080 -- my-server
-ERROR scinit: Address already in use (os error 48)
+[fail]  scinit: Address already in use (os error 48)
 ```
 
 The same collision happens if your app ignores the inherited socket and binds the port itself, because scinit is already holding it.

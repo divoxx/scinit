@@ -2,7 +2,7 @@
 
 An init's own log output shares the container's output streams with your application. Everything the container prints is your application's output, and that is what you want to read. Anything the init adds has to stay out of the way: it must not touch the app's stdout, it must not fill the logs during normal operation, and it must be easy to tell apart from the app's own lines. But when something goes wrong, such as a restart that didn't happen or a shutdown that took 30 seconds, the init is the only one that knows why.
 
-So scinit is quiet by default and detailed on request. It only prints warnings and errors unless you ask for more with the `SCINIT_LOG` environment variable. It writes to stderr only, never stdout, and every line names the part of scinit that wrote it.
+So scinit is quiet by default and detailed on request. It only prints warnings and errors unless you ask for more with the `SCINIT_LOG` environment variable. It writes to stderr only, never stdout, and every line says `scinit` right after its status tag.
 
 ```mermaid
 flowchart LR
@@ -15,32 +15,49 @@ flowchart LR
 
 ## The format
 
-Each event is one line, in the standard format of Rust's `tracing` library without a timestamp:
+Each event is one line without a timestamp: a status tag, `scinit:`, and the message.
 
 ```text
-LEVEL target: message
+[info]  scinit: Spawning process: server []
+  [ok]  scinit: Process spawned with PID: 15
+[warn]  scinit: Graceful shutdown timeout, forcing kill
+[fail]  scinit: Failed to spawn process 'server': No such file or directory (os error 2)
+ [dbg]  scinit::reaper: reaped zombie process 16 with exit status 0
 ```
 
-The level is `ERROR`, `WARN`, `INFO`, `DEBUG` or `TRACE`, right-aligned, so `INFO` and `WARN` get a leading space. The target is `scinit` or one of its modules, such as `scinit::process_manager` or `scinit::file_watcher`. Because every target starts with `scinit`, its lines are easy to pick out of the child's output, which is mixed into the same stderr:
+The tag is right-aligned in a 6-character column, so the messages line up at column 8. It shows the event's level:
+
+| Tag | Level | Color on a terminal |
+|---|---|---|
+| `[fail]` | error | red |
+| `[warn]` | warning | yellow |
+| `[info]` | info | cyan |
+| `[ok]` | info: a step that succeeded (the child spawned, the ports bound, file watching started) | green |
+| `[dbg]` | debug | dimmed |
+| `[trc]` | trace | dimmed |
+
+At `debug` and `trace`, the module that logged the event replaces `scinit:`, such as `scinit::reaper:` or `scinit::file_watcher:`, which is the name to use in a per-module `SCINIT_LOG` directive (see below). Events from scinit's main module show `scinit:` at every level. Either way, the first word after the tag is always `scinit`, so scinit's lines are easy to pick out of the child's output, which is mixed into the same stderr, and to find with `grep scinit`:
 
 ```text
- INFO scinit::process_manager: Process spawned with PID: 15
+  [ok]  scinit: Process spawned with PID: 15
 server: started, pid 15, config v1
- INFO scinit: File changed: "/app/config/app.conf", triggering restart
+[info]  scinit: File changed: "/app/config/app.conf", triggering restart
 ```
+
+A message that spans several lines continues on the next ones at column 8, so the extra lines stay visibly part of the event.
 
 There is no timestamp because container log drivers already record one per line, and a second one only adds noise. tini, dumb-init and catatonit leave it out for the same reason.
 
-Output is colored only when stderr is a terminal and the `NO_COLOR` environment variable is unset. Container logs and files never get escape codes, and `NO_COLOR=1` turns color off on a terminal too.
+Output is colored only when stderr is a terminal and the `NO_COLOR` environment variable is unset. Only the tag gets a color; `scinit:` is dimmed and the message is plain. Container logs and files never get escape codes, and `NO_COLOR=1` turns color off on a terminal too. `CLICOLOR_FORCE` set to anything other than `0` turns color on when stderr isn't a terminal, for example when a tool that shows colors reads scinit's output through a pipe; `NO_COLOR` still wins over it.
 
-Fatal errors use the same format. When scinit can't start, the reason is a single `ERROR` line and scinit exits with code 1. This line is printed whatever `SCINIT_LOG` says, even `off`, so an exit with code 1 always comes with a reason:
+Fatal errors use the same format. When scinit can't start, the reason is a single `[fail]` line and scinit exits with code 1. This line is printed whatever `SCINIT_LOG` says, even `off`, so an exit with code 1 always comes with a reason:
 
 ```console
 $ scinit -- nonexistent-cmd
-ERROR scinit: Failed to spawn process 'nonexistent-cmd': No such file or directory (os error 2)
+[fail]  scinit: Failed to spawn process 'nonexistent-cmd': No such file or directory (os error 2)
 ```
 
-Panics, which would be bugs in scinit, are logged the same way, and also whatever `SCINIT_LOG` says, as an `ERROR` line from the `scinit::logging` target that starts with `panic at` followed by the source location and the message, instead of Rust's default panic output.
+Panics, which would be bugs in scinit, are logged the same way, and also whatever `SCINIT_LOG` says, as a `[fail]` line that starts with `panic at` followed by the source location and the message, instead of Rust's default panic output.
 
 ## Choosing what to see
 
@@ -48,7 +65,7 @@ Panics, which would be bugs in scinit, are logged the same way, and also whateve
 
 `info` is the useful level for watching what scinit does. It shows each spawn, each signal and how it was handled, each restart and the exit code. `debug` adds detail such as every raw file system event, each zombie reaped, and the signal and terminal setup at startup.
 
-You can also set the level per module, by naming the target. Directives are separated by commas, and the most specific one wins. A common combination is a general level plus detail for one module:
+You can also set the level per module, by naming the target: `scinit` for the main module, or a module such as `scinit::process_manager`, `scinit::port_manager`, `scinit::file_watcher` or `scinit::reaper`, as shown on `[dbg]` lines. Directives are separated by commas, and the most specific one wins. A common combination is a general level plus detail for one module:
 
 ```sh
 SCINIT_LOG=info,scinit::file_watcher=debug
@@ -70,7 +87,7 @@ child sees RUST_LOG=info
 Start with `SCINIT_LOG=info,scinit::file_watcher=debug`. At startup, look for the line naming the watched path:
 
 ```text
- INFO scinit::file_watcher: Started watching path: "/app/config"
+[info]  scinit: Started watching path: "/app/config"
 ```
 
 If it is missing, live reload isn't on. `--watch-path`, `--debounce-ms` and `--restart-delay-ms` are silently ignored without `--live-reload`. If the path is not the one you expected, remember that without `--watch-path` scinit watches the command's executable, which for an interpreted app is the interpreter.
@@ -79,11 +96,11 @@ Then make the change and look at the events. This run on Linux watched `/app/con
 
 ```text
 + touch config/app.conf
-DEBUG scinit::file_watcher: File system event: Event { kind: Modify(Metadata(Any)), paths: ["/app/config/app.conf"], ...
+ [dbg]  scinit::file_watcher: File system event: Event { kind: Modify(Metadata(Any)), paths: ["/app/config/app.conf"], ...
 + echo x > config/nested/extra.conf
 + echo v5 > config/app.conf
-DEBUG scinit::file_watcher: File system event: Event { kind: Modify(Data(Any)), paths: ["/app/config/app.conf"], ...
- INFO scinit: File changed: "/app/config/app.conf", triggering restart
+ [dbg]  scinit::file_watcher: File system event: Event { kind: Modify(Data(Any)), paths: ["/app/config/app.conf"], ...
+[info]  scinit: File changed: "/app/config/app.conf", triggering restart
 ```
 
 Each case shows one of the reasons a change doesn't cause a restart. The `touch` produced an event, but a metadata-only one, which scinit ignores. The write to `config/nested/extra.conf` produced no event at all, because directories are watched non-recursively. Only the content change to a file directly in the watched directory led to `File changed`. A restart arrives `--debounce-ms` after the last change, so a file that keeps changing delays it.
@@ -95,32 +112,32 @@ If you see no events at all for a file you are sure changed, and you are watchin
 That is the graceful timeout running out: the child didn't exit on the termination signal, so scinit waited `--graceful-timeout-secs` (30 by default) before sending SIGKILL. With `SCINIT_LOG=info` it is easy to confirm. This run used a child that ignores SIGTERM, with the timeout lowered to 3 seconds:
 
 ```text
- INFO scinit: received termination signal SIGTERM, initiating graceful shutdown
- INFO scinit: Termination signal SIGTERM received, forwarding to child process (timeout: 3s)
- INFO scinit::process_manager: Initiating graceful shutdown of process 93999 with SIGTERM
- WARN scinit::process_manager: Graceful shutdown timeout, forcing kill
- INFO scinit::process_manager: Force killing process 93999
- INFO scinit::process_manager: Process killed, exit status: ExitStatus(unix_wait_status(9))
- INFO scinit: scinit exiting due to termination signal SIGTERM
- INFO scinit: scinit exiting with code 137
+[info]  scinit: received termination signal SIGTERM, initiating graceful shutdown
+[info]  scinit: Termination signal SIGTERM received, forwarding to child process (timeout: 3s)
+[info]  scinit: Initiating graceful shutdown of process 93999 with SIGTERM
+[warn]  scinit: Graceful shutdown timeout, forcing kill
+[info]  scinit: Force killing process 93999
+[info]  scinit: Process killed, exit status: ExitStatus(unix_wait_status(9))
+[info]  scinit: scinit exiting due to termination signal SIGTERM
+[info]  scinit: scinit exiting with code 137
 ```
 
-The `WARN ... forcing kill` line is the sign. The fix is in the application: handle SIGTERM and exit. Common causes are a shell script wrapper that runs the app without `exec` and doesn't pass the signal on, or a runtime that installs its own handler and waits for open connections. The same timeout applies to every live-reload restart. The [signals and shutdown guide](signals-and-shutdown.md) has the details, and [exit codes](exit-codes.md) explains the 137.
+The `[warn] ... forcing kill` line is the sign. The fix is in the application: handle SIGTERM and exit. Common causes are a shell script wrapper that runs the app without `exec` and doesn't pass the signal on, or a runtime that installs its own handler and waits for open connections. The same timeout applies to every live-reload restart. The [signals and shutdown guide](signals-and-shutdown.md) has the details, and [exit codes](exit-codes.md) explains the 137.
 
 ### The client gets connection refused
 
-First check whether scinit is holding the port at all. With `--ports`, the `scinit::port_manager` lines say what was bound and where:
+First check whether scinit is holding the port at all. With `--ports`, the port lines say what was bound and where:
 
 ```text
- INFO scinit::port_manager: Binding 2 ports to 127.0.0.1
- INFO scinit::port_manager: Bound port 8080 to 127.0.0.1:8080
- INFO scinit::port_manager: Bound port 8081 to 127.0.0.1:8081
- INFO scinit::port_manager: Successfully bound 2 ports
+[info]  scinit: Binding 2 ports to 127.0.0.1
+[info]  scinit: Bound port 8080 to 127.0.0.1:8080
+[info]  scinit: Bound port 8081 to 127.0.0.1:8081
+  [ok]  scinit: Successfully bound 2 ports
 ```
 
 `127.0.0.1` is the default, and it is the most common cause when the client is outside the container: published ports reach the container's external interface, not its loopback. Use `--bind-addr 0.0.0.0` (or `::`). Depending on the container runtime, the client may see an empty reply or a reset instead of a refusal.
 
-If there are no `port_manager` lines, scinit isn't binding anything and your app opens the port itself. Then the port is closed whenever the app isn't running, including during every live-reload restart, and connections in that window are refused. Passing the port with `--ports` and adopting the inherited socket in the app keeps it open; see [socket activation](socket-activation.md).
+If there are no such lines, scinit isn't binding anything and your app opens the port itself. Then the port is closed whenever the app isn't running, including during every live-reload restart, and connections in that window are refused. Passing the port with `--ports` and adopting the inherited socket in the app keeps it open; see [socket activation](socket-activation.md).
 
 If the lines are there and the bind address is right, the app may be ignoring the inherited socket and binding the port itself, which fails because scinit already holds it, or listening on a different port. Check the app's own startup output.
 
@@ -130,8 +147,8 @@ In `EnvFilter` syntax, a bare word that isn't a level is a target name, so `SCIN
 
 ```console
 $ SCINIT_LOG=inf scinit -- nonexistent-cmd
- WARN scinit::logging: SCINIT_LOG: "inf" is not a level (error, warn, info, debug, trace, off), so it selects the target named "inf"
-ERROR scinit: Failed to spawn process 'nonexistent-cmd': No such file or directory (os error 2)
+[warn]  scinit: SCINIT_LOG: "inf" is not a level (error, warn, info, debug, trace, off), so it selects the target named "inf"
+[fail]  scinit: Failed to spawn process 'nonexistent-cmd': No such file or directory (os error 2)
 ```
 
 A value that can't be parsed at all is ignored with a warning, and the default `warn` applies.

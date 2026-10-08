@@ -61,10 +61,10 @@ When scinit itself can't do its job, it logs an error to stderr and exits 1. Tha
 
 ```console
 $ scinit -- no-such-command; echo "exit=$?"
-ERROR scinit: Failed to spawn process 'no-such-command': No such file or directory (os error 2)
+[fail]  scinit: Failed to spawn process 'no-such-command': No such file or directory (os error 2)
 exit=1
 $ scinit --bind-addr localhost -- true; echo "exit=$?"
-ERROR scinit: Invalid bind address 'localhost': invalid IP address syntax
+[fail]  scinit: Invalid bind address 'localhost': invalid IP address syntax
 exit=1
 ```
 
@@ -84,7 +84,7 @@ exit=2
 
 ## Things to know
 
-Exit code 1 is ambiguous. It is what scinit uses for its own errors, and it is also the most common exit code for an application that failed. If the container exits 1 and you need to know which one happened, look at stderr: scinit's errors are always a line starting with `ERROR scinit`, which is printed whatever `SCINIT_LOG` says (see [logging](logging.md)).
+Exit code 1 is ambiguous. It is what scinit uses for its own errors, and it is also the most common exit code for an application that failed. If the container exits 1 and you need to know which one happened, look at stderr: scinit's errors are always a line starting with `[fail]  scinit:`, which is printed whatever `SCINIT_LOG` says (see [logging](logging.md)).
 
 A shell convention is not a guarantee. An application can exit with 137 or 143 on its own, and scinit passes it through, so a code above 128 means "killed by a signal" only by convention. Likewise, the "128 plus the signal scinit received" case reports the shutdown signal even though the child was actually sent SIGKILL.
 
