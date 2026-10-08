@@ -148,9 +148,15 @@ mod tests {
         assert_eq!(pairs.len(), 3);
 
         // Find specific pairs (order may vary due to HashMap)
-        let has_path = pairs.iter().any(|(k, v)| k.as_str() == "PATH" && v.as_str() == "/usr/bin");
-        let has_home = pairs.iter().any(|(k, v)| k.as_str() == "HOME" && v.as_str() == "/home/user");
-        let has_shell = pairs.iter().any(|(k, v)| k.as_str() == "SHELL" && v.as_str() == "/bin/bash");
+        let has_path = pairs
+            .iter()
+            .any(|(k, v)| k.as_str() == "PATH" && v.as_str() == "/usr/bin");
+        let has_home = pairs
+            .iter()
+            .any(|(k, v)| k.as_str() == "HOME" && v.as_str() == "/home/user");
+        let has_shell = pairs
+            .iter()
+            .any(|(k, v)| k.as_str() == "SHELL" && v.as_str() == "/bin/bash");
 
         assert!(has_path);
         assert!(has_home);

@@ -65,7 +65,8 @@ fn child_sigblk_is_empty() {
     let blocked = parse_sigset_field(&scinit.stdout(), "SigBlk")
         .unwrap_or_else(|| panic!("no SigBlk line\n{}", scinit.diagnostics()));
     assert_eq!(
-        blocked, 0,
+        blocked,
+        0,
         "child SigBlk should be 0, got {:016x}\n{}",
         blocked,
         scinit.diagnostics()
@@ -122,7 +123,10 @@ fn all_scinit_threads_block_handled_signals() {
 fn pid_namespace_flags() -> Option<Vec<&'static str>> {
     let base = ["--pid", "--fork", "--mount-proc", "--kill-child"];
     let candidates: Vec<Vec<&'static str>> = if unsafe { libc::geteuid() } == 0 {
-        vec![base.to_vec(), [&["--user", "--map-root-user"][..], &base].concat()]
+        vec![
+            base.to_vec(),
+            [&["--user", "--map-root-user"][..], &base].concat(),
+        ]
     } else {
         vec![[&["--user", "--map-root-user"][..], &base].concat()]
     };
@@ -152,7 +156,10 @@ fn pid_namespace_flags() -> Option<Vec<&'static str>> {
     if std::env::var_os("SCINIT_REQUIRE_PID1").is_some() {
         panic!("{}", msg);
     }
-    eprintln!("SKIP: {}; run scripts/test-linux.sh for PID 1 coverage", msg);
+    eprintln!(
+        "SKIP: {}; run scripts/test-linux.sh for PID 1 coverage",
+        msg
+    );
     None
 }
 
@@ -221,7 +228,9 @@ impl Pid1Scinit {
 
     /// Wait until the report contains an event matching `pred`
     fn wait_report(&self, timeout: Duration, pred: impl Fn(&Event) -> bool) -> Option<Event> {
-        poll_until(timeout, || read_events(&self.report).into_iter().find(|e| pred(e)))
+        poll_until(timeout, || {
+            read_events(&self.report).into_iter().find(|e| pred(e))
+        })
     }
 
     /// The child's `started` line, asserting scinit (its parent) is PID 1
@@ -241,16 +250,29 @@ impl Pid1Scinit {
     fn scinit_outer_pid(&self) -> Pid {
         let parent = self.unshare.id().to_string();
         poll_until(TIMEOUT, || {
-            std::fs::read_dir("/proc").unwrap().flatten().find_map(|entry| {
-                let status = std::fs::read_to_string(entry.path().join("status")).ok()?;
-                let ppid = status.lines().find_map(|l| l.strip_prefix("PPid:"))?;
-                if ppid.trim() != parent {
-                    return None;
-                }
-                entry.file_name().to_string_lossy().parse().ok().map(Pid::from_raw)
-            })
+            std::fs::read_dir("/proc")
+                .unwrap()
+                .flatten()
+                .find_map(|entry| {
+                    let status = std::fs::read_to_string(entry.path().join("status")).ok()?;
+                    let ppid = status.lines().find_map(|l| l.strip_prefix("PPid:"))?;
+                    if ppid.trim() != parent {
+                        return None;
+                    }
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .parse()
+                        .ok()
+                        .map(Pid::from_raw)
+                })
         })
-        .unwrap_or_else(|| panic!("could not find scinit under unshare\n{}", self.diagnostics()))
+        .unwrap_or_else(|| {
+            panic!(
+                "could not find scinit under unshare\n{}",
+                self.diagnostics()
+            )
+        })
     }
 }
 

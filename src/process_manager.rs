@@ -2,9 +2,9 @@ use crate::environment::Environment;
 use crate::fds;
 use crate::port_manager::PortManager;
 use crate::reaper::{clear_managed_child, set_managed_child};
-use crate::terminal;
 use crate::signals::Signal;
 use crate::socket_activation::SocketActivationExec;
+use crate::terminal;
 use crate::Result;
 use eyre::eyre;
 use nix::sys::signal::kill;
@@ -98,7 +98,10 @@ impl ProcessManager {
 
     /// Spawns a new process with port inheritance and proper signal mask reset
     pub async fn spawn_process(&mut self) -> Result<()> {
-        info!("Spawning process: {} {:?}", self.config.command, self.config.args);
+        info!(
+            "Spawning process: {} {:?}",
+            self.config.command, self.config.args
+        );
 
         // Bind ports before spawning
         self.port_manager.bind_ports()?;
@@ -110,7 +113,8 @@ impl ProcessManager {
         close_stray_fds_on_exec(&mut command);
         self.install_socket_activation(&mut command, overrides)?;
 
-        let child = command.spawn()
+        let child = command
+            .spawn()
             .map_err(|e| eyre!("Failed to spawn process '{}': {}", self.config.command, e))?;
         self.track_child(child)?;
         self.hand_terminal_to_child().await
@@ -158,7 +162,11 @@ impl ProcessManager {
 
     /// With sockets to pass, makes the child exec itself so it can move them
     /// to fds 3.. and set LISTEN_PID to its own pid (see socket_activation)
-    fn install_socket_activation(&self, command: &mut Command, overrides: Environment) -> Result<()> {
+    fn install_socket_activation(
+        &self,
+        command: &mut Command,
+        overrides: Environment,
+    ) -> Result<()> {
         let listen_fds = self.port_manager.listen_fds();
         if listen_fds.is_empty() {
             return Ok(());
@@ -229,7 +237,10 @@ impl ProcessManager {
         let Some(pid) = self.running_pid() else {
             return;
         };
-        info!("Initiating graceful shutdown of process {} with {:?}", pid, signal);
+        info!(
+            "Initiating graceful shutdown of process {} with {:?}",
+            pid, signal
+        );
         self.try_signal_group(signal);
 
         match timeout(self.config.graceful_shutdown_timeout, self.wait_for_exit()).await {
@@ -343,7 +354,7 @@ fn remove_inherited_listen_vars(command: &mut Command, overrides: &Environment) 
 fn reset_signal_mask_on_exec(command: &mut Command) {
     unsafe {
         command.pre_exec(|| {
-            use nix::sys::signal::{pthread_sigmask, SigmaskHow, SigSet};
+            use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow};
 
             pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None)
                 .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
@@ -371,14 +382,23 @@ impl Drop for ProcessManager {
         let Some(pid) = self.running_pid() else {
             return;
         };
-        warn!("ProcessManager dropped with running child (PID: {}), emergency cleanup", pid);
+        warn!(
+            "ProcessManager dropped with running child (PID: {}), emergency cleanup",
+            pid
+        );
 
         // Emergency SIGKILL to process group - no graceful shutdown in Drop
         match self.signal_group(Signal::SIGKILL) {
-            Ok(()) => warn!("Sent SIGKILL to process group {} during emergency cleanup", pid),
+            Ok(()) => warn!(
+                "Sent SIGKILL to process group {} during emergency cleanup",
+                pid
+            ),
             // Process already dead - this is fine, no cleanup needed
             Err(e) if matches!(e.downcast_ref::<nix::Error>(), Some(nix::Error::ESRCH)) => {}
-            Err(e) => error!("Failed to send SIGKILL to process group during emergency cleanup: {}", e),
+            Err(e) => error!(
+                "Failed to send SIGKILL to process group during emergency cleanup: {}",
+                e
+            ),
         }
 
         // Brief pause to let SIGKILL take effect
@@ -410,15 +430,20 @@ mod tests {
         if kill(pid, None).is_err() {
             return true;
         }
-        std::fs::read_to_string(format!("/proc/{}/stat", pid))
-            .is_ok_and(|stat| stat.rsplit(')').next().is_some_and(|s| s.trim_start().starts_with('Z')))
+        std::fs::read_to_string(format!("/proc/{}/stat", pid)).is_ok_and(|stat| {
+            stat.rsplit(')')
+                .next()
+                .is_some_and(|s| s.trim_start().starts_with('Z'))
+        })
     }
 
     /// Polls `f` every 10ms for up to 2s
     fn poll(mut f: impl FnMut() -> bool) -> bool {
-        (0..200).any(|_| f() || {
-            std::thread::sleep(Duration::from_millis(10));
-            false
+        (0..200).any(|_| {
+            f() || {
+                std::thread::sleep(Duration::from_millis(10));
+                false
+            }
         })
     }
 
@@ -477,11 +502,16 @@ mod tests {
         manager.shutdown_with_signal(Signal::SIGTERM).await;
         assert!(!manager.is_running());
         assert_eq!(manager.pid(), Some(pid));
-        assert_eq!(manager.exit_status().map(exit_code), Some(128 + Signal::SIGTERM as i32));
+        assert_eq!(
+            manager.exit_status().map(exit_code),
+            Some(128 + Signal::SIGTERM as i32)
+        );
         // The exited child's pid may be reused, so it is never signalled again
         assert!(manager.signal_group(Signal::SIGTERM).is_err());
         // And there is nothing left to wait for
-        assert!(timeout(Duration::from_millis(50), manager.wait_for_exit()).await.is_err());
+        assert!(timeout(Duration::from_millis(50), manager.wait_for_exit())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -495,12 +525,20 @@ mod tests {
         env.set("PID_FILE", pid_file.to_str().unwrap());
         let mut manager = manager(ProcessConfig {
             environment: env,
-            ..command("sh", &["-c", "trap '' TERM; sleep 10 & echo $! > \"$PID_FILE\"; wait"])
+            ..command(
+                "sh",
+                &[
+                    "-c",
+                    "trap '' TERM; sleep 10 & echo $! > \"$PID_FILE\"; wait",
+                ],
+            )
         });
         manager.spawn_process().await.unwrap();
         let mut grandchild = None;
         assert!(poll(|| {
-            grandchild = std::fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse().ok());
+            grandchild = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok());
             grandchild.is_some()
         }));
         let grandchild = Pid::from_raw(grandchild.unwrap());
@@ -510,7 +548,11 @@ mod tests {
         assert!(manager.is_running());
 
         drop(manager);
-        assert!(poll(|| is_gone(grandchild)), "grandchild {} survived the drop", grandchild);
+        assert!(
+            poll(|| is_gone(grandchild)),
+            "grandchild {} survived the drop",
+            grandchild
+        );
     }
 
     #[tokio::test]

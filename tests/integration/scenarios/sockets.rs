@@ -90,7 +90,12 @@ fn inherited_listen_vars_replaced_with_ports() {
     let pid = scinit.child_pid().unwrap();
     assert_eq!(env_value(&events, "LISTEN_FDS"), Some("1".to_string()));
     assert_eq!(env_value(&events, "LISTEN_PID"), Some(pid.to_string()));
-    assert_eq!(env_value(&events, "LISTEN_FDNAMES"), None, "{}", scinit.diagnostics());
+    assert_eq!(
+        env_value(&events, "LISTEN_FDNAMES"),
+        None,
+        "{}",
+        scinit.diagnostics()
+    );
 }
 
 /// A bare command name is resolved through PATH, and the child sees its own
@@ -133,7 +138,11 @@ fn listen_child_answers_on_every_port() {
             scinit.diagnostics()
         );
         let reply = scinit.assert_reply_from(&loopback(*port), pid);
-        assert!(reply.ends_with(&format!("port={}", port)), "reply {:?}", reply);
+        assert!(
+            reply.ends_with(&format!("port={}", port)),
+            "reply {:?}",
+            reply
+        );
     }
 }
 
@@ -170,7 +179,13 @@ fn inherited_listen_fds_stripped_without_ports() {
         .env("LISTEN_FDNAMES", "stale")
         .spawn_dump(&["--then-exit"]);
     for key in ["LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES"] {
-        assert_eq!(env_value(&events, key), None, "{}: {}", key, scinit.diagnostics());
+        assert_eq!(
+            env_value(&events, key),
+            None,
+            "{}: {}",
+            key,
+            scinit.diagnostics()
+        );
     }
 }
 
@@ -202,7 +217,12 @@ fn stray_inherited_fd_not_passed_with_ports() {
         .leak_fd()
         .ports(&free_ports(2))
         .spawn_dump(&["--then-exit"]);
-    assert_eq!(open_fds(&events), [0, 1, 2, 3, 4], "{}", scinit.diagnostics());
+    assert_eq!(
+        open_fds(&events),
+        [0, 1, 2, 3, 4],
+        "{}",
+        scinit.diagnostics()
+    );
 }
 
 /// A clean run with `--ports` leaves nothing on scinit's stderr: closing the
@@ -320,7 +340,11 @@ fn rebind_after_serving_connections() {
     let mut first = first;
     first.signal(Signal::SIGTERM).unwrap();
     first.wait_exit(TIMEOUT).unwrap();
-    assert!(wait_for_pid_gone(pid, TIMEOUT), "listen child {} still running", pid);
+    assert!(
+        wait_for_pid_gone(pid, TIMEOUT),
+        "listen child {} still running",
+        pid
+    );
 
     let (second, status) = Scinit::builder()
         .ports(&[port])
