@@ -40,6 +40,18 @@ pub struct Cli {
     #[arg(long)]
     pub watch_path: Option<PathBuf>,
 
+    /// Poll the watch path every MS milliseconds (at least 10; default 250) instead of using file notifications
+    #[arg(
+        long,
+        value_name = "MS",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "250",
+        requires = "live_reload",
+        value_parser = clap::value_parser!(u64).range(10..)
+    )]
+    pub watch_poll: Option<u64>,
+
     /// Comma-separated list of ports to bind
     #[arg(long, value_delimiter = ',')]
     pub ports: Vec<u16>,
@@ -94,6 +106,8 @@ pub struct Config {
 pub struct LiveReloadConfig {
     pub watch_path: PathBuf,
     pub debounce: Duration,
+    /// Polling interval, `None` to use file notifications
+    pub poll_interval: Option<Duration>,
     pub restart_delay: Duration,
 }
 
@@ -118,6 +132,7 @@ impl Config {
             Some(LiveReloadConfig {
                 watch_path,
                 debounce: Duration::from_millis(cli.debounce_ms),
+                poll_interval: cli.watch_poll.map(Duration::from_millis),
                 restart_delay: Duration::from_millis(cli.restart_delay_ms),
             })
         } else {
@@ -160,6 +175,7 @@ impl Config {
             .map(|live_reload| FileWatchConfig {
                 watch_path: live_reload.watch_path.clone(),
                 debounce: live_reload.debounce,
+                poll_interval: live_reload.poll_interval,
             })
     }
 }
