@@ -114,7 +114,7 @@ Only the six signals listed above are forwarded. Others, such as SIGWINCH (termi
 
 scinit waits for the managed child, not for the whole group. If the child exits within the graceful timeout but a worker in its group ignored the signal, scinit exits without killing that worker. As PID 1 this doesn't matter, because the kernel kills everything left in the container when scinit exits; outside a container the worker keeps running. The same goes for a process that moves itself into another process group or session, such as a daemon that calls `setsid`: it is not reached by forwarded signals or by the final SIGKILL, and only the end of the PID namespace cleans it up.
 
-A termination signal that arrives during a live-reload restart waits until the restart has finished and is then forwarded to the new child, which can receive it before it has installed its own signal handlers. In that case the new child dies from the signal's default action and scinit exits with 143 rather than the clean exit code your handler would have produced. The [live reload guide](live-reload.md) describes the restart sequence.
+A termination signal that arrives during a live-reload restart, before the new child is spawned, cancels the restart. scinit doesn't start a new child: if the old one is still stopping, scinit forwards the signal to it and waits for it as in any shutdown; then scinit exits with the old child's status. SIGUSR1, SIGUSR2 and SIGHUP that arrive during a restart are held and forwarded to the new child once it is spawned, which can be before it has installed its own signal handlers. The [live reload guide](live-reload.md) describes the restart sequence.
 
 The exit status scinit reports after a shutdown is explained in [exit codes](exit-codes.md).
 

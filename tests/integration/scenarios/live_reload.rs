@@ -156,6 +156,60 @@ fn restart_delay_is_respected() {
     );
 }
 
+/// A termination signal during the restart delay cancels the restart: no new
+/// child is started (it would get the forwarded signal before it could
+/// handle it), and scinit exits with the old child's status
+#[test]
+fn sigterm_during_restart_delay_cancels_restart() {
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let file = dir.join("app.conf");
+    modify(&file, "v1");
+    let (mut scinit, old) = start_and_settle(live_reload_with(b, &dir, 200, 3000).child(["run"]));
+    modify(&file, "v2");
+
+    scinit
+        .wait_for_nth_match("old child exit", 1, TIMEOUT, |e| {
+            e.is("exit") && e.pid() == old
+        })
+        .unwrap();
+    scinit.signal(Signal::SIGTERM).unwrap();
+    let status = scinit.wait_exit(TIMEOUT).unwrap();
+
+    scinit.assert_start_count(1, "a cancelled restart must not start a child");
+    scinit.assert_exit_code(status, 0);
+}
+
+/// A termination signal while the old child is still stopping cancels the
+/// restart too: it is forwarded to the old child, and scinit exits with that
+/// child's status
+#[test]
+fn sigint_while_old_child_stops_cancels_restart() {
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let file = dir.join("app.conf");
+    modify(&file, "v1");
+    // Traps SIGTERM without exiting, so the restart's stop keeps waiting
+    let (mut scinit, old) = start_and_settle(
+        live_reload(b, &dir)
+            .args(["--graceful-timeout-secs", "30"])
+            .child(["run", "--exit-on", "SIGINT"]),
+    );
+    modify(&file, "v2");
+
+    scinit
+        .wait_for_signal(old, Signal::SIGTERM, TIMEOUT)
+        .unwrap();
+    scinit.signal(Signal::SIGINT).unwrap();
+    scinit
+        .wait_for_signal(old, Signal::SIGINT, TIMEOUT)
+        .unwrap();
+    let status = scinit.wait_exit(TIMEOUT).unwrap();
+
+    scinit.assert_start_count(1, "a cancelled restart must not start a child");
+    scinit.assert_exit_code(status, 0);
+}
+
 /// A burst of writes inside the debounce window causes exactly one restart
 #[test]
 fn burst_of_writes_restarts_once() {

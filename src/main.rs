@@ -134,7 +134,13 @@ async fn run_main_loop(
 
             // Live-reload: restart as soon as a (debounced) change arrives
             Some(event) = next_file_event(&mut file_watcher) => {
-                on_file_event(event, process_manager).await?;
+                if let Some(signal) = on_file_event(event, process_manager, signal_handler).await? {
+                    // The restart was cancelled before the spawn: shut down
+                    // as for any termination signal, which also stops the
+                    // old child if it is still running
+                    on_signal(signal, process_manager).await;
+                    return Ok(exit_code_after_signal(process_manager, signal));
+                }
             }
 
             // Reap orphans as soon as they exit (matters when scinit is PID 1)
@@ -195,18 +201,37 @@ async fn on_signal(signal: Signal, process_manager: &mut ProcessManager) -> Sign
     }
 }
 
-/// Handles one file watcher event, restarting the process on a change
-async fn on_file_event(event: FileChangeEvent, process_manager: &mut ProcessManager) -> Result<()> {
+/// Handles one file watcher event, restarting the process on a change.
+///
+/// A termination signal cancels the restart if it arrives before the new
+/// child is spawned; it is returned for the caller to shut down with. Other
+/// signals arriving meanwhile wait for the new child.
+async fn on_file_event(
+    event: FileChangeEvent,
+    process_manager: &mut ProcessManager,
+    signal_handler: &mut SignalHandler,
+) -> Result<Option<Signal>> {
     match event {
         FileChangeEvent::FileChanged(path) => {
             info!("File changed: {:?}, triggering restart", path);
-            process_manager.restart().await?;
+            let cancel = signal_handler.wait_for_termination_signal();
+            match process_manager.restart_unless(cancel).await? {
+                Some(signal) => {
+                    let signal = signal?;
+                    info!(
+                        "received termination signal {:?} during restart, not starting a new child",
+                        signal
+                    );
+                    Ok(Some(signal))
+                }
+                None => Ok(None),
+            }
         }
         FileChangeEvent::WatchError(error) => {
             warn!("File watching error: {}", error);
+            Ok(None)
         }
     }
-    Ok(())
 }
 
 /// The child's exit code if its exit was observed; otherwise death by the
