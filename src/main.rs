@@ -25,7 +25,7 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 use cli::{Cli, Config};
-use exit_status::{exit_code, handle_child_exit, signal_exit_code};
+use exit_status::{exit_code, handle_child_exit, log_child_exit_while_watching, signal_exit_code};
 use file_watcher::{FileChangeEvent, FileWatcher};
 use port_manager::PortManager;
 use process_manager::ProcessManager;
@@ -115,15 +115,23 @@ async fn run_main_loop(
         }
     };
 
-    // Spawn initial process
+    let live_reload = file_watcher.is_some();
+
+    // Spawn initial process. Failing here ends scinit, with or without
+    // live reload
     process_manager.spawn_process().await?;
 
     loop {
         select! {
             // Check if subprocess has exited
-            exit_status = process_manager.wait_for_exit() => {
-                let status = exit_status.inspect_err(|e| error!("error waiting for subprocess: {}", e))?;
-                return Ok(handle_child_exit(status));
+            exit = process_manager.wait_for_exit() => {
+                let exit = exit.inspect_err(|e| error!("error waiting for subprocess: {}", e))?;
+                if !live_reload {
+                    return Ok(handle_child_exit(exit.status));
+                }
+                // Keep running, with the sockets bound, until a file change
+                // starts the next child
+                log_child_exit_while_watching(exit.status, exit.ran_for);
             }
 
             // Synchronous signal handling - proper for init systems
@@ -196,6 +204,12 @@ async fn on_signal(
             info!("scinit exiting due to termination signal {:?}", signal);
             SignalAction::Exit
         }
+        _ if !process_manager.is_running() => {
+            // Between a child's exit and the next file change under live
+            // reload: the next child starts without it
+            debug!("no child running, dropping signal {:?}", signal);
+            SignalAction::Continue
+        }
         Signal::SIGUSR1 | Signal::SIGUSR2 | Signal::SIGHUP => {
             // These signals should be forwarded to the child process only
             info!("forwarding signal {:?} to child process", signal);
@@ -211,11 +225,13 @@ async fn on_signal(
     }
 }
 
-/// Handles one file watcher event, restarting the process on a change.
+/// Handles one file watcher event, restarting the process on a change, or
+/// starting it if the last child exited.
 ///
 /// A termination signal cancels the restart if it arrives before the new
 /// child is spawned; it is returned for the caller to shut down with. Other
-/// signals arriving meanwhile wait for the new child.
+/// signals arriving meanwhile wait for the new child. A failed spawn is
+/// logged and leaves scinit waiting for the next change.
 async fn on_file_event(
     event: FileChangeEvent,
     process_manager: &mut ProcessManager,
@@ -225,8 +241,12 @@ async fn on_file_event(
         FileChangeEvent::FileChanged(path) => {
             info!("File changed: {:?}, triggering restart", path);
             let cancel = signal_handler.wait_for_termination_signal();
-            match process_manager.restart_unless(cancel).await? {
-                Some(signal) => {
+            match process_manager.restart_unless(cancel).await {
+                Err(e) => {
+                    error!("{:#}; waiting for a file change to try again", e);
+                    Ok(None)
+                }
+                Ok(Some(signal)) => {
                     let signal = signal?;
                     info!(
                         "received termination signal {:?} during restart, not starting a new child",
@@ -234,7 +254,7 @@ async fn on_file_event(
                     );
                     Ok(Some(signal))
                 }
-                None => Ok(None),
+                Ok(None) => Ok(None),
             }
         }
         FileChangeEvent::WatchError(error) => {

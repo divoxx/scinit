@@ -13,7 +13,7 @@ use std::future::Future;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::process::{ExitStatus, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
 use tokio::select;
 use tokio::time::sleep;
@@ -46,11 +46,21 @@ impl Default for ProcessConfig {
     }
 }
 
+/// How a child's run ended
+#[derive(Debug, Clone, Copy)]
+pub struct ChildExit {
+    pub status: ExitStatus,
+    /// From the spawn to the observed exit
+    pub ran_for: Duration,
+}
+
 /// Lifecycle of the managed child; each state carries only the data valid in it
 enum ChildState {
     NotStarted,
     Running(ManagedChild),
-    Exited { status: ExitStatus },
+    /// The last child exited. Under live reload scinit keeps running in this
+    /// state until a file change spawns the next child.
+    Exited(ChildExit),
 }
 
 /// A running child the zombie reaper must leave alone. Creating one marks
@@ -59,6 +69,7 @@ enum ChildState {
 struct ManagedChild {
     child: Child,
     pid: Pid,
+    started: Instant,
 }
 
 impl ManagedChild {
@@ -68,7 +79,11 @@ impl ManagedChild {
             None => return Err(eyre!("Failed to get process ID")),
         };
         set_managed_child(pid);
-        Ok(Self { child, pid })
+        Ok(Self {
+            child,
+            pid,
+            started: Instant::now(),
+        })
     }
 }
 
@@ -192,17 +207,17 @@ impl ProcessManager {
         Ok(())
     }
 
-    /// Waits for the running child to exit and returns its status. Never
+    /// Waits for the running child to exit and returns how it ended. Never
     /// resolves when no child is running.
-    pub async fn wait_for_exit(&mut self) -> Result<ExitStatus> {
+    pub async fn wait_for_exit(&mut self) -> Result<ChildExit> {
         let ChildState::Running(running) = &mut self.state else {
             return std::future::pending().await;
         };
         match running.child.wait().await {
             Ok(status) => {
-                self.record_exit(status);
+                let exit = self.record_exit(status);
                 debug!("Process exited with status: {:?}", status);
-                Ok(status)
+                Ok(exit)
             }
             Err(e) => {
                 error!("Error waiting for process: {}", e);
@@ -213,11 +228,15 @@ impl ProcessManager {
         }
     }
 
-    /// Moves a running child to `Exited`, which clears the reaper's mark
-    fn record_exit(&mut self, status: ExitStatus) {
-        if let ChildState::Running(_) = &self.state {
-            self.state = ChildState::Exited { status };
-        }
+    /// Moves the running child to `Exited`, which clears the reaper's mark
+    fn record_exit(&mut self, status: ExitStatus) -> ChildExit {
+        let ran_for = match &self.state {
+            ChildState::Running(running) => running.started.elapsed(),
+            _ => Duration::ZERO,
+        };
+        let exit = ChildExit { status, ran_for };
+        self.state = ChildState::Exited(exit);
+        exit
     }
 
     /// Performs a graceful shutdown of the current process with SIGTERM,
@@ -307,9 +326,9 @@ impl ProcessManager {
         }
     }
 
-    /// Restarts the process after a file change: graceful shutdown, the
-    /// restart delay, then a new spawn. Returns `None` once the new child is
-    /// spawned.
+    /// Restarts the process after a file change: graceful shutdown (if a
+    /// child is running), the restart delay, then a new spawn. Returns `None`
+    /// once the new child is spawned.
     ///
     /// If `cancel` completes first, gives up without spawning and returns
     /// its output. The old child may then still be stopping: it has been
@@ -318,7 +337,10 @@ impl ProcessManager {
         &mut self,
         cancel: impl Future<Output = T>,
     ) -> Result<Option<T>> {
-        info!("Restarting process due to file change");
+        match self.state {
+            ChildState::Running(_) => info!("Restarting process due to file change"),
+            _ => info!("Starting process due to file change"),
+        }
         tokio::pin!(cancel);
 
         select! {
@@ -355,10 +377,10 @@ impl ProcessManager {
         self.config.graceful_shutdown_timeout
     }
 
-    /// Exit status of the child, once its exit was observed
+    /// Exit status of the last child, once its exit was observed
     pub fn exit_status(&self) -> Option<ExitStatus> {
         match self.state {
-            ChildState::Exited { status } => Some(status),
+            ChildState::Exited(exit) => Some(exit.status),
             _ => None,
         }
     }
@@ -370,7 +392,6 @@ impl ProcessManager {
         }
     }
 
-    #[cfg(test)]
     pub fn is_running(&self) -> bool {
         matches!(self.state, ChildState::Running(_))
     }
@@ -520,6 +541,7 @@ mod tests {
     use super::*;
     use crate::exit_status::exit_code;
     use crate::port_manager::PortBindingConfig;
+    use std::os::unix::process::ExitStatusExt;
     use tokio::time::timeout;
 
     fn manager(config: ProcessConfig) -> ProcessManager {
@@ -570,9 +592,52 @@ mod tests {
         assert!(manager.spawn_process().await.is_ok());
 
         // Wait for process to exit
-        let status = manager.wait_for_exit().await.unwrap();
-        assert!(status.success());
+        let exit = manager.wait_for_exit().await.unwrap();
+        assert!(exit.status.success());
         assert!(!manager.is_running());
+    }
+
+    #[tokio::test]
+    async fn test_exit_records_run_time() {
+        let mut manager = manager(command("sleep", &["0.3"]));
+        manager.spawn_process().await.unwrap();
+
+        let exit = manager.wait_for_exit().await.unwrap();
+        assert!(exit.ran_for >= Duration::from_millis(300), "{:?}", exit);
+        assert!(exit.ran_for < Duration::from_secs(5), "{:?}", exit);
+    }
+
+    #[tokio::test]
+    async fn test_restart_after_exit_spawns() {
+        let mut manager = manager(ProcessConfig {
+            restart_delay: Duration::from_millis(10),
+            ..command("sleep", &["10"])
+        });
+        manager.state = ChildState::Exited(ChildExit {
+            status: ExitStatus::from_raw(3 << 8),
+            ran_for: Duration::ZERO,
+        });
+
+        let cancelled = manager.restart_unless(std::future::pending::<()>()).await;
+        assert!(cancelled.unwrap().is_none());
+        assert!(manager.is_running());
+    }
+
+    #[tokio::test]
+    async fn test_failed_restart_keeps_last_status() {
+        let mut manager = manager(ProcessConfig {
+            restart_delay: Duration::from_millis(10),
+            ..command("/nonexistent/scinit-no-such-binary", &[])
+        });
+        manager.state = ChildState::Exited(ChildExit {
+            status: ExitStatus::from_raw(3 << 8),
+            ran_for: Duration::ZERO,
+        });
+
+        let restart = manager.restart_unless(std::future::pending::<()>()).await;
+        assert!(restart.is_err());
+        assert!(!manager.is_running());
+        assert_eq!(manager.exit_status().map(exit_code), Some(3));
     }
 
     #[tokio::test]
@@ -800,7 +865,7 @@ mod tests {
             let mut manager = manager(command("true", &[]));
             barrier.wait();
             manager.spawn_process().await.unwrap();
-            manager.wait_for_exit().await.unwrap()
+            manager.wait_for_exit().await.unwrap().status
         });
         setup.join().unwrap();
         assert!(status.success(), "the child died: {:?}", status);
@@ -817,7 +882,7 @@ mod tests {
         });
         assert!(manager.spawn_process().await.is_ok());
 
-        let status = manager.wait_for_exit().await.unwrap();
-        assert!(status.success());
+        let exit = manager.wait_for_exit().await.unwrap();
+        assert!(exit.status.success());
     }
 }
