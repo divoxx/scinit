@@ -191,6 +191,73 @@ fn sigquit_escalates_to_sigkill() {
     assert_escalates_to_sigkill(Signal::SIGQUIT);
 }
 
+/// A second termination signal during the graceful wait SIGKILLs the child
+/// at once instead of waiting out the timeout
+fn assert_second_signal_kills(first: Signal, second: Signal) {
+    // Traps the termination signals without exiting on them
+    let (mut scinit, pid) = Scinit::builder()
+        .args(["--graceful-timeout-secs", "30"])
+        .child(["run", "--exit-on", "USR2"])
+        .start();
+    scinit.signal(first).unwrap();
+    scinit.wait_for_signal(pid, first, TIMEOUT).unwrap();
+    let start = Instant::now();
+    scinit.signal(second).unwrap();
+    let status = scinit.wait_exit(EXIT_BOUND).unwrap();
+
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "{:?} after {:?} took {:?} to stop the child, expected an immediate SIGKILL",
+        second,
+        first,
+        start.elapsed()
+    );
+    assert!(
+        wait_for_pid_gone(pid, Duration::from_secs(3)),
+        "child {} survived the SIGKILL\n{}",
+        pid,
+        scinit.diagnostics()
+    );
+    scinit.assert_exit_code(status, 137);
+}
+
+#[test]
+fn second_sigterm_kills_at_once() {
+    assert_second_signal_kills(Signal::SIGTERM, Signal::SIGTERM);
+}
+
+#[test]
+fn sigint_after_sigterm_kills_at_once() {
+    assert_second_signal_kills(Signal::SIGTERM, Signal::SIGINT);
+}
+
+/// SIGUSR1 during the graceful wait is forwarded to the stopping child
+/// rather than dropped, and doesn't end the wait
+#[test]
+fn usr1_forwarded_during_graceful_shutdown() {
+    let (mut scinit, pid) = Scinit::builder()
+        .args(["--graceful-timeout-secs", "30"])
+        .child(["run", "--exit-on", "USR2"])
+        .start();
+    scinit.signal(Signal::SIGTERM).unwrap();
+    scinit
+        .wait_for_signal(pid, Signal::SIGTERM, TIMEOUT)
+        .unwrap();
+    scinit.signal(Signal::SIGUSR1).unwrap();
+    scinit
+        .wait_for_signal(pid, Signal::SIGUSR1, TIMEOUT)
+        .unwrap();
+    assert!(
+        scinit.is_running(),
+        "SIGUSR1 must not end the graceful wait\n{}",
+        scinit.diagnostics()
+    );
+    // Lets the child exit by itself
+    scinit.signal(Signal::SIGUSR2).unwrap();
+    let status = scinit.wait_exit(EXIT_BOUND).unwrap();
+    scinit.assert_exit_code(status, 0);
+}
+
 fn assert_termination_forwarded(sig: Signal) {
     let (mut scinit, pid) = Scinit::builder().child(["run"]).start();
     scinit.signal(sig).unwrap();

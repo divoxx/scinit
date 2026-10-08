@@ -2,7 +2,7 @@ use crate::environment::Environment;
 use crate::fds;
 use crate::port_manager::PortManager;
 use crate::reaper::{clear_managed_child, set_managed_child};
-use crate::signals::Signal;
+use crate::signals::{is_termination, Signal};
 use crate::socket_activation::SocketActivationExec;
 use crate::terminal;
 use crate::Result;
@@ -15,7 +15,7 @@ use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::select;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 /// Configuration for process management behavior
@@ -225,17 +225,25 @@ impl ProcessManager {
         }
     }
 
-    /// Performs a graceful shutdown of the current process with SIGTERM
+    /// Performs a graceful shutdown of the current process with SIGTERM,
+    /// ignoring signals scinit receives meanwhile
     ///
     /// See [`ProcessManager::shutdown_with_signal`].
     pub async fn graceful_shutdown(&mut self) {
-        self.shutdown_with_signal(Signal::SIGTERM).await
+        let no_signals = async || std::future::pending::<Result<Signal>>().await;
+        self.shutdown_with_signal(Signal::SIGTERM, no_signals).await
     }
 
     /// Stops the running child: sends `signal` to its process group and
     /// waits for it to exit. If it doesn't exit within the graceful shutdown
-    /// timeout, it sends SIGKILL.
-    pub async fn shutdown_with_signal(&mut self, signal: Signal) {
+    /// timeout, or `next_signal` yields another termination signal first, it
+    /// sends SIGKILL. Other signals from `next_signal` are forwarded to the
+    /// stopping child.
+    pub async fn shutdown_with_signal(
+        &mut self,
+        signal: Signal,
+        mut next_signal: impl AsyncFnMut() -> Result<Signal>,
+    ) {
         let Some(pid) = self.running_pid() else {
             return;
         };
@@ -245,13 +253,40 @@ impl ProcessManager {
         );
         self.try_signal_group(signal);
 
-        match timeout(self.config.graceful_shutdown_timeout, self.wait_for_exit()).await {
-            Ok(Ok(_)) => {
-                info!("Process exited gracefully");
-                return;
+        let deadline = sleep(self.config.graceful_shutdown_timeout);
+        tokio::pin!(deadline);
+        let mut signals_open = true;
+        loop {
+            select! {
+                exit = self.wait_for_exit() => match exit {
+                    Ok(_) => {
+                        info!("Process exited gracefully");
+                        return;
+                    }
+                    Err(e) => {
+                        warn!("Error during graceful shutdown: {}", e);
+                        break;
+                    }
+                },
+                _ = &mut deadline => {
+                    warn!("Graceful shutdown timeout, forcing kill");
+                    break;
+                }
+                next = next_signal(), if signals_open => match next {
+                    Ok(next) if is_termination(next) => {
+                        warn!("Received {:?} during graceful shutdown, forcing kill", next);
+                        break;
+                    }
+                    Ok(next) => {
+                        info!("Forwarding signal {:?} to the stopping process", next);
+                        self.try_signal_group(next);
+                    }
+                    Err(e) => {
+                        error!("{}; waiting out the graceful shutdown timeout", e);
+                        signals_open = false;
+                    }
+                },
             }
-            Ok(Err(e)) => warn!("Error during graceful shutdown: {}", e),
-            Err(_) => warn!("Graceful shutdown timeout, forcing kill"),
         }
         self.force_kill().await;
     }
@@ -429,6 +464,7 @@ mod tests {
     use super::*;
     use crate::exit_status::exit_code;
     use crate::port_manager::PortBindingConfig;
+    use tokio::time::timeout;
 
     fn manager(config: ProcessConfig) -> ProcessManager {
         ProcessManager::new(config, PortManager::new(PortBindingConfig::default()))
@@ -539,7 +575,7 @@ mod tests {
         manager.spawn_process().await.unwrap();
         let pid = manager.pid().unwrap();
 
-        manager.shutdown_with_signal(Signal::SIGTERM).await;
+        manager.graceful_shutdown().await;
         assert!(!manager.is_running());
         assert_eq!(manager.pid(), Some(pid));
         assert_eq!(
@@ -552,6 +588,62 @@ mod tests {
         assert!(timeout(Duration::from_millis(50), manager.wait_for_exit())
             .await
             .is_err());
+    }
+
+    /// Spawns `sh -c script` and waits until the script has touched
+    /// `$READY`, so its traps are in place before it is signalled
+    async fn spawn_ready(script: &str) -> (ProcessManager, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let mut env = Environment::new();
+        env.set("READY", ready.to_str().unwrap());
+        let mut manager = manager(ProcessConfig {
+            environment: env,
+            graceful_shutdown_timeout: Duration::from_secs(30),
+            ..command("sh", &["-c", script])
+        });
+        manager.spawn_process().await.unwrap();
+        assert!(poll(|| ready.exists()), "the script never became ready");
+        (manager, dir)
+    }
+
+    /// A `next_signal` that yields `signal` once, after `delay`, then nothing
+    fn signal_once(signal: Signal, delay: Duration) -> impl AsyncFnMut() -> Result<Signal> {
+        let mut sent = false;
+        async move || {
+            if sent {
+                return std::future::pending().await;
+            }
+            sent = true;
+            sleep(delay).await;
+            Ok(signal)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_second_termination_signal_kills() {
+        let (mut manager, _dir) =
+            spawn_ready("trap '' TERM INT; touch \"$READY\"; sleep 10 & wait; wait").await;
+
+        let next = signal_once(Signal::SIGINT, Duration::from_millis(200));
+        let stop = manager.shutdown_with_signal(Signal::SIGTERM, next);
+        assert!(timeout(Duration::from_secs(5), stop).await.is_ok());
+        assert_eq!(
+            manager.exit_status().map(exit_code),
+            Some(128 + Signal::SIGKILL as i32)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_other_signals_reach_stopping_child() {
+        let (mut manager, _dir) =
+            spawn_ready("trap '' TERM; trap 'exit 7' USR1; touch \"$READY\"; sleep 10 & wait")
+                .await;
+
+        let next = signal_once(Signal::SIGUSR1, Duration::from_millis(200));
+        let stop = manager.shutdown_with_signal(Signal::SIGTERM, next);
+        assert!(timeout(Duration::from_secs(5), stop).await.is_ok());
+        assert_eq!(manager.exit_status().map(exit_code), Some(7));
     }
 
     #[tokio::test]
@@ -583,7 +675,7 @@ mod tests {
         }));
         let grandchild = Pid::from_raw(grandchild.unwrap());
 
-        let stop = manager.shutdown_with_signal(Signal::SIGTERM);
+        let stop = manager.graceful_shutdown();
         assert!(timeout(Duration::from_millis(200), stop).await.is_err());
         assert!(manager.is_running());
 

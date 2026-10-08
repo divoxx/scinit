@@ -96,7 +96,7 @@ impl SignalHandler {
 }
 
 /// Whether `signal` makes scinit stop the child and exit
-fn is_termination(signal: Signal) -> bool {
+pub fn is_termination(signal: Signal) -> bool {
     matches!(signal, Signal::SIGTERM | Signal::SIGINT | Signal::SIGQUIT)
 }
 
