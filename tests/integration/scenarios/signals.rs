@@ -1,7 +1,7 @@
 //! Signal handling: forwarding to the child's process group, termination and
 //! SIGKILL escalation, and the signal state the child inherits.
 
-use crate::integration::harness::{let_setup_writes_age, wait_for_pid_gone, Scinit, TIMEOUT};
+use crate::integration::harness::{wait_for_pid_gone, Scinit, TIMEOUT};
 use nix::sys::signal::Signal;
 use std::time::{Duration, Instant};
 
@@ -107,7 +107,6 @@ fn repeated_usr1_with_live_reload() {
     let builder = Scinit::builder();
     let watched = builder.dir().join("watched.txt");
     std::fs::write(&watched, "v1").unwrap();
-    let_setup_writes_age();
     let (mut scinit, pid) = builder.watch(&watched).child(["run"]).start();
     std::thread::sleep(Duration::from_millis(5500));
     assert_repeated_delivery(&mut scinit, pid, Signal::SIGUSR1, 5);

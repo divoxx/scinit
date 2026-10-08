@@ -14,6 +14,7 @@ mod process_manager;
 mod program;
 mod reaper;
 mod signals;
+mod snapshot;
 mod socket_activation;
 mod terminal;
 
