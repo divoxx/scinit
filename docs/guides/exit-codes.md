@@ -13,7 +13,7 @@ flowchart TD
     setup -- yes --> how{"What ends the child?"}
     how -- "it exits with code N" --> code["exit N"]
     how -- "it is killed by signal S" --> sig["exit 128 + S"]
-    how -- "scinit receives TERM, INT or QUIT" --> grace{"Child exits within the graceful timeout?"}
+    how -- "scinit receives TERM, INT or QUIT" --> grace{"Child exits within the graceful timeout, before a second termination signal?"}
     grace -- yes --> status["exit with the child's status: N or 128 + S"]
     grace -- no --> kill["SIGKILL to the process group"]
     kill --> reaped{"Child collected within 100 ms?"}
@@ -44,7 +44,7 @@ When scinit receives SIGTERM, SIGINT or SIGQUIT, it forwards the signal to the c
 
 If the child exits within the timeout, scinit exits with the child's status exactly as above. A child that catches SIGTERM and exits 0 makes scinit exit 0, which is how a clean shutdown should look. A child that doesn't handle SIGTERM dies from it, and scinit exits 143. Both are normal outcomes of `docker stop`; which one you get depends on your application, not on scinit.
 
-If the timeout expires, scinit sends SIGKILL to the process group, waits 100 milliseconds, and checks whether the child has exited. Normally it has, and scinit exits 137. If the child still hasn't been collected after those 100 milliseconds (a process stuck in uninterruptible I/O can take longer to die), scinit doesn't wait any longer and exits with 128 plus the signal it received: 143 for SIGTERM, 130 for SIGINT, 131 for SIGQUIT. That code describes why scinit stopped, not how the child ended, so treat it as "shutdown requested and the child had to be killed".
+If the timeout expires, or scinit receives a second termination signal, it sends SIGKILL to the process group, waits 100 milliseconds, and checks whether the child has exited. Normally it has, and scinit exits 137. If the child still hasn't been collected after those 100 milliseconds (a process stuck in uninterruptible I/O can take longer to die), scinit doesn't wait any longer and exits with 128 plus the signal it received: 143 for SIGTERM, 130 for SIGINT, 131 for SIGQUIT. That code describes why scinit stopped, not how the child ended, so treat it as "shutdown requested and the child had to be killed".
 
 Here is a child that ignores SIGTERM, stopped with a three-second timeout:
 

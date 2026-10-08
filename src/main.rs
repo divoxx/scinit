@@ -126,7 +126,7 @@ async fn run_main_loop(
             // Synchronous signal handling - proper for init systems
             signal = signal_handler.wait_for_signal() => {
                 let signal = signal?;
-                match on_signal(signal, process_manager).await {
+                match on_signal(signal, process_manager, signal_handler).await {
                     SignalAction::Exit => return Ok(exit_code_after_signal(process_manager, signal)),
                     SignalAction::Continue => {},
                 }
@@ -138,7 +138,7 @@ async fn run_main_loop(
                     // The restart was cancelled before the spawn: shut down
                     // as for any termination signal, which also stops the
                     // old child if it is still running
-                    on_signal(signal, process_manager).await;
+                    on_signal(signal, process_manager, signal_handler).await;
                     return Ok(exit_code_after_signal(process_manager, signal));
                 }
             }
@@ -167,7 +167,11 @@ enum SignalAction {
 }
 
 /// Handles a signal according to init system semantics
-async fn on_signal(signal: Signal, process_manager: &mut ProcessManager) -> SignalAction {
+async fn on_signal(
+    signal: Signal,
+    process_manager: &mut ProcessManager,
+    signal_handler: &mut SignalHandler,
+) -> SignalAction {
     match signal {
         Signal::SIGTERM | Signal::SIGINT | Signal::SIGQUIT => {
             info!(
@@ -175,13 +179,16 @@ async fn on_signal(signal: Signal, process_manager: &mut ProcessManager) -> Sign
                 signal
             );
             // Forward the signal itself, escalating to SIGKILL if the child
-            // outlives the graceful timeout
+            // outlives the graceful timeout or another termination signal
+            // arrives
             info!(
                 "Termination signal {:?} received, forwarding to child process (timeout: {}s)",
                 signal,
                 process_manager.graceful_shutdown_timeout().as_secs()
             );
-            process_manager.shutdown_with_signal(signal).await;
+            process_manager
+                .shutdown_with_signal(signal, async || signal_handler.wait_for_signal().await)
+                .await;
 
             info!("scinit exiting due to termination signal {:?}", signal);
             SignalAction::Exit

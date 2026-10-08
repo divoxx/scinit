@@ -14,7 +14,7 @@ sequenceDiagram
     alt child exits within --graceful-timeout-secs
         G-->>S: exit status
         S-->>R: exits with the child's status
-    else timeout expires
+    else timeout expires, or a second termination signal arrives
         S->>G: SIGKILL, sent to the whole group
         G-->>S: exit status, killed by SIGKILL
         S-->>R: exits, normally with 137
@@ -25,7 +25,7 @@ sequenceDiagram
 
 scinit handles six signals, in two groups.
 
-SIGTERM, SIGINT and SIGQUIT are termination signals. When scinit receives one, it forwards that same signal to the child's process group, so an application that treats SIGINT differently from SIGTERM (as some servers do for a fast versus a graceful stop) sees the signal that was actually sent. scinit then waits for the child to exit. If it exits within the graceful timeout, scinit exits with the child's status. If it doesn't, scinit sends SIGKILL to the process group, waits briefly for the child to be collected, and exits. Either way, a termination signal always ends scinit.
+SIGTERM, SIGINT and SIGQUIT are termination signals. When scinit receives one, it forwards that same signal to the child's process group, so an application that treats SIGINT differently from SIGTERM (as some servers do for a fast versus a graceful stop) sees the signal that was actually sent. scinit then waits for the child to exit. If it exits within the graceful timeout, scinit exits with the child's status. If it doesn't, or if another termination signal arrives first, scinit sends SIGKILL to the process group, waits briefly for the child to be collected, and exits. Either way, a termination signal always ends scinit.
 
 SIGUSR1, SIGUSR2 and SIGHUP are forwarded to the child's process group and nothing else happens. Applications commonly use these for reloading configuration or reopening log files, and scinit stays out of the way: it doesn't restart anything, and it keeps running.
 
@@ -108,7 +108,7 @@ If you want scinit's escalation to be the one that fires, set `--graceful-timeou
 
 ## Things to know
 
-A second termination signal does not speed things up. Once scinit starts a shutdown, its main loop waits for the child and the timeout and doesn't look at new signals; any that arrive in the meantime are dropped when scinit exits. Sending SIGTERM and then SIGINT a second later to a child that ignores both still ends with the SIGKILL at the full timeout, measured from the first signal. To force an immediate stop, signal the child directly or let the runtime send SIGKILL.
+A second termination signal forces the stop. While scinit waits out the graceful timeout, it keeps receiving signals: another SIGTERM, SIGINT or SIGQUIT makes it send SIGKILL to the process group at once, as if the timeout had expired, so pressing Ctrl-C twice or running `kill` twice stops a child that is stuck shutting down. The exit code follows the same rules as a timeout, usually 137. SIGUSR1, SIGUSR2 and SIGHUP received during the wait are forwarded to the stopping child and don't change the timeout.
 
 Only the six signals listed above are forwarded. Others, such as SIGWINCH (terminal resize) and SIGTSTP (Ctrl-Z when sent with `kill`), are not passed on to the child; they take their default action on scinit itself. As PID 1 that means they are discarded, but outside a container a SIGTSTP sent to scinit stops scinit, not the child. When you run scinit in a terminal this matters less than it sounds, because keys like Ctrl-C and Ctrl-Z make the terminal signal its foreground process group, and scinit hands the foreground to the child (see [process isolation](process-isolation.md)), so those reach the child without going through scinit.
 
