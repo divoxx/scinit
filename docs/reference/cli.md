@@ -54,7 +54,7 @@ The ports themselves are bound just before the first child is spawned. A port th
 
 | Variable | Effect |
 |---|---|
-| `SCINIT_LOG` | Filter for scinit's own log output on stderr, in [tracing's `EnvFilter` syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html): a level (`error`, `warn`, `info`, `debug`, `trace`) and/or per-module directives such as `scinit::file_watcher=debug`. The default is `warn`, used when the variable is unset or empty. A value that can't be parsed, or that has a bare word that isn't a level (such as `inf`), is ignored with a warning and the default applies; see [Logging](../guides/logging.md#things-to-know). The fatal error that ends scinit is printed whatever the filter. |
+| `SCINIT_LOG` | Filter for scinit's own log output on stderr, in [tracing's `EnvFilter` syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html): a level (`error`, `warn`, `info`, `debug`, `trace`) and/or per-module directives such as `scinit::file_watcher=debug`. The default is `warn`. A bare word that isn't a level (such as `inf`) is read as a target name, as `EnvFilter` does, with a warning; a value that can't be parsed is ignored with a warning and the default applies. See [Logging](../guides/logging.md#things-to-know). The fatal error that ends scinit is printed whatever the filter. |
 | `NO_COLOR` | When set (to any value), scinit's log lines are never colored. Without it, they are colored only when stderr is a terminal. |
 | `PATH` | Used to find `<COMMAND>` when it contains no `/`, both to spawn it and to pick the default `--watch-path`. |
 

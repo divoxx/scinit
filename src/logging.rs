@@ -19,14 +19,14 @@ use tracing_subscriber::{prelude::*, EnvFilter};
 /// Environment variable holding scinit's log filter (`EnvFilter` syntax)
 pub const LOG_ENV: &str = "SCINIT_LOG";
 
-/// Filter used when `SCINIT_LOG` is unset, empty or ignored
+/// Filter used when `SCINIT_LOG` is unset or can't be parsed
 const DEFAULT_FILTER: &str = "warn";
 
 /// The level names, for the warning about a bare word that isn't one
 const LEVELS: [&str; 6] = ["error", "warn", "info", "debug", "trace", "off"];
 
 pub fn init() {
-    let (directives, ignored) = filter_directives(std::env::var(LOG_ENV).ok().as_deref());
+    let (directives, warning) = filter_directives(std::env::var(LOG_ENV).ok().as_deref());
     // `filter_directives` only passes on values that parse
     let filter = EnvFilter::try_new(&directives).unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
     tracing_subscriber::registry()
@@ -37,12 +37,12 @@ pub fn init() {
                 // Container log drivers record a timestamp per line;
                 // tini, dumb-init and catatonit leave it out too
                 .without_time()
-                .with_filter(filter.or(filter_fn(is_fatal))),
+                .with_filter(filter.or(filter_fn(always_shown))),
         )
         .init();
 
-    if let Some(reason) = ignored {
-        tracing::warn!("ignoring {}: {}; using {}", LOG_ENV, reason, DEFAULT_FILTER);
+    if let Some(warning) = warning {
+        tracing::warn!("{}", warning);
     }
 
     // Panics are reported like any other error, not by the default hook
@@ -63,41 +63,48 @@ fn use_color() -> bool {
     std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
-/// Errors that end scinit, which are shown whatever `SCINIT_LOG` says, so
-/// exit code 1 always comes with a reason: the fatal error `main` logs
-/// (the crate root's only errors) and panics (the hook above)
-fn is_fatal(meta: &Metadata<'_>) -> bool {
-    *meta.level() == Level::ERROR && matches!(meta.target(), "scinit" | "scinit::logging")
+/// Events shown whatever `SCINIT_LOG` says: the fatal error `main` logs (the
+/// crate root's only errors), so exit code 1 always comes with a reason, and
+/// everything from this module, which is panics (the hook above) and the
+/// warning about `SCINIT_LOG` itself, which its own filter could hide
+fn always_shown(meta: &Metadata<'_>) -> bool {
+    (meta.target() == "scinit" && *meta.level() == Level::ERROR) || meta.target() == module_path!()
 }
 
-/// The filter directives to use for the `SCINIT_LOG` value `value`, and why
-/// the value was ignored if it was.
+/// The filter directives to use for the `SCINIT_LOG` value `value`, and a
+/// warning about the value if it needs one.
 ///
-/// Unset or empty means the default. So does a value that doesn't parse, or
-/// one with a bare word that isn't a level name: `EnvFilter` reads `inf` as
-/// "everything from a target named inf", which matches nothing and would
-/// hide even fatal errors. A bare `scinit` is a target, not a typo.
+/// Unset means the default, and so does a value that doesn't parse. A bare
+/// word that isn't a level name is kept, since it may name a target on
+/// purpose, but gets a warning: `EnvFilter` reads a typo like `inf` as
+/// "everything from a target named inf", which matches nothing. A bare
+/// `scinit` is clearly a target and gets none.
 fn filter_directives(value: Option<&str>) -> (String, Option<String>) {
-    let default = || DEFAULT_FILTER.to_string();
     let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
-        return (default(), None);
+        return (DEFAULT_FILTER.to_string(), None);
     };
-    let typo = value.split(',').map(str::trim).find(|directive| {
+    if let Err(e) = EnvFilter::try_new(value) {
+        let warning = format!(
+            "ignoring {}={:?}, which is not a valid filter ({}); using {}",
+            LOG_ENV, value, e, DEFAULT_FILTER
+        );
+        return (DEFAULT_FILTER.to_string(), Some(warning));
+    }
+    let not_a_level = value.split(',').map(str::trim).find(|directive| {
         !directive.contains(['=', '[', ':'])
             && *directive != "scinit"
             && directive.parse::<LevelFilter>().is_err()
     });
-    if let Some(word) = typo {
-        let reason = format!("{:?} is not a level ({})", word, LEVELS.join(", "));
-        return (default(), Some(reason));
-    }
-    match EnvFilter::try_new(value) {
-        Ok(_) => (value.to_string(), None),
-        Err(e) => (
-            default(),
-            Some(format!("{:?} is not a valid filter: {}", value, e)),
-        ),
-    }
+    let warning = not_a_level.map(|word| {
+        format!(
+            "{}: {:?} is not a level ({}), so it selects the target named {:?}",
+            LOG_ENV,
+            word,
+            LEVELS.join(", "),
+            word
+        )
+    });
+    (value.to_string(), warning)
 }
 
 #[cfg(test)]
@@ -108,7 +115,7 @@ mod tests {
         filter_directives(value).0
     }
 
-    fn ignored(value: &str) -> bool {
+    fn warns(value: &str) -> bool {
         filter_directives(Some(value)).1.is_some()
     }
 
@@ -125,7 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn levels_and_module_directives_are_kept() {
+    fn levels_and_module_directives_are_kept_without_a_warning() {
         for value in [
             "info",
             "DEBUG",
@@ -137,21 +144,21 @@ mod tests {
             "scinit::reaper",
         ] {
             assert_eq!(directives(Some(value)), value);
-            assert!(!ignored(value), "{}", value);
+            assert!(!warns(value), "{}", value);
         }
     }
 
     #[test]
-    fn a_bare_word_that_is_not_a_level_is_ignored() {
-        for value in ["inf", "deubg", "info,deubg", "warning"] {
-            assert_eq!(directives(Some(value)), "warn", "{}", value);
-            assert!(ignored(value), "{}", value);
+    fn a_bare_word_that_is_not_a_level_is_kept_with_a_warning() {
+        for value in ["inf", "deubg", "info,deubg", "tokio"] {
+            assert_eq!(directives(Some(value)), value);
+            assert!(warns(value), "{}", value);
         }
     }
 
     #[test]
-    fn an_unparseable_value_is_ignored() {
-        assert!(ignored("scinit=notalevel"));
+    fn an_unparseable_value_is_replaced_by_the_default_with_a_warning() {
         assert_eq!(directives(Some("scinit=notalevel")), "warn");
+        assert!(warns("scinit=notalevel"));
     }
 }

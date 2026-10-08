@@ -400,13 +400,22 @@ fn fatal_error_is_shown_whatever_scinit_log_says() {
     }
 }
 
-/// A bare word that isn't a level (`inf`) is ignored with a warning, and the
-/// default applies, instead of silently matching nothing
+/// A bare word that isn't a level gets a warning, shown even when the
+/// filter would hide it, but is kept: it may name a target on purpose
 #[test]
-fn mistyped_scinit_log_warns_and_uses_the_default() {
+fn bare_word_that_is_not_a_level_warns_and_is_kept() {
     let stderr = spawn_failure_stderr("inf");
     assert!(
-        stderr.contains("WARN scinit::logging: ignoring SCINIT_LOG: \"inf\" is not a level"),
+        stderr.contains("WARN scinit::logging: SCINIT_LOG: \"inf\" is not a level"),
+        "{}",
+        stderr
+    );
+
+    // The rest of the value still applies
+    let stderr = spawn_failure_stderr("info,deubg");
+    assert!(
+        stderr.contains("\"deubg\" is not a level")
+            && stderr.contains("INFO scinit: scinit starting"),
         "{}",
         stderr
     );

@@ -44,7 +44,7 @@ Panics, which would be bugs in scinit, are logged the same way, and also whateve
 
 ## Choosing what to see
 
-`SCINIT_LOG` takes the filter syntax of `tracing`'s `EnvFilter`. The simplest form is a level: `error`, `warn` (the default), `info`, `debug` or `trace`. Each level includes the ones above it. An unset or empty `SCINIT_LOG` means `warn`. At `warn`, a normal run prints nothing; warnings report things such as a child killed after the graceful timeout or a signal that couldn't be forwarded.
+`SCINIT_LOG` takes the filter syntax of `tracing`'s `EnvFilter`. The simplest form is a level: `error`, `warn` (the default), `info`, `debug` or `trace`. Each level includes the ones above it. At `warn`, a normal run prints nothing; warnings report things such as a child killed after the graceful timeout or a signal that couldn't be forwarded.
 
 `info` is the useful level for watching what scinit does. It shows each spawn, each signal and how it was handled, each restart and the exit code. `debug` adds detail such as every raw file system event, each zombie reaped, and the signal and terminal setup at startup.
 
@@ -126,13 +126,15 @@ If the lines are there and the bind address is right, the app may be ignoring th
 
 ## Things to know
 
-A mistyped level doesn't silence scinit. In `EnvFilter` syntax, a bare word that isn't a level is a module name, so `SCINIT_LOG=inf` would mean "show events from a module named `inf`" and match nothing. scinit treats a bare word that isn't a level name (other than `scinit` itself) as a mistake instead: it ignores the whole value, uses the default `warn`, and says so once at startup. A value that can't be parsed at all is handled the same way:
+In `EnvFilter` syntax, a bare word that isn't a level is a target name, so `SCINIT_LOG=inf` means "show events from a target named `inf`", which matches nothing. scinit keeps that meaning, since you may be selecting a target on purpose, but warns about any bare word that isn't a level name (other than `scinit` itself) at startup. The warning and the fatal error are shown even when the filter would hide them, so a typo can't make scinit exit 1 without a word:
 
 ```console
 $ SCINIT_LOG=inf scinit -- nonexistent-cmd
- WARN scinit::logging: ignoring SCINIT_LOG: "inf" is not a level (error, warn, info, debug, trace, off); using warn
+ WARN scinit::logging: SCINIT_LOG: "inf" is not a level (error, warn, info, debug, trace, off), so it selects the target named "inf"
 ERROR scinit: Failed to spawn process 'nonexistent-cmd': No such file or directory (os error 2)
 ```
+
+A value that can't be parsed at all is ignored with a warning, and the default `warn` applies.
 
 scinit has no log file, no JSON output and no syslog support. Its lines go to stderr alongside your application's, and the container runtime collects both.
 
