@@ -29,7 +29,7 @@ SIGTERM, SIGINT and SIGQUIT are termination signals. When scinit receives one, i
 
 SIGUSR1, SIGUSR2 and SIGHUP are forwarded to the child's process group and nothing else happens. Applications commonly use these for reloading configuration or reopening log files, and scinit stays out of the way: it doesn't restart anything, and it keeps running.
 
-Two signals are explicitly ignored. SIGTTIN and SIGTTOU are sent to a background process that tries to read from or write to its terminal, and their default action is to stop the process. scinit ignores them so that it can never be stopped by a terminal operation, which would freeze the whole container.
+Two signals are explicitly ignored. SIGTTIN and SIGTTOU are sent to a background process that tries to read from or write to its terminal, and their default action is to stop the process. scinit ignores them so that it can never be stopped by a terminal operation, which would freeze the whole container. The child doesn't inherit that: it starts with every signal at its default disposition (see [process isolation](process-isolation.md#default-signal-dispositions)).
 
 Finally, some signals are deliberately left alone. SIGCHLD, which tells a parent that a child changed state, is used by scinit to reap zombies and to notice the child's exit (see [zombie reaping](zombie-reaping.md)). Synchronous signals that the kernel raises because of a fault in scinit itself, such as SIGSEGV, SIGBUS, SIGFPE and SIGILL, are never blocked or intercepted, so a crash in scinit is a real crash and not a hang.
 

@@ -7,9 +7,10 @@ use crate::socket_activation::SocketActivationExec;
 use crate::terminal;
 use crate::Result;
 use eyre::eyre;
-use nix::sys::signal::kill;
+use nix::sys::signal::{kill, sigaction, SaFlags, SigAction, SigHandler, SigSet};
 use nix::unistd::{getpgid, Pid};
 use std::future::Future;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
@@ -49,7 +50,7 @@ impl Default for ProcessConfig {
 enum ChildState {
     NotStarted,
     Running(ManagedChild),
-    Exited { pid: Pid, status: ExitStatus },
+    Exited { status: ExitStatus },
 }
 
 /// A running child the zombie reaper must leave alone. Creating one marks
@@ -110,7 +111,13 @@ impl ProcessManager {
 
         let overrides = self.child_env_overrides();
         let mut command = self.build_command(&overrides);
-        // These hooks must run before the socket-activation exec
+        // These hooks must run before the socket-activation exec, and the
+        // terminal must be taken before the dispositions are reset
+        let tty = terminal::controlling_terminal();
+        if let Some(tty) = &tty {
+            take_terminal_on_exec(&mut command, tty.as_raw_fd());
+        }
+        reset_signal_dispositions_on_exec(&mut command);
         reset_signal_mask_on_exec(&mut command);
         close_stray_fds_on_exec(&mut command);
         self.install_socket_activation(&mut command, overrides)?;
@@ -118,20 +125,10 @@ impl ProcessManager {
         let child = command
             .spawn()
             .map_err(|e| eyre!("Failed to spawn process '{}': {}", self.config.command, e))?;
-        self.track_child(child)?;
-        self.hand_terminal_to_child().await
-    }
-
-    /// Makes the child's process group the terminal's foreground group, if
-    /// scinit has a terminal, so the child gets Ctrl-C and terminal input.
-    /// Runs on every spawn, including live-reload restarts.
-    async fn hand_terminal_to_child(&self) -> Result<()> {
-        let Some(pid) = self.pid() else {
-            return Ok(());
-        };
-        // The child leads its own process group (process_group(0)), so its
-        // pid is the group id
-        tokio::task::spawn_blocking(move || terminal::make_foreground(pid)).await?
+        // Close-on-exec, so only scinit held it; the child has its own
+        // terminal through stdio
+        drop(tty);
+        self.track_child(child)
     }
 
     /// Variables the child gets on top of scinit's environment: systemd
@@ -217,11 +214,8 @@ impl ProcessManager {
 
     /// Moves a running child to `Exited`, which clears the reaper's mark
     fn record_exit(&mut self, status: ExitStatus) {
-        if let ChildState::Running(child) = &self.state {
-            self.state = ChildState::Exited {
-                pid: child.pid,
-                status,
-            };
+        if let ChildState::Running(_) = &self.state {
+            self.state = ChildState::Exited { status };
         }
     }
 
@@ -360,19 +354,10 @@ impl ProcessManager {
         self.config.graceful_shutdown_timeout
     }
 
-    /// PID of the running or last exited child
-    pub fn pid(&self) -> Option<Pid> {
-        match &self.state {
-            ChildState::NotStarted => None,
-            ChildState::Running(child) => Some(child.pid),
-            ChildState::Exited { pid, .. } => Some(*pid),
-        }
-    }
-
     /// Exit status of the child, once its exit was observed
     pub fn exit_status(&self) -> Option<ExitStatus> {
         match self.state {
-            ChildState::Exited { status, .. } => Some(status),
+            ChildState::Exited { status } => Some(status),
             _ => None,
         }
     }
@@ -399,6 +384,33 @@ fn remove_inherited_listen_vars(command: &mut Command, overrides: &Environment) 
         if inherited_listen_var && !key.to_str().is_some_and(|k| overrides.contains(k)) {
             command.env_remove(key);
         }
+    }
+}
+
+/// Makes the child take the foreground of terminal `tty` (see
+/// [`terminal::take_foreground`])
+fn take_terminal_on_exec(command: &mut Command, tty: RawFd) {
+    unsafe {
+        command.pre_exec(move || terminal::take_foreground(tty));
+    }
+}
+
+/// Resets every signal's disposition to the default in the child. Signals
+/// scinit ignores (SIGTTIN, SIGTTOU, and any it was started with ignored)
+/// would otherwise stay ignored across exec; handlers are reset by exec.
+fn reset_signal_dispositions_on_exec(command: &mut Command) {
+    // Built before the fork: nothing in the hook allocates
+    let default_action = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+    unsafe {
+        command.pre_exec(move || {
+            for signal in Signal::iterator() {
+                if !matches!(signal, Signal::SIGKILL | Signal::SIGSTOP) {
+                    // sigaction is async-signal-safe
+                    let _ = sigaction(signal, &default_action);
+                }
+            }
+            Ok(())
+        });
     }
 }
 
@@ -505,7 +517,6 @@ mod tests {
     async fn test_process_manager_creation() {
         let manager = manager(ProcessConfig::default());
         assert!(!manager.is_running());
-        assert!(manager.pid().is_none());
         assert!(manager.exit_status().is_none());
     }
 
@@ -539,14 +550,12 @@ mod tests {
             ..command("sleep", &["10"])
         });
         manager.spawn_process().await.unwrap();
-        let old = manager.pid();
 
         // Cancelled during the restart delay, after the old child exited
         let cancel = sleep(Duration::from_millis(300));
         let cancelled = timeout(Duration::from_secs(5), manager.restart_unless(cancel)).await;
         assert!(cancelled.unwrap().unwrap().is_some());
         assert!(!manager.is_running());
-        assert_eq!(manager.pid(), old);
         assert_eq!(
             manager.exit_status().map(exit_code),
             Some(128 + Signal::SIGTERM as i32)
@@ -573,11 +582,9 @@ mod tests {
             ..command("sleep", &["10"])
         });
         manager.spawn_process().await.unwrap();
-        let pid = manager.pid().unwrap();
 
         manager.graceful_shutdown().await;
         assert!(!manager.is_running());
-        assert_eq!(manager.pid(), Some(pid));
         assert_eq!(
             manager.exit_status().map(exit_code),
             Some(128 + Signal::SIGTERM as i32)

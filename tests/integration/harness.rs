@@ -9,6 +9,7 @@ use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use std::ffi::OsString;
 use std::io::Read;
+use std::os::fd::OwnedFd;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -136,6 +137,8 @@ pub struct ScinitBuilder {
     command: Vec<OsString>,
     env: Vec<(OsString, OsString)>,
     leak_fd: bool,
+    ignored_signals: Vec<Signal>,
+    controlling_terminal: bool,
 }
 
 /// fd at which `ScinitBuilder::leak_fd` leaks a socket into scinit, above
@@ -208,6 +211,21 @@ impl ScinitBuilder {
         self
     }
 
+    /// Start scinit with `signals` ignored, as a non-interactive shell
+    /// starts a background job (`scinit ... &`) with SIGINT and SIGQUIT
+    pub fn ignore_signals(mut self, signals: &[Signal]) -> Self {
+        self.ignored_signals.extend_from_slice(signals);
+        self
+    }
+
+    /// Start scinit as a session leader with a pseudo-terminal as its
+    /// controlling terminal (stdio stays as usual), like a shell in a
+    /// terminal window
+    pub fn controlling_terminal(mut self) -> Self {
+        self.controlling_terminal = true;
+        self
+    }
+
     pub fn spawn(self) -> Result<Scinit> {
         let dir = canonical(self.dir.path());
         let report = self.report_dir.path().join("report.log");
@@ -223,9 +241,18 @@ impl ScinitBuilder {
             .env_remove("LISTEN_FDNAMES")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Own process group so the test runner's signals don't hit scinit
-            .process_group(0);
+            .stderr(Stdio::piped());
+        let pty = self
+            .controlling_terminal
+            .then(|| nix::pty::openpty(None, None))
+            .transpose()
+            .context("openpty")?;
+        let tty_raw = pty.as_ref().map(|pty| pty.slave.as_raw_fd());
+        if tty_raw.is_none() {
+            // Own process group so the test runner's signals don't hit
+            // scinit (a new session, below, does the same)
+            cmd.process_group(0);
+        }
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
@@ -241,8 +268,19 @@ impl ScinitBuilder {
             .transpose()
             .context("failed to open the socket to leak")?;
         let leaked_raw = leaked.as_ref().map(AsRawFd::as_raw_fd);
+        let ignored_signals = self.ignored_signals.clone();
         unsafe {
             cmd.pre_exec(move || {
+                if let Some(tty) = tty_raw {
+                    // A new session, whose controlling terminal is the pty
+                    if libc::setsid() < 0 || libc::ioctl(tty, libc::TIOCSCTTY as _, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                for &sig in &ignored_signals {
+                    // signal() is async-signal-safe
+                    libc::signal(sig as libc::c_int, libc::SIG_IGN);
+                }
                 for fd in 3..max_fd {
                     // fcntl is async-signal-safe; unopened fds just fail
                     libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
@@ -259,6 +297,10 @@ impl ScinitBuilder {
 
         let mut child = cmd.spawn().context("failed to spawn scinit")?;
         drop(leaked);
+        // Both ends stay open while scinit runs: without the master the
+        // terminal hangs up, and with no fd on the slave (scinit's copy was
+        // close-on-exec) macOS closes it, leaving the session without one
+        let pty = pty.map(|pty| (pty.master, pty.slave));
         let stdout = Arc::new(Mutex::new(String::new()));
         let stderr = Arc::new(Mutex::new(String::new()));
         let readers = vec![
@@ -275,6 +317,7 @@ impl ScinitBuilder {
             stdout,
             stderr,
             readers,
+            _pty: pty,
         })
     }
 
@@ -353,6 +396,7 @@ pub struct Scinit {
     stdout: Arc<Mutex<String>>,
     stderr: Arc<Mutex<String>>,
     readers: Vec<JoinHandle<()>>,
+    _pty: Option<(OwnedFd, OwnedFd)>,
 }
 
 impl Scinit {
@@ -364,6 +408,8 @@ impl Scinit {
             command: Vec::new(),
             env: Vec::new(),
             leak_fd: false,
+            ignored_signals: Vec::new(),
+            controlling_terminal: false,
         }
     }
 
