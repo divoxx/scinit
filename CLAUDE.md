@@ -125,6 +125,7 @@ The `listen` fixture mode verifies socket inheritance end to end:
 - Bound sockets stay close-on-exec; the child gets `dup2` copies at fds 3.. (which clears the flag), so only those are inherited
 - The child marks every fd above stdio close-on-exec before exec (`src/fds.rs`, before the socket remap), so stray fds scinit itself inherited never reach it
 - Code in the child between fork and exec (`pre_exec`) must be async-signal-safe: build everything before forking, never allocate there
+- On macOS, `prepare_for_fork` (`src/process_manager.rs`) must run before every fork: it finishes libnotify's lazy setup first, since a fork while another thread is mid-setup (e.g. FSEvents starting the file watcher) makes libnotify's fork handler abort the child with SIGKILL (#42)
 - **Signal masking**: Block handled signals on the main thread before any other thread exists; never block critical/synchronous signals or SIGCHLD
 - **Signal handling**: Consume handled signals only on the dedicated sigwait thread; never call `sigwait` from per-iteration tasks (cancelled waits leave threads that swallow signals)
 - Zombie reaping runs in background tasks to avoid blocking main loop, except the final pass before scinit exits (`reap_before_exit`, on every exit path), which runs inline so it completes before the runtime shuts down
