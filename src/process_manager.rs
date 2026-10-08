@@ -28,6 +28,8 @@ pub struct ProcessConfig {
     pub args: Vec<String>,
     /// Delay before restart after graceful shutdown
     pub restart_delay: Duration,
+    /// Timeout for stopping the old child on a restart
+    pub restart_timeout: Duration,
     /// Timeout for graceful shutdown
     pub graceful_shutdown_timeout: Duration,
     /// Environment variables to set
@@ -40,10 +42,20 @@ impl Default for ProcessConfig {
             command: String::new(),
             args: Vec::new(),
             restart_delay: Duration::from_millis(1000),
-            graceful_shutdown_timeout: Duration::from_secs(30),
+            restart_timeout: Duration::from_secs(2),
+            graceful_shutdown_timeout: Duration::from_secs(8),
             environment: Environment::new(),
         }
     }
+}
+
+/// Why the child is stopped, which picks the timeout before SIGKILL
+#[derive(Clone, Copy)]
+enum Stop {
+    /// scinit is shutting down: the graceful shutdown timeout
+    Shutdown,
+    /// A live-reload restart: the restart timeout
+    Restart,
 }
 
 /// Lifecycle of the managed child; each state carries only the data valid in it
@@ -220,13 +232,13 @@ impl ProcessManager {
         }
     }
 
-    /// Performs a graceful shutdown of the current process with SIGTERM,
+    /// Stops the current process with SIGTERM and the timeout for `stop`,
     /// ignoring signals scinit receives meanwhile
     ///
     /// See [`ProcessManager::shutdown_with_signal`].
-    pub async fn graceful_shutdown(&mut self) {
+    async fn terminate(&mut self, stop: Stop) {
         let no_signals = async || std::future::pending::<Result<Signal>>().await;
-        self.shutdown_with_signal(Signal::SIGTERM, no_signals).await
+        self.stop(Signal::SIGTERM, stop, no_signals).await
     }
 
     /// Stops the running child: sends `signal` to its process group and
@@ -237,6 +249,16 @@ impl ProcessManager {
     pub async fn shutdown_with_signal(
         &mut self,
         signal: Signal,
+        next_signal: impl AsyncFnMut() -> Result<Signal>,
+    ) {
+        self.stop(signal, Stop::Shutdown, next_signal).await
+    }
+
+    /// [`Self::shutdown_with_signal`] with the timeout for `stop`
+    async fn stop(
+        &mut self,
+        signal: Signal,
+        stop: Stop,
         mut next_signal: impl AsyncFnMut() -> Result<Signal>,
     ) {
         let Some(pid) = self.running_pid() else {
@@ -248,7 +270,11 @@ impl ProcessManager {
         );
         self.try_signal_group(signal);
 
-        let deadline = sleep(self.config.graceful_shutdown_timeout);
+        let timeout = match stop {
+            Stop::Shutdown => self.config.graceful_shutdown_timeout,
+            Stop::Restart => self.config.restart_timeout,
+        };
+        let deadline = sleep(timeout);
         tokio::pin!(deadline);
         let mut signals_open = true;
         loop {
@@ -264,7 +290,10 @@ impl ProcessManager {
                     }
                 },
                 _ = &mut deadline => {
-                    warn!("Graceful shutdown timeout, forcing kill");
+                    match stop {
+                        Stop::Shutdown => warn!("Graceful shutdown timeout, forcing kill"),
+                        Stop::Restart => warn!("Restart timeout, forcing kill"),
+                    }
                     break;
                 }
                 next = next_signal(), if signals_open => match next {
@@ -307,9 +336,9 @@ impl ProcessManager {
         }
     }
 
-    /// Restarts the process after a file change: graceful shutdown, the
-    /// restart delay, then a new spawn. Returns `None` once the new child is
-    /// spawned.
+    /// Restarts the process after a file change: SIGTERM, SIGKILL if the
+    /// child outlives the restart timeout, the restart delay, then a new
+    /// spawn. Returns `None` once the new child is spawned.
     ///
     /// If `cancel` completes first, gives up without spawning and returns
     /// its output. The old child may then still be stopping: it has been
@@ -322,7 +351,7 @@ impl ProcessManager {
         tokio::pin!(cancel);
 
         select! {
-            _ = self.graceful_shutdown() => {}
+            _ = self.terminate(Stop::Restart) => {}
             output = &mut cancel => return Ok(Some(output)),
         }
         select! {
@@ -615,7 +644,7 @@ mod tests {
         assert!(manager.spawn_process().await.is_ok());
         assert!(manager.is_running());
 
-        manager.graceful_shutdown().await;
+        manager.terminate(Stop::Shutdown).await;
         assert!(!manager.is_running());
     }
 
@@ -627,7 +656,7 @@ mod tests {
         });
         manager.spawn_process().await.unwrap();
 
-        manager.graceful_shutdown().await;
+        manager.terminate(Stop::Shutdown).await;
         assert!(!manager.is_running());
         assert_eq!(
             manager.exit_status().map(exit_code),
@@ -686,6 +715,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_restart_kills_after_restart_timeout() {
+        // The graceful shutdown timeout (30s) would outlast the test timeout
+        let (mut manager, _dir) =
+            spawn_ready("trap '' TERM; touch \"$READY\"; sleep 10 & wait").await;
+        manager.config.restart_timeout = Duration::from_millis(300);
+        manager.config.restart_delay = Duration::ZERO;
+        let old = manager.running_pid().unwrap();
+
+        let restart = manager.restart_unless(std::future::pending::<()>());
+        assert!(timeout(Duration::from_secs(5), restart)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+        assert!(is_gone(old), "the old child survived the restart");
+        assert_ne!(manager.running_pid(), Some(old));
+    }
+
+    #[tokio::test]
     async fn test_other_signals_reach_stopping_child() {
         let (mut manager, _dir) =
             spawn_ready("trap '' TERM; trap 'exit 7' USR1; touch \"$READY\"; sleep 10 & wait")
@@ -726,7 +774,7 @@ mod tests {
         }));
         let grandchild = Pid::from_raw(grandchild.unwrap());
 
-        let stop = manager.graceful_shutdown();
+        let stop = manager.terminate(Stop::Shutdown);
         assert!(timeout(Duration::from_millis(200), stop).await.is_err());
         assert!(manager.is_running());
 

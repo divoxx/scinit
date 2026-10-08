@@ -56,6 +56,7 @@ So on each spawn, the child makes its own process group the terminal's foregroun
 ```console
 $ SCINIT_LOG=info scinit -- sh -c 'trap "echo child: got INT; exit 130" INT; echo running; sleep 1000 & wait'
  INFO scinit: scinit starting
+ INFO scinit: graceful timeout 8s (no runtime detected)
  INFO scinit: init system started, managing subprocess: sh
  INFO scinit::process_manager: Spawning process: sh ["-c", "trap \"echo child: got INT; exit 130\" INT; echo running; sleep 1000 & wait"]
  INFO scinit::process_manager: Process spawned with PID: 93628

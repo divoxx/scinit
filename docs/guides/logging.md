@@ -90,9 +90,9 @@ Each case shows one of the reasons a change doesn't cause a restart. The `touch`
 
 If you see no events at all for a file you are sure changed, and you are watching a single file on Linux, the file may have been replaced by a rename, which loses the watch. Watch the directory instead. The [live reload guide](live-reload.md) covers this and the other cases in detail.
 
-### The container takes 30 seconds to stop
+### The container takes several seconds to stop
 
-That is the graceful timeout running out: the child didn't exit on the termination signal, so scinit waited `--graceful-timeout-secs` (30 by default) before sending SIGKILL. With `SCINIT_LOG=info` it is easy to confirm. This run used a child that ignores SIGTERM, with the timeout lowered to 3 seconds:
+That is the graceful timeout running out: the child didn't exit on the termination signal, so scinit waited the graceful timeout (8 seconds by default, 25 under Kubernetes; see [choosing the graceful timeout](signals-and-shutdown.md#choosing-the-graceful-timeout)) before sending SIGKILL. With `SCINIT_LOG=info` it is easy to confirm. This run used a child that ignores SIGTERM, with the timeout lowered to 3 seconds:
 
 ```text
  INFO scinit: received termination signal SIGTERM, initiating graceful shutdown
@@ -105,7 +105,7 @@ That is the graceful timeout running out: the child didn't exit on the terminati
  INFO scinit: scinit exiting with code 137
 ```
 
-The `WARN ... forcing kill` line is the sign. The fix is in the application: handle SIGTERM and exit. Common causes are a shell script wrapper that runs the app without `exec` and doesn't pass the signal on, or a runtime that installs its own handler and waits for open connections. The same timeout applies to every live-reload restart. The [signals and shutdown guide](signals-and-shutdown.md) has the details, and [exit codes](exit-codes.md) explains the 137.
+The `WARN ... forcing kill` line is the sign. The fix is in the application: handle SIGTERM and exit. Common causes are a shell script wrapper that runs the app without `exec` and doesn't pass the signal on, or a runtime that installs its own handler and waits for open connections. A live-reload restart does the same with its own, shorter timeout, `--restart-timeout-secs` (2 seconds by default), and logs `WARN scinit::process_manager: Restart timeout, forcing kill`. The [signals and shutdown guide](signals-and-shutdown.md) has the details, and [exit codes](exit-codes.md) explains the 137.
 
 ### The client gets connection refused
 

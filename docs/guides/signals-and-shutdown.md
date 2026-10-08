@@ -2,7 +2,7 @@
 
 Stopping a container is a conversation carried out in signals. The runtime sends SIGTERM to PID 1, waits, and sends SIGKILL if the container is still running when its patience runs out. Kubernetes does the same with `terminationGracePeriodSeconds`. For a stop to be graceful, the signal has to reach your application, the application has to get time to finish its work, and something has to make sure the stop actually completes if the application hangs.
 
-As PID 1, scinit sits in the middle of that conversation. It receives the runtime's signals, passes them on to your application's process group, and enforces its own deadline: if the application hasn't exited within `--graceful-timeout-secs` (30 seconds by default), scinit sends SIGKILL to the whole group and exits.
+As PID 1, scinit sits in the middle of that conversation. It receives the runtime's signals, passes them on to your application's process group, and enforces its own deadline: if the application hasn't exited within the graceful timeout, scinit sends SIGKILL to the whole group and exits. The timeout is `--graceful-timeout-secs` when given; otherwise it defaults to a little less than the stop timeout of the runtime scinit detects, 8 seconds under Docker or podman and 25 under Kubernetes (see [choosing the graceful timeout](#choosing-the-graceful-timeout)).
 
 ```mermaid
 sequenceDiagram
@@ -11,7 +11,7 @@ sequenceDiagram
     participant G as Child process group
     R->>S: SIGTERM (docker stop)
     S->>G: SIGTERM, sent to the whole group
-    alt child exits within --graceful-timeout-secs
+    alt child exits within the graceful timeout
         G-->>S: exit status
         S-->>R: exits with the child's status
     else timeout expires, or a second termination signal arrives
@@ -55,11 +55,12 @@ The examples use `sh -c` scripts as stand-in applications and `SCINIT_LOG=info` 
 $ SCINIT_LOG=info scinit -- sh -c 'trap "echo child: got TERM, cleaning up; exit 0" TERM; sleep 1000 & wait' &
 $ kill -TERM %1
  INFO scinit: scinit starting
+ INFO scinit: graceful timeout 8s (no runtime detected)
  INFO scinit: init system started, managing subprocess: sh
  INFO scinit::process_manager: Spawning process: sh ["-c", "trap \"echo child: got TERM, cleaning up; exit 0\" TERM; sleep 1000 & wait"]
  INFO scinit::process_manager: Process spawned with PID: 93372
  INFO scinit: received termination signal SIGTERM, initiating graceful shutdown
- INFO scinit: Termination signal SIGTERM received, forwarding to child process (timeout: 30s)
+ INFO scinit: Termination signal SIGTERM received, forwarding to child process (timeout: 8s)
  INFO scinit::process_manager: Initiating graceful shutdown of process 93372 with SIGTERM
 child: got TERM, cleaning up
  INFO scinit::process_manager: Process exited gracefully
@@ -102,9 +103,39 @@ scinit logs the forward and keeps running; the child decides what SIGHUP means.
 
 ## Choosing the graceful timeout
 
-scinit's timeout and the runtime's timeout both run from the moment the stop begins, and the shorter one wins. Docker and podman wait 10 seconds by default before sending SIGKILL to PID 1, while scinit's default is 30. With those defaults, a child that takes longer than 10 seconds to exit is never killed by scinit: the runtime kills scinit first, and since scinit is PID 1, the kernel then kills every process in the container. The container still stops, but scinit's escalation and logging never happen, and the exit status is whatever the runtime reports for a killed PID 1.
+scinit's timeout and the runtime's timeout both run from the moment the stop begins, and the shorter one wins. If the runtime's runs out first, it kills scinit, and since scinit is PID 1, the kernel then kills every process in the container. The container still stops, but scinit's escalation and logging never happen, and the exit status is whatever the runtime reports for a killed PID 1. scinit's timeout should therefore be a little shorter than the runtime's.
 
-If you want scinit's escalation to be the one that fires, set `--graceful-timeout-secs` a few seconds below the runtime's grace period, for example 8 under Docker's default of 10, or raise the runtime's (`docker stop -t`, `docker run --stop-timeout`). Kubernetes' default `terminationGracePeriodSeconds` is 30, the same as scinit's default, so the two race; lower scinit's to 25 or so, or raise the grace period. The setting also applies to live-reload restarts, where it bounds how long scinit waits for the old child before starting the new one.
+scinit takes the timeout from the first of these that is set:
+
+1. `--graceful-timeout-secs`.
+2. The `SCINIT_GRACEFUL_TIMEOUT_SECS` environment variable. It must be a whole number of seconds; anything else is an error and scinit exits with code 1 without starting the child.
+3. A default for the container runtime scinit detects:
+   - Kubernetes, detected by the `KUBERNETES_SERVICE_HOST` variable that it sets in every container: 25 seconds, below the default `terminationGracePeriodSeconds` of 30. Kubernetes is checked first, because a pod's container can also have the marker file of the runtime underneath it.
+   - podman, detected by the file `/run/.containerenv`: 8 seconds, below `podman stop`'s default of 10.
+   - Docker, detected by the file `/.dockerenv`: 8 seconds, below `docker stop`'s default of 10.
+4. 8 seconds when no runtime is detected, below the 10 seconds of Docker and podman, the shortest of the common defaults.
+
+With `SCINIT_LOG=info`, scinit logs the value and its source at startup:
+
+```
+ INFO scinit: graceful timeout 25s (detected: kubernetes)
+```
+
+The other sources show as `(--graceful-timeout-secs)`, `(SCINIT_GRACEFUL_TIMEOUT_SECS)` and `(no runtime detected)`.
+
+Detection only finds the runtime, not the stop timeout it was configured with: no runtime makes `docker stop -t`, `docker run --stop-timeout` or a pod's `terminationGracePeriodSeconds` visible inside the container. If you change the runtime's timeout, set scinit's to match. In Kubernetes, the person writing the pod spec knows the grace period, so setting `SCINIT_GRACEFUL_TIMEOUT_SECS` next to `terminationGracePeriodSeconds`, a few seconds lower, keeps the two together:
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 60
+  containers:
+    - name: app
+      env:
+        - name: SCINIT_GRACEFUL_TIMEOUT_SECS
+          value: "55"
+```
+
+The graceful timeout applies to shutdowns after a termination signal. Live-reload restarts use `--restart-timeout-secs` (2 seconds by default) instead; see [live reload](live-reload.md).
 
 ## Things to know
 
@@ -120,4 +151,4 @@ The exit status scinit reports after a shutdown is explained in [exit codes](exi
 
 ## Related
 
-[Getting started](../getting-started.md) walks through a first run and a Dockerfile. The [CLI reference](../reference/cli.md) documents `--graceful-timeout-secs`. [Why an init](why-an-init.md) explains why PID 1 needs signal handling at all, and [logging](logging.md) shows how to turn on the log lines used above.
+[Getting started](../getting-started.md) walks through a first run and a Dockerfile. The [CLI reference](../reference/cli.md) documents `--graceful-timeout-secs` and `SCINIT_GRACEFUL_TIMEOUT_SECS`. [Why an init](why-an-init.md) explains why PID 1 needs signal handling at all, and [logging](logging.md) shows how to turn on the log lines used above.

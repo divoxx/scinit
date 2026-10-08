@@ -239,6 +239,10 @@ impl ScinitBuilder {
             .env_remove("LISTEN_FDS")
             .env_remove("LISTEN_PID")
             .env_remove("LISTEN_FDNAMES")
+            // Nor the graceful timeout's sources, so it defaults the same
+            // everywhere (marker files like /.dockerenv can't be hidden)
+            .env_remove("KUBERNETES_SERVICE_HOST")
+            .env_remove("SCINIT_GRACEFUL_TIMEOUT_SECS")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

@@ -25,19 +25,39 @@ A misspelled scinit option before the command is still an error (exit 2), not mi
 
 | Option | Default | Description |
 |---|---|---|
-| `--graceful-timeout-secs <N>` | `30` | After a termination signal (or a live-reload restart), how many seconds to wait for the child to exit before sending SIGKILL to its process group. |
+| `--graceful-timeout-secs <N>` | see below | After a termination signal, how many seconds to wait for the child to exit before sending SIGKILL to its process group. Without the flag, `SCINIT_GRACEFUL_TIMEOUT_SECS` is used, and without that, a default for the detected container runtime: 25 under Kubernetes, 8 under podman or Docker, and 8 when no runtime is detected. |
 | `--zombie-reap-interval-ms <N>` | `5000` | Interval of the periodic sweep that reaps orphaned processes. Orphans are also reaped as soon as SIGCHLD arrives, so this is a fallback. Must be at least 1; `0` is a usage error. |
 | `--live-reload` | off | Restart the child when `--watch-path` changes. |
 | `--watch-path <PATH>` | the command's executable | The file, or directory (not recursive), to watch for changes. Without it, scinit watches the executable that `<COMMAND>` refers to, looked up in `PATH` the way exec does, and exits with an error if it can't find it. |
 | `--debounce-ms <N>` | `500` | How long the watched path has to stay quiet after a change before the restart happens. Every new change starts the wait over. |
 | `--restart-delay-ms <N>` | `1000` | Pause between the old child exiting and the new one starting during a live-reload restart. |
+| `--restart-timeout-secs <N>` | `2` | During a live-reload restart, how many seconds to wait for the old child to exit after SIGTERM before sending SIGKILL to its process group. Requires `--live-reload`. |
 | `--ports <PORT>[,<PORT>...]` | none | TCP ports to bind and pass to the child as file descriptors 3, 4, ... in the order given. Takes a comma-separated list, and the flag can be repeated (`--ports 8080 --ports 8081` is the same as `--ports 8080,8081`). Each port must be between 0 and 65535. |
 | `--bind-addr <ADDR>` | `127.0.0.1` | The address `--ports` are bound on. Must be an IP address literal, IPv4 or IPv6 (`0.0.0.0`, `::`, `::1`); a hostname such as `localhost` is rejected. |
 | `--reuse-port` | off | Set `SO_REUSEPORT` on the `--ports` sockets, so other processes that also set it can bind the same ports. `SO_REUSEADDR` is always set. |
-| `-h`, `--help` | | Print help, including a summary of `SCINIT_LOG`, and exit with code 0. |
+| `-h`, `--help` | | Print help, including a summary of `SCINIT_LOG` and `SCINIT_GRACEFUL_TIMEOUT_SECS`, and exit with code 0. |
 | `-V`, `--version` | | Print the version and exit with code 0. |
 
-`--watch-path`, `--debounce-ms` and `--restart-delay-ms` only take effect together with `--live-reload`. Without it they are accepted and ignored: no error, no warning, and nothing is watched. Since a child that exits is never restarted, the restart delay has no use outside live reload either.
+`--watch-path`, `--debounce-ms` and `--restart-delay-ms` only take effect together with `--live-reload`. Without it they are accepted and ignored: no error, no warning, and nothing is watched. Since a child that exits is never restarted, the restart delay has no use outside live reload either. `--restart-timeout-secs` is the exception: without `--live-reload` it is a usage error (exit 2).
+
+### The default graceful timeout
+
+scinit picks the graceful timeout from the first of these that is set, and logs the value and where it came from at `info`, for example `INFO scinit: graceful timeout 25s (detected: kubernetes)`:
+
+1. `--graceful-timeout-secs`.
+2. The `SCINIT_GRACEFUL_TIMEOUT_SECS` environment variable.
+3. The default for the container runtime scinit detects, checked in this order:
+
+   | Runtime | Detected by | Default | Why |
+   |---|---|---|---|
+   | Kubernetes | `KUBERNETES_SERVICE_HOST` is set and not empty | 25 | The default `terminationGracePeriodSeconds` is 30. |
+   | podman | `/run/.containerenv` exists | 8 | `podman stop` waits 10 seconds by default. |
+   | Docker | `/.dockerenv` exists | 8 | `docker stop` waits 10 seconds by default. |
+
+   Kubernetes is checked first because a pod's container can also have the marker file of the runtime underneath it.
+4. 8 seconds, when no runtime is detected: just under the 10 seconds of Docker and podman.
+
+Each default is a little below the runtime's own default, so scinit's SIGKILL, and its log line, come before the runtime's. No runtime tells the container the stop timeout it was actually configured with (`docker stop -t`, `--stop-timeout`, or a pod's `terminationGracePeriodSeconds`), so detection can only pick the runtime's default. If you change the runtime's timeout, set scinit's to match. [Signals and shutdown](../guides/signals-and-shutdown.md#choosing-the-graceful-timeout) explains the trade-off.
 
 `--bind-addr` is parsed at startup even when `--ports` is not given, so an invalid address is always an error:
 
@@ -54,6 +74,8 @@ The ports themselves are bound just before the first child is spawned. A port th
 
 | Variable | Effect |
 |---|---|
+| `SCINIT_GRACEFUL_TIMEOUT_SECS` | The graceful timeout in seconds when `--graceful-timeout-secs` isn't given. It must be a whole number; any other value, including an empty one, is an error (exit 1) before the child starts. |
+| `KUBERNETES_SERVICE_HOST` | When set and not empty, scinit assumes it runs under Kubernetes and defaults the graceful timeout to 25 seconds. scinit also checks for the files `/run/.containerenv` (podman) and `/.dockerenv` (Docker); see [the default graceful timeout](#the-default-graceful-timeout). |
 | `SCINIT_LOG` | Filter for scinit's own log output on stderr, in [tracing's `EnvFilter` syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html): a level (`error`, `warn`, `info`, `debug`, `trace`) and/or per-module directives such as `scinit::file_watcher=debug`. The default is `error`, which is also used when the value can't be parsed. A value that parses but matches nothing, such as `inf` or an empty string, silences scinit entirely; see [Logging](../guides/logging.md#things-to-know). |
 | `NO_COLOR` | When set (to any value), scinit's log lines are never colored. Without it, they are colored only when stderr is a terminal. |
 | `PATH` | Used to find `<COMMAND>` when it contains no `/`, both to spawn it and to pick the default `--watch-path`. |
@@ -79,7 +101,7 @@ scinit's exit code is designed to be the one your program would have produced if
 |---|---|
 | The child's exit code | The child exited normally, on its own or after a forwarded signal. |
 | 128 + signal number | The child was killed by a signal, for example 130 for SIGINT, 137 for SIGKILL, 143 for SIGTERM. Also used when scinit received a termination signal and the child's exit could not be observed even after SIGKILL; the number is then that of the signal scinit received. |
-| 1 | An error in scinit itself: the command could not be found or executed (at startup or on a live-reload restart), `--bind-addr` is not an IP address, a port could not be bound, `--live-reload` found no executable to watch, the watch could not be set up, or the terminal could not be handed to the child. |
+| 1 | An error in scinit itself: the command could not be found or executed (at startup or on a live-reload restart), `--bind-addr` is not an IP address, `SCINIT_GRACEFUL_TIMEOUT_SECS` is not a whole number, a port could not be bound, `--live-reload` found no executable to watch, the watch could not be set up, or the terminal could not be handed to the child. |
 | 2 | A usage error reported by the argument parser, such as a missing `<COMMAND>`, an unknown option, or an out-of-range value. |
 | 0 | `--help` or `--version`. |
 
@@ -102,4 +124,4 @@ For more information, try '--help'.
 
 ## Related
 
-[Signals and shutdown](../guides/signals-and-shutdown.md) explains `--graceful-timeout-secs`, [Exit codes](../guides/exit-codes.md) the table above, [Zombie reaping](../guides/zombie-reaping.md) `--zombie-reap-interval-ms`, [Live reload](../guides/live-reload.md) the watch options, [Socket activation](../guides/socket-activation.md) `--ports`, `--bind-addr` and `--reuse-port`, and [Logging](../guides/logging.md) `SCINIT_LOG`.
+[Signals and shutdown](../guides/signals-and-shutdown.md) explains `--graceful-timeout-secs`, [Exit codes](../guides/exit-codes.md) the table above, [Zombie reaping](../guides/zombie-reaping.md) `--zombie-reap-interval-ms`, [Live reload](../guides/live-reload.md) the watch options and `--restart-timeout-secs`, [Socket activation](../guides/socket-activation.md) `--ports`, `--bind-addr` and `--reuse-port`, and [Logging](../guides/logging.md) `SCINIT_LOG`.

@@ -48,6 +48,7 @@ The repository's test fixture, `scinit-test-child listen`, is a tiny server that
 $ SCINIT_LOG=info scinit --live-reload --watch-path config \
       --restart-delay-ms 2000 --ports 8080,8081 -- scinit-test-child listen
  INFO scinit: scinit starting
+ INFO scinit: graceful timeout 8s (no runtime detected)
  INFO scinit: init system started, managing subprocess: scinit-test-child
  INFO scinit::file_watcher: Started watching path: "config"
  INFO scinit: File watching started for live-reload
@@ -180,7 +181,7 @@ The fallback in the Node example is worth copying in any language: when the vari
 
 Kubernetes probes see a live-reload restart the same way any other client does. The listening socket stays open while no child is running, so an HTTP or TCP probe that arrives mid-restart is not refused: its connection waits in the backlog and gets its answer once the new process starts accepting. That is the behavior you want, but the wait counts against the probe's `timeoutSeconds`, which defaults to one second.
 
-A restart takes as long as the old process needs to exit (up to `--graceful-timeout-secs`), plus `--restart-delay-ms` (one second by default), plus however long your app takes to start accepting. That is easily longer than one second, so a probe or two can fail during a reload. A failed readiness probe only takes the pod out of its Service until the next probe succeeds, which hardly matters in a development environment. A failed liveness probe is different: after `failureThreshold` consecutive failures, Kubernetes restarts the whole container, which ends the process scinit is keeping running.
+A restart takes as long as the old process needs to exit (up to `--restart-timeout-secs`, 2 seconds by default), plus `--restart-delay-ms` (one second by default), plus however long your app takes to start accepting. That is easily longer than one second, so a probe or two can fail during a reload. A failed readiness probe only takes the pod out of its Service until the next probe succeeds, which hardly matters in a development environment. A failed liveness probe is different: after `failureThreshold` consecutive failures, Kubernetes restarts the whole container, which ends the process scinit is keeping running.
 
 For development pods that use live reload, give the liveness probe a generous `timeoutSeconds` and `failureThreshold`, or leave it out and rely on readiness alone. A shorter, separate timeout for live-reload restarts is planned in [#20](https://github.com/divoxx/scinit/issues/20), which will make reloads faster but won't remove the gap entirely.
 
