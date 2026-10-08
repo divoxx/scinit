@@ -25,7 +25,7 @@ cargo test --test integration_test
 cargo test --test integration_test signals::
 cargo test --test integration_test sockets::
 
-# Run the known-bug tests (expected to fail, see KNOWN-ISSUES.md)
+# Run the known-bug tests (expected to fail until their GitHub issue is fixed)
 cargo test -- --ignored
 
 # Run the suite on Linux in rootless podman, including the scinit-as-PID-1 tests
@@ -101,9 +101,11 @@ The live-reload system integrates:
 - **Linux runner** (`scripts/test-linux.sh`, `tests/container/Containerfile`): builds a test image and runs `cargo test` in rootless podman (args pass through), with the permissions the `linux` PID-1 tests need; `SCINIT_REQUIRE_PID1=1` makes them fail rather than skip
 - **CI** (`.github/workflows/ci.yml`): on every PR and push to `main`, runs `cargo clippy --all-targets -- -D warnings` on macOS and Linux, `cargo test` on a macOS runner and `scripts/test-linux.sh` on an Ubuntu runner
 
-### Known Bugs
+### Issues and Known Bugs
 
-Tests that fail because of a known scinit bug are marked `#[ignore = "bug: <anchor> (KNOWN-ISSUES.md)"]`. Each anchor is a section in `KNOWN-ISSUES.md`. When fixing a bug, remove the `#[ignore]` from its tests (`grep -rn 'bug: <anchor>' tests/`) and delete its entry.
+Bugs, limitations and planned features are tracked as GitHub issues (`gh issue list`), not in files in the repo. When you find one, open an issue with the problem (what happens, where in the code, a reproduction), why it matters, and, once decided, the agreed fix and a priority; label it `bug` or `enhancement`. Don't fix unrelated issues as part of another change: open an issue instead.
+
+A test that reproduces an unfixed bug stays in the suite but is marked `#[ignore = "bug: #<issue>"]`, so the default run stays green (`cargo test -- --ignored` runs them). When fixing a bug, remove the `#[ignore]` from its tests (`grep -rn 'bug: #<issue>' tests/`), reference the issue in the PR (`Fixes #<issue>`), and update any docs that describe the old behavior.
 
 ### Socket Activation Testing
 
