@@ -319,6 +319,15 @@ fn escape_non_utf8(value: &OsStr) -> String {
 }
 
 fn cmd_dump(args: &[String]) -> ! {
+    // Whether this process's group holds the terminal's foreground, checked
+    // first thing after exec so a handover from outside has had no time
+    let tty = match std::fs::File::open("/dev/tty") {
+        Ok(tty) => format!(
+            "foreground={}",
+            unistd::tcgetpgrp(&tty).ok() == Some(unistd::getpgrp())
+        ),
+        Err(_) => "none".to_string(),
+    };
     let mut env_keys: Vec<String> = Vec::new();
     let mut then_exit = false;
     let mut it = args.iter();
@@ -372,12 +381,19 @@ fn cmd_dump(args: &[String]) -> ! {
         .collect();
     report("sigmask", &format!("blocked={}", blocked.join(",")));
 
-    for sig in [Signal::SIGTTIN, Signal::SIGTTOU] {
+    for sig in [
+        Signal::SIGTTIN,
+        Signal::SIGTTOU,
+        Signal::SIGINT,
+        Signal::SIGQUIT,
+    ] {
         report(
             "sigdisp",
             &format!("sig={} ignored={}", short_name(sig), is_ignored(sig)),
         );
     }
+
+    report("tty", &tty);
 
     if let Ok(cwd) = std::env::current_dir() {
         report("cwd", &format!("value={}", cwd.display()));

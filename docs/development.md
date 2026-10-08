@@ -41,7 +41,7 @@ flowchart LR
 
 The child is `tests/fixtures/test_child.rs`, built as `scinit-test-child`. It is a small program with a few subcommands, each modeled on something a real child might do, and it reports what it observes by appending one line per event to the file named in `$SCINIT_TEST_REPORT`. Each line has the form `<name> pid=<pid> t=<microseconds> key=value ...`, and it also echoes every event to stderr prefixed with `[test-child]`, which helps when you run it by hand.
 
-`run` reports `started` and then waits, recording each signal it receives; flags choose which signals it traps, ignores or exits on, and `--grandchild` makes it fork a second process into the same group. `exit <code>` exits with the given code, and `kill-self <SIG>` kills itself with a signal, which together cover the exit-code paths. `dump` records the child's argv, the `LISTEN_*` variables (plus any others named with `--env`), its open file descriptors, its signal mask, whether SIGTTIN and SIGTTOU are ignored, and its working directory. `listen` finds the sockets it inherited, accepts on each one, and answers every connection with `pid=<pid> fd=<n> port=<port>`, so a test can tell which process served it, which is how the socket activation and live-reload tests check that no connection is dropped across a restart. `spawn-orphan` creates an orphaned process and checks whether it gets reaped, which only means something when scinit is PID 1.
+`run` reports `started` and then waits, recording each signal it receives; flags choose which signals it traps, ignores or exits on, and `--grandchild` makes it fork a second process into the same group. `exit <code>` exits with the given code, and `kill-self <SIG>` kills itself with a signal, which together cover the exit-code paths. `dump` records the child's argv, the `LISTEN_*` variables (plus any others named with `--env`), its open file descriptors, its signal mask, whether SIGTTIN, SIGTTOU, SIGINT and SIGQUIT are ignored, whether its group holds the terminal's foreground, and its working directory. `listen` finds the sockets it inherited, accepts on each one, and answers every connection with `pid=<pid> fd=<n> port=<port>`, so a test can tell which process served it, which is how the socket activation and live-reload tests check that no connection is dropped across a restart. `spawn-orphan` creates an orphaned process and checks whether it gets reaped, which only means something when scinit is PID 1.
 
 The fixture is also handy outside the tests, for example to write a reproduction for an issue or to see what scinit hands to a child:
 
@@ -56,8 +56,11 @@ $ SCINIT_TEST_REPORT=/tmp/report.log target/debug/scinit --ports 18090 -- target
 [test-child] env pid=95285 t=1791447112918202 key=LISTEN_PID value=95285
 [test-child] fds pid=95285 t=1791447112918226 open=0,1,2,3 sockets=3
 [test-child] sigmask pid=95285 t=1791447112918267 blocked=
-[test-child] sigdisp pid=95285 t=1791447112918294 sig=TTIN ignored=true
-[test-child] sigdisp pid=95285 t=1791447112918318 sig=TTOU ignored=true
+[test-child] sigdisp pid=95285 t=1791447112918294 sig=TTIN ignored=false
+[test-child] sigdisp pid=95285 t=1791447112918318 sig=TTOU ignored=false
+[test-child] sigdisp pid=95285 t=1791447112918329 sig=INT ignored=false
+[test-child] sigdisp pid=95285 t=1791447112918340 sig=QUIT ignored=false
+[test-child] tty pid=95285 t=1791447112918349 none
 [test-child] cwd pid=95285 t=1791447112918358 value=/home/you/scinit
 [test-child] dump-done pid=95285 t=1791447112918381
 [test-child] exit pid=95285 t=1791447112918403 code=0

@@ -343,28 +343,73 @@ fn sigquit_exits_promptly_when_child_exits() {
     assert_prompt_exit(Signal::SIGQUIT);
 }
 
-/// scinit ignores TTIN/TTOU and the ignored disposition survives exec
-/// (current intended behaviour for container use)
+/// The child starts with every signal at its default disposition: not the
+/// SIGTTIN/SIGTTOU scinit ignores for itself, nor the SIGINT/SIGQUIT scinit
+/// was started with ignored
 #[test]
-fn child_inherits_ignored_ttin_ttou() {
-    let (scinit, events) = Scinit::builder().spawn_dump(&[]);
-    for sig in ["TTIN", "TTOU"] {
+fn child_starts_with_default_dispositions() {
+    let (scinit, events) = Scinit::builder()
+        .ignore_signals(&[Signal::SIGINT, Signal::SIGQUIT])
+        .spawn_dump(&[]);
+    for sig in ["TTIN", "TTOU", "INT", "QUIT"] {
         let disp = events
             .iter()
             .find(|e| e.is("sigdisp") && e.field_is("sig", sig))
             .unwrap_or_else(|| panic!("no sigdisp for {}\n{}", sig, scinit.diagnostics()));
         assert_eq!(
             disp.get("ignored"),
-            Some("true"),
-            "{}\n{}",
+            Some("false"),
+            "{} is ignored in the child\n{}",
             sig,
             scinit.diagnostics()
         );
     }
 }
 
-/// scinit blocks signals for sigwait, but the child must start with an empty
-/// signal mask
+/// With a terminal, the child's group holds its foreground when the child
+/// starts. The child takes it itself before exec: with SIGTTIN/SIGTTOU at
+/// their defaults, a child still in the background would be stopped by
+/// reading or configuring the terminal. (Handing it over from scinit after
+/// the spawn usually won that race too, so this checks the handoff works,
+/// not that the race is gone.)
+#[test]
+fn child_starts_in_terminal_foreground() {
+    let (scinit, events) = Scinit::builder().controlling_terminal().spawn_dump(&[]);
+    let tty = events
+        .iter()
+        .find(|e| e.is("tty"))
+        .unwrap_or_else(|| panic!("no tty event\n{}", scinit.diagnostics()));
+    assert_eq!(
+        tty.get("foreground"),
+        Some("true"),
+        "the child started outside the terminal's foreground\n{}",
+        scinit.diagnostics()
+    );
+}
+
+/// scinit started with SIGINT and SIGQUIT ignored (`scinit ... &` from a
+/// script) still receives them and forwards them to the child
+fn assert_received_though_ignored(sig: Signal) {
+    let (mut scinit, pid) = Scinit::builder()
+        .ignore_signals(&[Signal::SIGINT, Signal::SIGQUIT])
+        .child(["run"])
+        .start();
+    scinit.signal(sig).unwrap();
+    scinit.wait_for_signal(pid, sig, TIMEOUT).unwrap();
+    let status = scinit.wait_exit(EXIT_BOUND).unwrap();
+    scinit.assert_exit_code(status, 0);
+}
+
+#[test]
+fn sigint_received_though_started_ignored() {
+    assert_received_though_ignored(Signal::SIGINT);
+}
+
+#[test]
+fn sigquit_received_though_started_ignored() {
+    assert_received_though_ignored(Signal::SIGQUIT);
+}
+
 #[test]
 fn child_signal_mask_is_empty() {
     let (scinit, events) = Scinit::builder().spawn_dump(&[]);

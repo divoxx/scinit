@@ -43,6 +43,10 @@ impl SignalHandler {
     pub fn install() -> Result<Self> {
         let handled_signals = handled_signals();
         pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&handled_signals), None)?;
+        // After blocking, so none of them can take its default action on
+        // scinit: an ignored signal would be discarded instead of reaching
+        // sigwait (e.g. SIGINT for a `scinit ... &` from a script)
+        reset_dispositions(handled_signals)?;
         ignore_tty_signals()?;
 
         let (sender, receiver) = unbounded_channel();
@@ -115,6 +119,16 @@ fn handled_signals() -> SigSet {
     ]
     .into_iter()
     .collect()
+}
+
+/// Resets the dispositions of `set` to the default, undoing any `SIG_IGN`
+/// scinit inherited
+fn reset_dispositions(set: SigSet) -> Result<()> {
+    let default_action = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+    for signal in set.iter() {
+        unsafe { nix::sys::signal::sigaction(signal, &default_action)? };
+    }
+    Ok(())
 }
 
 /// Ignores SIGTTIN and SIGTTOU, so terminal operations can't stop scinit.

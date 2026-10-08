@@ -2,20 +2,21 @@
 
 A child process inherits a lot from its parent: a process group, a signal mask, signal dispositions, open file descriptors, the environment, the working directory, and a place in relation to the terminal. Most of the time that is exactly what you want. An init is different, because it sets up its own process state for its own purposes, and some of that state would be wrong for the application it runs. scinit blocks several signals on every thread, for example, and an application that inherited that mask would never see SIGTERM.
 
-So each time scinit starts the child, at startup and on every live-reload restart, it adjusts what the child inherits. The child gets its own process group, an empty signal mask, the terminal's foreground when there is a terminal, and no file descriptors beyond stdio and the sockets scinit hands it on purpose. Everything else, including the environment, working directory and stdio, is passed through unchanged.
+So each time scinit starts the child, at startup and on every live-reload restart, it adjusts what the child inherits. The child gets its own process group, an empty signal mask, every signal at its default disposition, the terminal's foreground when there is a terminal, and no file descriptors beyond stdio and the sockets scinit hands it on purpose. Everything else, including the environment, working directory and stdio, is passed through unchanged.
 
 ```mermaid
 flowchart LR
     S["scinit"] -- fork --> C["new process"]
     subgraph prep["In the new process, before exec"]
         direction TB
-        P1["own process group"] --> P2["signal mask cleared"]
+        P1["own process group"] --> P0["takes the terminal's foreground"]
+        P0 --> PD["signal dispositions reset"]
+        PD --> P2["signal mask cleared"]
         P2 --> P3["fds above 2 marked close-on-exec"]
         P3 --> P4["activated sockets placed at fd 3 and up"]
     end
     C --> prep
     prep -- exec --> A["your application"]
-    S -. "makes its group the terminal's foreground" .-> A
 ```
 
 ## Its own process group
@@ -40,11 +41,17 @@ scinit blocks SIGTERM, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2 and SIGHUP on all of it
 
 Between fork and exec, scinit's child process clears its signal mask, so the application starts with nothing blocked, as it would when started from a shell.
 
+## Default signal dispositions
+
+A signal's disposition says what happens when it arrives: the default action, a handler, or nothing at all. Handlers are reset by `exec`, but an ignored signal stays ignored. scinit ignores SIGTTIN and SIGTTOU for itself, so that background terminal I/O can never stop the container's init, and scinit itself may have been started with signals ignored: a non-interactive shell starts a background job (`scinit ... &` in a script) with SIGINT and SIGQUIT ignored.
+
+So between fork and exec, the child also resets every signal to its default disposition, as tini does. The application starts with nothing ignored, whatever scinit inherited, and a forwarded SIGINT has its usual effect. scinit does the same for the six signals it handles, before it starts waiting for them, so it receives a SIGINT even when it was started with SIGINT ignored.
+
 ## The terminal's foreground
 
 When you run a program in a terminal, the terminal delivers Ctrl-C (SIGINT), Ctrl-\ (SIGQUIT) and Ctrl-Z (SIGTSTP) to its foreground process group, and only processes in that group may read from it. When your shell starts scinit, scinit's group is in the foreground. Since the child has its own group, it would be in the background: it would not receive Ctrl-C directly, and reading from the terminal would stop it.
 
-So after each spawn, scinit makes the child's process group the terminal's foreground group. This happens only when scinit has a controlling terminal, which it checks by opening `/dev/tty`; in a container without `-t`, or under a process manager, there is none, and the step is skipped. When there is a terminal, Ctrl-C goes straight to the child, as if you had started it from the shell yourself. Here is a Ctrl-C typed into a terminal running scinit, with `SCINIT_LOG=info`:
+So on each spawn, the child makes its own process group the terminal's foreground group, between fork and exec, before its signal dispositions are reset. Taking it there means the application never runs in the background, where reading or configuring the terminal would stop it with SIGTTIN or SIGTTOU, and SIGTTOU is still ignored at that point, which `tcsetpgrp` needs when called from the background. This happens only when scinit has a controlling terminal, which it checks by opening `/dev/tty`; in a container without `-t`, or under a process manager, there is none, and the step is skipped. When there is a terminal, Ctrl-C goes straight to the child, as if you had started it from the shell yourself. Here is a Ctrl-C typed into a terminal running scinit, with `SCINIT_LOG=info`:
 
 ```console
 $ SCINIT_LOG=info scinit -- sh -c 'trap "echo child: got INT; exit 130" INT; echo running; sleep 1000 & wait'
@@ -87,17 +94,17 @@ There is one adjustment. Variables starting with `LISTEN_` describe sockets pass
 
 ## Things to know
 
-scinit ignores SIGTTIN and SIGTTOU for itself, so that background terminal I/O can never stop the container's init. An ignored signal stays ignored across `exec`, so the child starts with SIGTTIN and SIGTTOU ignored too, unlike a program started from a shell. For most applications this makes no difference, and programs that care about job control (shells, for example) set these dispositions themselves. You can see it in `/proc` on Linux, where bits 21 and 22 (the two signals' numbers) are set in the ignored mask while the blocked mask is empty:
+You can check both the mask and the dispositions in `/proc` on Linux, where the child's blocked and ignored masks are empty:
 
 ```console
 $ scinit -- sh -c 'grep -E "^(SigBlk|SigIgn)" /proc/self/status'
 SigBlk:	0000000000000000
-SigIgn:	0000000000300000
+SigIgn:	0000000000000000
 ```
 
 There is no option to set or remove environment variables for the child. Set them on scinit, with `ENV` in the Dockerfile, `-e` on `docker run`, or `env` in front of the command (`scinit -- env FOO=bar my-server`).
 
-If scinit has a terminal but can't make the child's group the foreground group, that is treated as an error: scinit kills the child's process group and exits with 1.
+If scinit has a terminal but the child can't make its group the foreground group, that is treated as an error: the application isn't started, and scinit exits with 1.
 
 Processes that leave the child's process group, for example by calling `setsid` to daemonize, are outside the group that scinit signals; [signals and shutdown](signals-and-shutdown.md#things-to-know) describes what that means for a shutdown.
 

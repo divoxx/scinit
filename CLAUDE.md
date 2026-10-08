@@ -57,7 +57,7 @@ cargo run -- --live-reload --debounce-ms 1000 --restart-delay-ms 500 my-app
 **scinit** is a lightweight async init system designed for container environments, built around several key modules:
 
 - **`main` / `run_main_loop`** (`src/main.rs`): Builds the tokio runtime and runs the event loop; dispatches signals (`on_signal`) and file events (`on_file_event`) to the `ProcessManager`
-- **`ProcessManager`** (`src/process_manager.rs`): Spawns, monitors, restarts and stops the child, and forwards signals to its process group. The child's lifecycle is a `ChildState` enum (`NotStarted` / `Running(ManagedChild)` / `Exited { pid, status }`). Every spawn hands the terminal to the new child (`src/terminal.rs`)
+- **`ProcessManager`** (`src/process_manager.rs`): Spawns, monitors, restarts and stops the child, and forwards signals to its process group. The child's lifecycle is a `ChildState` enum (`NotStarted` / `Running(ManagedChild)` / `Exited { status }`). Every spawn hands the terminal to the new child, which takes the foreground itself before exec (`src/terminal.rs`)
 - **`SignalHandler`** (`src/signals.rs`): Receives signals only: masks the handled signals on all threads and consumes them on a dedicated `sigwait` thread, never blocking critical signals (SIGFPE, SIGILL, SIGSEGV, etc.)
 - **`FileWatcher`** (`src/file_watcher.rs`): Live-reload file watching using the `notify` crate, with a trailing-edge debounce
 - **`reaper`** (`src/reaper.rs`): Zombie reaping, leaving the managed child to tokio's `Child::wait()`
@@ -77,7 +77,7 @@ cargo run -- --live-reload --debounce-ms 1000 --restart-delay-ms 500 my-app
 ### Signal Flow Architecture
 
 The signal handling follows proper init system semantics:
-1. **Signal Blocking**: `SignalHandler::install()` blocks SIGTERM, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2 and SIGHUP on the main thread before the tokio runtime starts, so every thread inherits the mask
+1. **Signal Blocking**: `SignalHandler::install()` blocks SIGTERM, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2 and SIGHUP on the main thread before the tokio runtime starts, so every thread inherits the mask, then resets them to `SIG_DFL` (an inherited `SIG_IGN` would discard them)
 2. **Signal Detection**: One dedicated `scinit-sigwait` thread loops on `sigwait()` and forwards signals over a channel to the main loop's `select!` (cancel-safe, so no signal is lost while the loop is busy)
 3. **Signal Categories**:
    - **Termination signals** (SIGTERM, SIGINT, SIGQUIT): Forward to child, then graceful shutdown
@@ -128,5 +128,5 @@ The `listen` fixture mode verifies socket inheritance end to end:
 - **Signal masking**: Block handled signals on the main thread before any other thread exists; never block critical/synchronous signals or SIGCHLD
 - **Signal handling**: Consume handled signals only on the dedicated sigwait thread; never call `sigwait` from per-iteration tasks (cancelled waits leave threads that swallow signals)
 - Zombie reaping runs in background tasks to avoid blocking main loop, except the final pass before scinit exits (`reap_before_exit`, on every exit path), which runs inline so it completes before the runtime shuts down
-- Terminal signals (SIGTTIN, SIGTTOU) are ignored to prevent blocking in containers
+- Terminal signals (SIGTTIN, SIGTTOU) are ignored in scinit to prevent blocking in containers. The child resets every disposition to `SIG_DFL` before exec, after taking the terminal's foreground itself (which needs SIGTTOU still ignored)
 - scinit's own logs (`src/logging.rs`) go to stderr only, in tracing's standard format without timestamps (`LEVEL scinit::module: message`; color only on a terminal), filtered by `SCINIT_LOG` (default `error`); never read `RUST_LOG`, which belongs to the child. Fatal errors are logged the same way
