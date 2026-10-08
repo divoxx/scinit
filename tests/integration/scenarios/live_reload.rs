@@ -6,7 +6,8 @@
 //! their contents. A changed, deleted or new non-empty file restarts the
 //! child; a new empty file or a metadata-only change doesn't. A restart is
 //! SIGTERM to the child's group, a `--restart-delay-ms` pause, then a fresh
-//! spawn that gets the same listening sockets.
+//! spawn that gets the same listening sockets. With `--watch-poll`, rescans
+//! on a timer take the place of file notifications.
 //!
 //! The first snapshot is taken when the watch starts, so tests write their
 //! files right before starting scinit and change them as soon as the child
@@ -407,6 +408,49 @@ fn modifying_file_in_subdirectory_does_not_restart() {
     modify(&file, "v2");
 
     assert_no_restart(&mut scinit, "modifying a file in a subdirectory");
+}
+
+/// With `--watch-poll`, a change found by polling restarts the child, and
+/// scinit logs that it is polling
+#[test]
+fn polling_detects_a_change() {
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let file = dir.join("app.conf");
+    modify(&file, "v1");
+    let (scinit, old) = live_reload(b, &dir)
+        .args(["--watch-poll=50"])
+        .env("SCINIT_LOG", "info")
+        .child(["run"])
+        .start();
+    modify(&file, "v2");
+
+    let new = scinit.wait_for_nth("started", 2, TIMEOUT).unwrap().pid();
+    assert_ne!(old, new, "restart must spawn a new process");
+    let watching = format!("Started watching path: {:?} (polling every 50ms)", dir);
+    assert!(
+        scinit.stderr().contains(&watching),
+        "expected log line {:?}\n{}",
+        watching,
+        scinit.diagnostics()
+    );
+}
+
+/// With `--watch-poll`, polls that find nothing changed don't restart, and
+/// neither do metadata-only changes
+#[test]
+fn polling_without_changes_does_not_restart() {
+    let b = Scinit::builder();
+    let dir = watched_dir(&b);
+    let file = dir.join("app.conf");
+    modify(&file, "v1");
+    let (mut scinit, _) = live_reload(b, &dir)
+        .args(["--watch-poll=50"])
+        .child(["run"])
+        .start();
+    modify(&file, "v1");
+
+    assert_no_restart(&mut scinit, "polling an unchanged directory");
 }
 
 /// Only file changes restart: a child that exits on its own ends scinit

@@ -282,6 +282,43 @@ fn zero_zombie_reap_interval_exits_two() {
     );
 }
 
+/// A `--watch-poll` interval under 10ms is a usage error (exit 2)
+#[test]
+fn too_short_watch_poll_interval_exits_two() {
+    let builder = Scinit::builder();
+    let dir = builder.dir();
+    let (scinit, status) = builder
+        .watch(&dir)
+        .args(["--watch-poll=5"])
+        .child(["exit", "0"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 2);
+    scinit.assert_start_count(0, "child must not start with an invalid config");
+    assert!(
+        scinit.stderr().contains("--watch-poll"),
+        "{}",
+        scinit.diagnostics()
+    );
+}
+
+/// `--watch-poll` without `--live-reload` is a usage error (exit 2)
+#[test]
+fn watch_poll_without_live_reload_exits_two() {
+    let (scinit, status) = Scinit::builder()
+        .args(["--watch-poll"])
+        .child(["exit", "0"])
+        .run(TIMEOUT)
+        .unwrap();
+    scinit.assert_exit_code(status, 2);
+    scinit.assert_start_count(0, "child must not start with an invalid config");
+    assert!(
+        scinit.stderr().contains("--live-reload"),
+        "{}",
+        scinit.diagnostics()
+    );
+}
+
 /// Write a script to `dir` that prints each of its arguments on its own line
 fn print_args_script(dir: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;

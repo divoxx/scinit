@@ -22,20 +22,39 @@ pub struct FileWatchConfig {
     pub watch_path: PathBuf,
     /// Debounce time for file changes (prevents excessive restarts)
     pub debounce: Duration,
+    /// Poll the path at this interval instead of using file notifications
+    pub poll_interval: Option<Duration>,
 }
 
 /// Async file watcher that monitors files for changes and emits events
 ///
 /// This watcher uses the `notify` crate for cross-platform file system monitoring
+/// (or, with [`FileWatchConfig::poll_interval`], rescans the path on a timer)
 /// and includes debouncing to prevent excessive restarts when files are being
 /// written or compiled. Events only say when to look: once they go quiet, the
 /// watched path is compared against a [`Snapshot`] of its contents, which
 /// decides whether anything changed.
 pub struct FileWatcher {
-    /// The underlying notify watcher; dropping it stops watching
-    _watcher: RecommendedWatcher,
+    /// What produces the raw events; dropping it stops watching
+    _source: EventSource,
     /// Channel receiver for file change events
     event_rx: mpsc::UnboundedReceiver<FileChangeEvent>,
+}
+
+/// Where a [`FileWatcher`]'s raw events come from
+enum EventSource {
+    /// File notifications
+    Notify { _watcher: RecommendedWatcher },
+    /// The [`poll_changes`] task, aborted on drop
+    Poll { _poller: AbortOnDrop },
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl FileWatcher {
@@ -45,31 +64,54 @@ impl FileWatcher {
     pub fn start(config: FileWatchConfig) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (tx, rx) = mpsc::channel(100);
-
-        // Create the notify watcher
-        let mut watcher = RecommendedWatcher::new(
-            move |res: std::result::Result<notify::Event, notify::Error>| {
-                if let Err(e) = tx.blocking_send(res) {
-                    error!("Failed to send file change event: {}", e);
-                }
-            },
-            notify::Config::default(),
-        )?;
-
-        // Start watching the configured path
         let watch_path = config.watch_path;
-        watcher.watch(&watch_path, RecursiveMode::NonRecursive)?;
-        info!("Started watching path: {:?}", watch_path);
 
-        // After the watch starts, so a change in between is in the snapshot
-        // or delivered as an event, and before the child spawns, so events
-        // for earlier writes (FSEvents replays some) find nothing changed
-        let snapshot = Snapshot::take(&watch_path)?;
+        let (source, snapshot) = match config.poll_interval {
+            None => {
+                // Create the notify watcher
+                let mut watcher = RecommendedWatcher::new(
+                    move |res: std::result::Result<notify::Event, notify::Error>| {
+                        if let Err(e) = tx.blocking_send(res) {
+                            error!("Failed to send file change event: {}", e);
+                        }
+                    },
+                    notify::Config::default(),
+                )?;
+
+                // Start watching the configured path
+                watcher.watch(&watch_path, RecursiveMode::NonRecursive)?;
+                info!("Started watching path: {:?}", watch_path);
+
+                // After the watch starts, so a change in between is in the
+                // snapshot or delivered as an event, and before the child
+                // spawns, so events for earlier writes (FSEvents replays some)
+                // find nothing changed
+                let snapshot = Snapshot::take(&watch_path)?;
+                (EventSource::Notify { _watcher: watcher }, snapshot)
+            }
+            Some(interval) => {
+                // A missing path is an error, as it is for a notify watch
+                std::fs::metadata(&watch_path)?;
+                let snapshot = Snapshot::take(&watch_path)?;
+                info!(
+                    "Started watching path: {:?} (polling every {}ms)",
+                    watch_path,
+                    interval.as_millis()
+                );
+                let poller = tokio::spawn(poll_changes(snapshot.clone(), interval, tx));
+                (
+                    EventSource::Poll {
+                        _poller: AbortOnDrop(poller),
+                    },
+                    snapshot,
+                )
+            }
+        };
 
         tokio::spawn(debounce_events(rx, event_tx, snapshot, config.debounce));
 
         Ok(FileWatcher {
-            _watcher: watcher,
+            _source: source,
             event_rx,
         })
     }
@@ -103,6 +145,52 @@ fn is_read(event: &notify::Event) -> bool {
 
     matches!(event.kind, notify::EventKind::Access(kind)
         if kind != AccessKind::Close(AccessMode::Write))
+}
+
+/// Polls the watched path every `interval` in place of file notifications:
+/// rescans `snapshot` and, when anything differs from the previous poll,
+/// sends an event naming the changed paths, so a change arms the debounce as
+/// a notification would. Whether it restarts the child is still decided by
+/// [`debounce_events`].
+async fn poll_changes(
+    mut snapshot: Snapshot,
+    interval: Duration,
+    tx: mpsc::Sender<notify::Result<notify::Event>>,
+) {
+    let start = tokio::time::Instant::now() + interval;
+    let mut ticker = tokio::time::interval_at(start, interval);
+    // A scan slower than the interval delays the next poll rather than
+    // starting the next one at once
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Only the first of consecutive failed scans is reported
+    let mut failing = false;
+
+    loop {
+        ticker.tick().await;
+        let (next, changes) = rescan(snapshot).await;
+        snapshot = next;
+        let res = match changes {
+            Ok(changes) => {
+                failing = false;
+                if changes.is_empty() {
+                    continue;
+                }
+                let mut event = notify::Event::new(notify::EventKind::Any);
+                for change in changes {
+                    event = event.add_path(change.path);
+                }
+                Ok(event)
+            }
+            Err(_) if failing => continue,
+            Err(e) => {
+                failing = true;
+                Err(notify::Error::io(e))
+            }
+        };
+        if tx.send(res).await.is_err() {
+            break;
+        }
+    }
 }
 
 /// Turns raw notify events into debounced [`FileChangeEvent`]s.
@@ -202,6 +290,7 @@ mod tests {
         let config = FileWatchConfig {
             watch_path: temp_dir.path().to_path_buf(),
             debounce: Duration::from_millis(100),
+            poll_interval: None,
         };
 
         assert!(FileWatcher::start(config).is_ok());
@@ -213,6 +302,7 @@ mod tests {
         let config = FileWatchConfig {
             watch_path: temp_dir.path().to_path_buf(),
             debounce: Duration::from_millis(100),
+            poll_interval: None,
         };
 
         let mut watcher = FileWatcher::start(config).unwrap();
@@ -241,6 +331,7 @@ mod tests {
         let config = FileWatchConfig {
             watch_path: temp_dir.path().to_path_buf(),
             debounce: Duration::from_millis(500),
+            poll_interval: None,
         };
 
         let mut watcher = FileWatcher::start(config).unwrap();
@@ -277,6 +368,7 @@ mod tests {
         let config = FileWatchConfig {
             watch_path: temp_dir.path().to_path_buf(),
             debounce: Duration::from_millis(100),
+            poll_interval: None,
         };
         let mut watcher = FileWatcher::start(config).unwrap();
 
@@ -303,6 +395,7 @@ mod tests {
         let config = FileWatchConfig {
             watch_path: temp_dir.path().to_path_buf(),
             debounce: Duration::from_millis(100),
+            poll_interval: None,
         };
         let mut watcher = FileWatcher::start(config).unwrap();
 
@@ -318,5 +411,89 @@ mod tests {
             test_file,
             event
         );
+    }
+
+    fn polling_config(watch_path: &std::path::Path) -> FileWatchConfig {
+        FileWatchConfig {
+            watch_path: watch_path.to_path_buf(),
+            debounce: Duration::from_millis(100),
+            poll_interval: Some(Duration::from_millis(20)),
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_sends_changed_paths_and_nothing_when_unchanged() {
+        let temp_dir = tempdir().unwrap();
+        let test_file = temp_dir.path().join("test.txt");
+        fs::write(&test_file, "v1").unwrap();
+        let snapshot = Snapshot::take(temp_dir.path()).unwrap();
+        let (tx, mut rx) = mpsc::channel(100);
+        let _poller = AbortOnDrop(tokio::spawn(poll_changes(
+            snapshot,
+            Duration::from_millis(20),
+            tx,
+        )));
+
+        let quiet = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(quiet.is_err(), "unexpected event: {:?}", quiet);
+
+        fs::write(&test_file, "v2").unwrap();
+        let event = tokio::time::timeout(Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("no event for the change")
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.paths, vec![test_file]);
+    }
+
+    #[tokio::test]
+    async fn polling_detects_a_change() {
+        let temp_dir = tempdir().unwrap();
+        let test_file = temp_dir.path().join("test.txt");
+        fs::write(&test_file, "v1").unwrap();
+        let mut watcher = FileWatcher::start(polling_config(temp_dir.path())).unwrap();
+
+        fs::write(&test_file, "v2").unwrap();
+
+        let event = watcher
+            .wait_for_event(Duration::from_millis(1000))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&event, Some(FileChangeEvent::FileChanged(path)) if *path == test_file),
+            "expected a change for {:?}, got {:?}",
+            test_file,
+            event
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_ignores_metadata_changes_and_empty_files() {
+        let temp_dir = tempdir().unwrap();
+        let test_file = temp_dir.path().join("test.txt");
+        fs::write(&test_file, "v1").unwrap();
+        let mut watcher = FileWatcher::start(polling_config(temp_dir.path())).unwrap();
+
+        fs::File::create(temp_dir.path().join("empty.txt")).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&test_file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now())
+            .unwrap();
+
+        let event = watcher
+            .wait_for_event(Duration::from_millis(1000))
+            .await
+            .unwrap();
+        assert!(event.is_none(), "unexpected event: {:?}", event);
+    }
+
+    #[tokio::test]
+    async fn polling_a_missing_path_fails_to_start() {
+        let temp_dir = tempdir().unwrap();
+        let missing = temp_dir.path().join("missing");
+
+        assert!(FileWatcher::start(polling_config(&missing)).is_err());
     }
 }
