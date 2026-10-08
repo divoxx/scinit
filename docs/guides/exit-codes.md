@@ -76,7 +76,7 @@ error: unexpected argument '--bogus-flag' found
 
   tip: to pass '--bogus-flag' as a value, use '-- --bogus-flag'
 
-Usage: scinit [OPTIONS] <COMMAND> [ARGS]...
+Usage: scinit [OPTIONS] <COMMAND>...
 
 For more information, try '--help'.
 exit=2

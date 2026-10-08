@@ -8,9 +8,11 @@ This page lists everything you can pass to scinit and everything it reports back
 scinit [OPTIONS] [--] <COMMAND> [ARGS]...
 ```
 
-scinit takes its own options first, then the command to run and its arguments. Put `--` between the two. It marks the end of scinit's options, so everything after it reaches the child unchanged, including arguments that happen to look like scinit flags.
+scinit takes its own options first, then the command to run and its arguments. scinit stops reading options at the first argument that isn't one of its own: that argument is the command, and it and everything after it reach the child unchanged, including arguments that look like scinit flags. `scinit echo --help` runs `echo --help`, and `scinit my-server --ports 9` passes `--ports 9` to `my-server`.
 
-The separator matters because without it, scinit still parses a flag of its own that comes right after the command. `scinit echo --help` prints scinit's help instead of running `echo --help`, and `scinit my-server --ports 9` makes scinit bind port 9. Once the child has received one argument, everything that follows is passed through, so `scinit echo hi --help` does print `hi --help`. Writing `scinit [OPTIONS] -- <COMMAND> [ARGS]...` every time avoids the question entirely, and it is what the examples in these docs do.
+`--` marks the end of scinit's options explicitly. It is optional, but it makes the split obvious to a reader, and it is required when the command name itself starts with `-`. The examples in these docs always write it.
+
+A misspelled scinit option before the command is still an error (exit 2), not mistaken for the command.
 
 ## Positional arguments
 

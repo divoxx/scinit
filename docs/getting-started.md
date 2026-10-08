@@ -35,7 +35,7 @@ $ echo $?
 0
 ```
 
-The `--` separates scinit's own options from the command it should run, so everything after it reaches the child unchanged. Always write it: without it, scinit still reads its own flags right after the command name, and `scinit echo --help` prints scinit's help instead of running `echo --help`. The [command-line reference](reference/cli.md#synopsis) has the details.
+The `--` separates scinit's own options from the command it should run. It is optional: scinit stops reading its own options at the command name, so everything from there on reaches the child unchanged either way. Writing it makes the split easy to see. The [command-line reference](reference/cli.md#synopsis) has the details.
 
 scinit printed nothing of its own. Its log messages go to stderr only, and the default level shows errors and nothing else, so stdout carries exactly what your program writes. When the command exits, scinit exits with the same code:
 

@@ -68,12 +68,9 @@ pub struct Cli {
     #[arg(long, default_value = "5000", value_parser = clap::value_parser!(u64).range(1..))]
     pub zombie_reap_interval_ms: u64,
 
-    /// Command to execute
-    pub command: String,
-
-    /// Arguments for the command
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    pub args: Vec<String>,
+    /// Command to execute and its arguments, passed to the child unchanged
+    #[arg(required = true, num_args = 1.., trailing_var_arg = true, value_name = "COMMAND")]
+    pub command: Vec<String>,
 }
 
 /// Configuration for the init system
@@ -103,6 +100,10 @@ pub struct LiveReloadConfig {
 impl Config {
     /// Parse command line arguments into configuration
     pub fn from_cli(cli: Cli) -> Result<Self> {
+        let mut command = cli.command.into_iter();
+        let program = command.next().expect("clap requires a command");
+        let args: Vec<String> = command.collect();
+
         // Parse bind address
         let bind_address: IpAddr = cli
             .bind_addr
@@ -112,7 +113,7 @@ impl Config {
         let live_reload = if cli.live_reload {
             let watch_path = match cli.watch_path {
                 Some(path) => path,
-                None => default_watch_path(&cli.command)?,
+                None => default_watch_path(&program)?,
             };
             Some(LiveReloadConfig {
                 watch_path,
@@ -124,8 +125,8 @@ impl Config {
         };
 
         Ok(Config {
-            command: cli.command,
-            args: cli.args,
+            command: program,
+            args,
             zombie_reap_interval: Duration::from_millis(cli.zombie_reap_interval_ms),
             graceful_timeout: Duration::from_secs(cli.graceful_timeout_secs),
             live_reload,
