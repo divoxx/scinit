@@ -22,7 +22,7 @@ cargo build --release
 
 The binary is `target/release/scinit`. It is a single executable with no runtime files, so you can copy it wherever you like. The examples below assume it is on your `PATH`, or that you replace `scinit` with the path to it.
 
-scinit is built for Linux containers, and it also runs on macOS so that you can develop with it locally. Everything in this guide works on both, except that a program run outside a container doesn't start as PID 1, which only changes what happens to orphaned processes (see [Zombie reaping](guides/zombie-reaping.md)).
+scinit is built for Linux containers, and it also runs on macOS so that you can develop with it locally. Everything in this guide works on both, except that a program run outside a container doesn't start as PID 1, which on macOS changes what happens to orphaned processes (see [Zombie reaping](guides/zombie-reaping.md)).
 
 ## A first run
 

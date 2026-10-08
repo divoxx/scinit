@@ -29,7 +29,7 @@ use exit_status::{exit_code, handle_child_exit, signal_exit_code};
 use file_watcher::{FileChangeEvent, FileWatcher};
 use port_manager::PortManager;
 use process_manager::ProcessManager;
-use reaper::{reap_before_exit, spawn_zombie_reap};
+use reaper::{become_subreaper, reap_before_exit, spawn_zombie_reap};
 use signals::{Signal, SignalHandler};
 
 fn main() {
@@ -45,6 +45,9 @@ fn main() {
 /// Runs scinit and returns the exit code to exit with
 fn run() -> Result<i32> {
     info!("scinit starting");
+
+    // Before spawning anything, so every orphan of the child comes to scinit
+    become_subreaper();
 
     // Before any other thread exists, so every thread inherits the mask
     let mut signal_handler = SignalHandler::install()?;

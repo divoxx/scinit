@@ -115,6 +115,38 @@ fn all_scinit_threads_block_handled_signals() {
     );
 }
 
+/// When scinit isn't PID 1, an orphan of the child is still reparented to
+/// scinit, a child subreaper, and reaped by it. Without the flag it would go
+/// to the test runner's PID 1 or subreaper instead.
+#[test]
+fn orphan_reaped_by_subreaper_when_not_pid1() {
+    let (scinit, _) = Scinit::builder().child(["spawn-orphan"]).start();
+
+    let parent = scinit.wait_for_event("orphan-parent", TIMEOUT).unwrap();
+    assert_eq!(
+        parent.parse_field::<i32>("ppid"),
+        Some(scinit.pid().as_raw()),
+        "orphan should be reparented to scinit (pid {}): {:?}\n{}",
+        scinit.pid(),
+        parent,
+        scinit.diagnostics()
+    );
+    // spawn-orphan checks the orphan ~2s after it exits
+    let verdict = poll_until(Duration::from_secs(15), || {
+        let stdout = scinit.stdout();
+        stdout
+            .lines()
+            .find(|l| l.starts_with("ORPHAN_"))
+            .map(str::to_string)
+    });
+    assert_eq!(
+        verdict.as_deref(),
+        Some("ORPHAN_REAPED"),
+        "orphan should be reaped by scinit as a subreaper\n{}",
+        scinit.diagnostics()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // scinit as PID 1 of a new PID namespace
 // ---------------------------------------------------------------------------

@@ -24,7 +24,7 @@ use std::net::TcpListener;
 use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_TRAP: &[Signal] = &[
     Signal::SIGTERM,
@@ -467,16 +467,25 @@ fn cmd_spawn_orphan() -> ! {
     // Fork an intermediate process that forks the orphan and exits at once,
     // so the orphan is reparented to the nearest subreaper / PID 1
     match unsafe { unistd::fork() }.expect("fork failed") {
-        ForkResult::Child => match unsafe { unistd::fork() }.expect("fork failed") {
-            ForkResult::Child => {
-                std::thread::sleep(Duration::from_millis(300));
-                unsafe { libc::_exit(0) };
+        ForkResult::Child => {
+            let intermediate = unistd::getpid();
+            match unsafe { unistd::fork() }.expect("fork failed") {
+                ForkResult::Child => {
+                    // Once the intermediate is gone, report who adopted the orphan
+                    let deadline = Instant::now() + Duration::from_secs(1);
+                    while unistd::getppid() == intermediate && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    report("orphan-parent", &format!("ppid={}", unistd::getppid()));
+                    std::thread::sleep(Duration::from_millis(300));
+                    unsafe { libc::_exit(0) };
+                }
+                ForkResult::Parent { child } => {
+                    report("orphan", &format!("orphan_pid={}", child));
+                    unsafe { libc::_exit(0) };
+                }
             }
-            ForkResult::Parent { child } => {
-                report("orphan", &format!("orphan_pid={}", child));
-                unsafe { libc::_exit(0) };
-            }
-        },
+        }
         ForkResult::Parent { child } => {
             let _ = nix::sys::wait::waitpid(child, None);
         }

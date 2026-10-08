@@ -18,7 +18,7 @@ The order below starts with getting scinit running and then works from the core 
 
 [Exit codes](guides/exit-codes.md) describes how the child's outcome becomes scinit's exit status: the child's own exit code, 128 plus the signal number when it was killed by a signal, and the codes scinit uses for its own errors. This is what your orchestrator sees, so it is worth knowing when you set up restart policies or alerts.
 
-[Zombie reaping](guides/zombie-reaping.md) explains when scinit collects orphaned processes: as soon as SIGCHLD arrives, on a periodic sweep, and once more when the child exits on its own. It also explains why orphans are only re-parented to scinit when it is actually PID 1.
+[Zombie reaping](guides/zombie-reaping.md) explains when scinit collects orphaned processes: as soon as SIGCHLD arrives, on a periodic sweep, and once more when the child exits on its own. It also explains how, on Linux, scinit registers as a child subreaper so that orphans are re-parented to it even when it isn't PID 1.
 
 [Process isolation](guides/process-isolation.md) describes the environment the child starts in: its own process group, an empty signal mask, the terminal's foreground (so Ctrl-C reaches it directly), and no file descriptors other than stdio and any activated sockets.
 
