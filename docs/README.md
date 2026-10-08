@@ -2,7 +2,7 @@
 
 These pages explain how scinit works and why it behaves the way it does. They are plain Markdown, written to be read on GitHub. If you only want to look up a flag, go straight to the [command-line reference](reference/cli.md).
 
-scinit exists to make remote development environments feel local. When there are too many services to run on a laptop, you develop against a Docker host or a Kubernetes cluster instead. Rather than routing traffic to a service on your laptop, or rebuilding images and re-applying manifests on every change, scinit's approach keeps the service deployed in the cluster and moves only the code: your edits are synchronized into the running container, rebuilt there (typically by a sidecar container), and the running service has to pick up the new build without anything connected to it noticing. scinit runs as that container's init, restarts the service when a new build lands ([live reload](guides/live-reload.md)) and keeps its listening sockets open across the restart ([socket activation](guides/socket-activation.md)). Underneath, it is a complete container init, so the same entrypoint works in production. The [README](../README.md) has a diagram of this setup.
+scinit is a container init: it does what tini and dumb-init do, bounds every shutdown with a SIGKILL deadline, and adds two features designed for development, live reload and socket inheritance. Those were built for remote development environments, where a service stays deployed in a Docker host or Kubernetes cluster and only its code moves: your edits are synchronized into the running container, rebuilt there, and scinit swaps the running process for the new build while keeping its listening sockets open. The same entrypoint then runs the service in production. The [README](../README.md) compares scinit with other inits and lists its use cases.
 
 The order below starts with getting scinit running and then works from the core job of an init towards the development features.
 
@@ -22,7 +22,9 @@ The order below starts with getting scinit running and then works from the core 
 
 [Process isolation](guides/process-isolation.md) describes the environment the child starts in: its own process group, an empty signal mask, the terminal's foreground (so Ctrl-C reaches it directly), and no file descriptors other than stdio and any activated sockets.
 
-## The development loop
+## The development features
+
+[Remote development environments](guides/remote-development.md) is the setup live reload and socket inheritance were designed for: a service deployed once in a cluster, with a build sidecar recompiling it in place and scinit swapping in each new build. It describes the pieces, what scinit is and isn't responsible for, and how one change travels from your editor to the running service.
 
 [Live reload](guides/live-reload.md) covers `--live-reload`: what scinit watches by default, which file system events count as a change, how the trailing-edge debounce turns a burst of saves into one restart, and the sequence scinit follows to stop the old child and start a new one.
 
