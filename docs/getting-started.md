@@ -109,7 +109,7 @@ The same applies to Ctrl-C in a terminal. When scinit runs attached to a termina
 
 ## A first live-reload loop
 
-scinit can also restart your program when its files change. This is what it was built for: in a remote development environment, a new build of your service lands in the container and scinit swaps the running process for it (the [README](../README.md) shows the full setup). Locally, the same mechanism makes a small development loop. Create a script that stands in for a server: it prints its version and then waits.
+scinit can also restart your program when its files change. This is what it was built for: in a remote development environment, a new build of your service can be written into the container, and scinit then swaps the running process for it (the [README](../README.md) shows the full setup). Locally, the same mechanism makes a small development loop. Create a script that stands in for a server: it prints its version and then waits.
 
 ```bash
 mkdir scinit-demo && cd scinit-demo

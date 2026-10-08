@@ -2,7 +2,7 @@
 
 These pages explain how scinit works and why it behaves the way it does. They are plain Markdown, written to be read on GitHub. If you only want to look up a flag, go straight to the [command-line reference](reference/cli.md).
 
-scinit is a container init: it does what tini and dumb-init do, sends SIGKILL to your program when it doesn't exit within a timeout after a shutdown signal, and adds two features designed for development, live reload and socket inheritance. Those were built for remote development environments, where a service then can stay deployed in a Docker host or Kubernetes cluster and only its code or binary needs to change: your edits are synchronized into the running container, rebuilt there, and scinit swaps the running process for the new build while keeping its listening sockets open. The same entrypoint then runs the service in production. The [README](../README.md) compares scinit with other inits and lists its use cases.
+scinit is a container init: it does what tini and dumb-init do, sends SIGKILL to your program when it doesn't exit within a timeout after a shutdown signal, and adds two features designed for development, live reload and socket inheritance. Those were built for remote development environments, where a service then can stay deployed in a Docker host or Kubernetes cluster and only its code or binary needs to change: your edits can be synchronized into the running container and rebuilt there, and scinit then swaps the running process for the new build while keeping its listening sockets open. The same entrypoint can then run the service in production. The [README](../README.md) compares scinit with other inits and lists its use cases.
 
 The order below starts with getting scinit running and then works from the core job of an init towards the development features.
 
@@ -24,7 +24,7 @@ The order below starts with getting scinit running and then works from the core 
 
 ## The development features
 
-[Remote development environments](guides/remote-development.md) is the setup live reload and socket inheritance were designed for: a service that then can stay deployed in a cluster while only its code or binary needs to change, with a build sidecar recompiling it in place and scinit swapping in each new build. It describes the pieces, what scinit is and isn't responsible for, and how one change travels from your editor to the running service.
+[Remote development environments](guides/remote-development.md) is the setup live reload and socket inheritance were designed for: a service that then can stay deployed in a cluster while only its code or binary needs to change, where a build sidecar can recompile it in place and scinit then swaps in each new build. It describes the pieces, what scinit is and isn't responsible for, and how one change travels from your editor to the running service.
 
 [Live reload](guides/live-reload.md) covers `--live-reload`: what scinit watches by default, which file system events count as a change, how the trailing-edge debounce turns a burst of saves into one restart, and the sequence scinit follows to stop the old child and start a new one.
 

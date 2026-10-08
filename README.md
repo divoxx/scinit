@@ -31,12 +31,12 @@ Smaller decisions follow the same reasoning. scinit writes its own logs to stder
 
 **As the init of production containers.** Use scinit anywhere you would use tini or dumb-init. You get the same guarantees plus a bounded, logged shutdown. Without `--live-reload`, scinit never restarts anything: a crash ends the container, and the orchestrator decides what happens next.
 
-**Remote development environments.** This is the use case live reload and socket inheritance were designed for. When a system has too many services to run on a laptop, development moves to a Docker host or Kubernetes cluster. Rather than routing traffic to your laptop, as [Telepresence](https://www.telepresence.io) does, or rebuilding images and re-applying manifests on every change, the deploy loop [Garden](https://garden.io) and [Tilt](https://tilt.dev) are built around, the service then can stay deployed and only the code or binary needs to change. Your edits are synced into the running pod, a build sidecar recompiles the program into a shared volume, and scinit swaps the running process for the new build in place while its sockets stay open, so connections from your browser, a `kubectl port-forward` or other services in the cluster are not refused during the restart.
+**Remote development environments.** This is the use case live reload and socket inheritance were designed for. When a system has too many services to run on a laptop, development moves to a Docker host or Kubernetes cluster. Rather than routing traffic to your laptop, as [Telepresence](https://www.telepresence.io) does, or rebuilding images and re-applying manifests on every change, the deploy loop [Garden](https://garden.io) and [Tilt](https://tilt.dev) are built around, the service then can stay deployed and only the code or binary needs to change. Your edits can be synced into the running pod, a build sidecar can recompile the program into a shared volume, and scinit then swaps the running process for the new build in place while its sockets stay open, so connections from your browser, a `kubectl port-forward` or other services in the cluster are not refused during the restart.
 
 ```mermaid
 flowchart LR
     Dev["Your editor"] -- "file sync" --> Builder
-    subgraph Pod["Development pod, deployed once"]
+    subgraph Pod["Development pod, can stay deployed"]
         Builder["Build sidecar"] -- "new binary" --> Vol[("Shared volume")]
         subgraph App["Application container"]
             scinit["scinit (PID 1)<br/>owns the sockets"] -- "restart" --> Service["Your service"]
@@ -46,7 +46,7 @@ flowchart LR
     Clients["Browser, port-forward,<br/>other services"] -- "connections" --> scinit
 ```
 
-The same image and entrypoint then go to production with the live-reload flags dropped. [Remote development environments](docs/guides/remote-development.md) walks through the setup and what each piece is responsible for.
+The same image and entrypoint can then go to production with the live-reload flags dropped. [Remote development environments](docs/guides/remote-development.md) walks through the setup and what each piece is responsible for.
 
 **Local development in containers.** The same mechanism works on a single machine: with Docker Compose or a plain `docker run`, mount your build output into the container and let scinit restart the program whenever you rebuild, keeping its ports open in between.
 

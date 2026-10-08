@@ -2,16 +2,16 @@
 
 In an organization with many services, running everything on a laptop is a hassle and often impossible: there are too many services, too much data, and too many dependencies on the real infrastructure. So development moves to a remote environment, a Docker host or a Kubernetes cluster, and the existing tools mostly take one of two routes. Some keep your service running on your laptop and route network traffic between it and the cluster, as [Telepresence](https://www.telepresence.io) does. Others, such as [Garden](https://garden.io) and [Tilt](https://tilt.dev), are built around a deploy loop: a change rebuilds the image and re-applies the manifests, and the cluster replaces the pods.
 
-scinit's live reload and socket inheritance were designed for a different approach. The service runs in the cluster and then can stay deployed, and only the code or binary needs to change: no traffic is routed to your laptop, a code change doesn't touch the manifests or recreate the pod, and the running process is swapped for the new build in place. This guide describes how such an environment fits together and what scinit's part in it is.
+scinit's live reload and socket inheritance were designed for a different approach. The service runs in the cluster and then can stay deployed, and only the code or binary needs to change: no traffic needs to be routed to your laptop, a code change doesn't need to touch the manifests or recreate the pod, and the running process can be swapped for the new build in place. This guide describes how such an environment fits together and what scinit's part in it is.
 
 ## The pieces
 
-A development environment built this way has four parts, and scinit has the narrowest responsibility of them. A deployment tool sets up the development pod once: an application container whose entrypoint is scinit, a build sidecar next to it, and a volume the two share. A file-sync tool such as [Mutagen](https://mutagen.io), or something simpler, keeps the source code inside the pod in step with your editor. The build sidecar watches those sources, recompiles the program when they change, and writes the new binary into the shared volume. scinit runs the program in the application container and owns two things: the running process, and the listening sockets clients connect to.
+A development environment built this way has four parts, and scinit has the narrowest responsibility of them. A deployment tool can set up the development pod once: an application container whose entrypoint is scinit, a build sidecar next to it, and a volume the two share. A file-sync tool such as [Mutagen](https://mutagen.io), or something simpler, can keep the source code inside the pod in step with your editor. The build sidecar can watch those sources, recompile the program when they change, and write the new binary into the shared volume. scinit runs the program in the application container and owns two things: the running process, and the listening sockets clients connect to.
 
 ```mermaid
 flowchart LR
     Dev["Your editor"] -- "file sync" --> Builder
-    subgraph Pod["Development pod, deployed once"]
+    subgraph Pod["Development pod, can stay deployed"]
         Builder["Build sidecar"] -- "new binary" --> Vol[("Shared volume")]
         subgraph App["Application container"]
             scinit["scinit (PID 1)<br/>owns the sockets"] -- "restart" --> Service["Your service"]
@@ -25,7 +25,7 @@ scinit doesn't sync files, build code or talk to Kubernetes. Its only inputs are
 
 ## One change, start to finish
 
-When you save a file, the change travels through each piece in turn. The sync tool copies it into the pod, and the build sidecar compiles a new binary into the shared volume. scinit sees the binary change, waits for the writes to settle, stops the old process the same way `docker stop` would, and starts the new build. That part is [live reload](live-reload.md), which covers what scinit watches, how the debounce works, and how a restart is sequenced.
+When you save a file, the change can travel through each piece in turn. The sync tool can copy it into the pod, and the build sidecar can compile a new binary into the shared volume. scinit then sees the binary change, waits for the writes to settle, stops the old process the same way `docker stop` would, and starts the new build. That part is [live reload](live-reload.md), which covers what scinit watches, how the debounce works, and how a restart is sequenced.
 
 ```mermaid
 sequenceDiagram
@@ -48,7 +48,7 @@ Restarting a server normally leaves a window in which nothing listens on its por
 
 ## From development to production
 
-The application container in a development pod and the one you ship differ only in their flags. In production you drop the live-reload options, and scinit is a plain container init: it forwards signals, shuts down gracefully, reaps zombies and exits with your program's status, and a crash ends the container so the orchestrator can see it. `--ports` can stay, since a program that adopts inherited sockets runs the same way with or without restarts. Keeping one entrypoint for both means the process model you develop against is the one you deploy.
+The application container in a development pod and the one you ship can differ only in their flags. In production you can drop the live-reload options, and scinit is a plain container init: it forwards signals, shuts down gracefully, reaps zombies and exits with your program's status, and a crash ends the container so the orchestrator can see it. `--ports` can stay, since a program that adopts inherited sockets runs the same way with or without restarts. Keeping one entrypoint for both means the process model you develop against is the one you deploy.
 
 ## Things to know
 
