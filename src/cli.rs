@@ -11,10 +11,10 @@ use crate::process_manager::ProcessConfig;
 use crate::program::resolve_program;
 use crate::Result;
 
-/// A live-reloading init system for managing subprocesses
+/// Command-line interface (the help text's description comes from Cargo.toml)
 #[derive(Parser)]
 #[command(name = "scinit")]
-#[command(about = "A live-reloading init system for managing subprocesses")]
+#[command(about)]
 #[command(version)]
 #[command(after_help = "\
 Environment:

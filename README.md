@@ -1,149 +1,65 @@
 # scinit
 
-A small init system for containers, written in Rust. scinit runs one child process as PID 1 and handles what an init has to: forwarding signals, shutting down gracefully, reaping zombies, and exiting with the child's status. It can also restart the child when files change (live reload), and pass it listening sockets using the systemd socket-activation protocol, so restarts don't drop connections.
+A small init system for containers, written in Rust. scinit runs as the container's PID 1, starts your program as its one child, and handles what an init has to: forwarding signals, shutting down gracefully, reaping zombies, and exiting with the child's status. It can also restart the child when files change (live reload), and pass it listening sockets using the systemd socket-activation protocol, so restarts don't drop connections.
 
-It is in the same family as [tini](https://github.com/krallin/tini) and [dumb-init](https://github.com/Yelp/dumb-init), with live reload and socket activation added for development and zero-downtime restarts.
+## Why scinit
 
-## Usage
+The first process in a container runs as PID 1, and the kernel treats PID 1 differently from every other process. A signal that PID 1 has not installed a handler for is simply dropped, so the default action that would normally terminate a process never happens. Most programs don't install a SIGTERM handler because they rely on that default, which is why a server run directly as the container's command often ignores `docker stop`: Docker waits out its 10 second timeout and then kills it with SIGKILL, skipping any cleanup.
 
-```bash
-scinit [OPTIONS] <COMMAND> [ARGS]...
-```
+PID 1 also inherits every orphaned process in the container. When a process exits, its parent has to collect its exit status with `wait()`, or it stays in the process table as a zombie. A server that spawns helpers (a shell script, a worker pool, a health check) and doesn't expect to be an init never collects the orphans that get re-parented to it, and the zombies pile up.
 
-Everything after the command is passed to the child unchanged, including arguments that look like scinit flags.
+scinit sits in front of your program and does that job. It handles the signals, forwards them to your program's process group, escalates to SIGKILL if the program doesn't exit within a timeout, reaps orphans, and exits with your program's exit code, so the orchestrator can tell a crash from a clean shutdown. That is the same job [tini](https://github.com/krallin/tini) and [dumb-init](https://github.com/Yelp/dumb-init) do. scinit adds a development loop on top: with `--live-reload` it restarts your program when its files change, and with `--ports` it binds the listening sockets itself and hands the same sockets to every restarted child, so clients wait in the socket's backlog during a restart instead of getting "connection refused".
 
-```bash
-# Run a process under scinit
-scinit my-server --config /etc/my-server.toml
+## Examples
 
-# Restart the child when files in ./config change
-scinit --live-reload --watch-path ./config my-server
-
-# Bind ports 8080 and 8081 and pass them to the child (fds 3 and 4)
-scinit --ports 8080,8081 --bind-addr 0.0.0.0 my-server
-```
-
-As a container entrypoint:
+As a container entrypoint, with your program as the command:
 
 ```dockerfile
 COPY scinit /usr/local/bin/scinit
 ENTRYPOINT ["/usr/local/bin/scinit", "--"]
-CMD ["my-server"]
+CMD ["my-server", "--config", "/etc/my-server.toml"]
 ```
 
-### Options
-
-| Option | Default | Description |
-|---|---|---|
-| `--graceful-timeout-secs <N>` | `30` | How long to wait for the child to exit after a termination signal before sending SIGKILL |
-| `--zombie-reap-interval-ms <N>` | `5000` | Interval for the periodic zombie reaper (orphans are also reaped on SIGCHLD); must be at least 1 |
-| `--live-reload` | off | Restart the child when the watched path changes |
-| `--watch-path <PATH>` | the command's executable | File or directory to watch (non-recursive). By default, a bare command name is looked up in `PATH` like exec does; scinit exits with an error if it isn't found |
-| `--debounce-ms <N>` | `500` | Wait this long after the last change before restarting |
-| `--restart-delay-ms <N>` | `1000` | Pause between the old child exiting and the new one starting |
-| `--ports <P1,P2,...>` | none | Ports to bind and pass to the child |
-| `--bind-addr <ADDR>` | `127.0.0.1` | Address to bind `--ports` on (IPv4 or IPv6) |
-| `--reuse-port` | off | Set `SO_REUSEPORT` on the `--ports` sockets, so other processes that also set it can bind the same ports |
-
-### Logging
-
-scinit writes its own messages to **stderr** only, so stdout carries nothing but the child's output (`docker run img cmd | jq` stays clean). Lines use tracing's standard format, with the level and the `scinit` module that logged them:
-
-```
-ERROR scinit: Failed to spawn process 'my-app': No such file or directory (os error 2)
- INFO scinit::process_manager: Spawning process: my-app ["--port", "8080"]
-```
-
-Lines carry no timestamp: container log drivers (Docker's `json-file`, Kubernetes' CRI log files, journald) record one per line, shown with `docker logs -t` or `kubectl logs --timestamps`. Attached runs (`docker run` without `-d`) and runs outside a container get none. Color is used only when stderr is a terminal (`NO_COLOR` turns it off).
-
-Verbosity is set with **`SCINIT_LOG`**, using [tracing's `EnvFilter` syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html). The default is `error`.
+Running a program directly. The `--` ends scinit's own options, so everything after it is the command and its arguments, passed through unchanged:
 
 ```bash
-SCINIT_LOG=info scinit my-server                        # lifecycle events: spawn, restart, signals
-SCINIT_LOG=debug scinit my-server                       # everything
-SCINIT_LOG=scinit::file_watcher=debug scinit my-server  # one module
+scinit -- my-server --config /etc/my-server.toml
 ```
 
-scinit doesn't read `RUST_LOG`: it's passed to the child unchanged, so setting it for your app doesn't make scinit verbose, and the other way around.
+Restarting the program whenever a file in `./config` changes:
 
-## Behavior
+```bash
+scinit --live-reload --watch-path ./config -- my-server
+```
 
-### Child process
+Binding port 8080 on every interface and passing it to the program as file descriptor 3, with `LISTEN_FDS=1` and `LISTEN_PID` set as systemd does:
 
-- The child runs in its own process group, with an empty signal mask, and inherits scinit's environment, working directory and stdio.
-- When there is a terminal, each child's process group (including after a live-reload restart) is made the foreground group, so it receives Ctrl-C and terminal input.
-- scinit exits when the child exits, **with the child's exit code**, or 128 + the signal number if the child was killed by a signal (e.g. 137 for SIGKILL).
-- A child that exits or crashes is never restarted; only file changes trigger restarts (with `--live-reload`). In a container, a crash should end the container.
+```bash
+scinit --ports 8080 --bind-addr 0.0.0.0 -- my-server
+```
 
-### Signals
+## Documentation
 
-| Signal | What scinit does |
-|---|---|
-| SIGTERM, SIGINT, SIGQUIT | Forwards it to the child's process group, waits up to `--graceful-timeout-secs` for the child to exit, then SIGKILLs the group. Exits with the child's status. |
-| SIGUSR1, SIGUSR2, SIGHUP | Forwards it to the child's process group and keeps running |
-| SIGCHLD | Reaps orphaned processes (the child's exit status is left to scinit's own wait) |
-| SIGTTIN, SIGTTOU | Ignored (inherited by the child), so background terminal I/O doesn't stop processes |
-| SIGFPE, SIGILL, SIGSEGV, SIGBUS, SIGABRT, ... | Never blocked: they keep their default action |
+- [Documentation index](docs/README.md), with a suggested reading order
+- [Getting started](docs/getting-started.md): build scinit, run it, put it in a container
+- [Why a container needs an init](docs/guides/why-an-init.md)
+- [Signals and shutdown](docs/guides/signals-and-shutdown.md)
+- [Exit codes](docs/guides/exit-codes.md)
+- [Zombie reaping](docs/guides/zombie-reaping.md)
+- [Process isolation](docs/guides/process-isolation.md): process groups, the terminal, file descriptors
+- [Live reload](docs/guides/live-reload.md)
+- [Socket activation](docs/guides/socket-activation.md)
+- [Logging](docs/guides/logging.md)
+- [Command-line reference](docs/reference/cli.md): every flag, environment variable and exit code
+- [Development](docs/development.md): building and testing scinit itself
 
-The handled signals are blocked on every scinit thread and consumed by one dedicated `sigwait` thread, so they are never lost or delivered to the wrong place. This also works when scinit is PID 1, where the kernel would otherwise drop signals it doesn't handle.
-
-### Zombie reaping
-
-Processes orphaned inside the container are re-parented to scinit (as PID 1) and reaped as soon as SIGCHLD arrives, with a periodic sweep (`--zombie-reap-interval-ms`) as a fallback.
-
-### Live reload
-
-With `--live-reload`, scinit watches `--watch-path` (one file, or the entries of one directory) and restarts the child when it changes:
-
-- Only content changes and renames count (editors often save by renaming over the file). Metadata-only changes, such as creating an empty file or changing permissions, don't.
-- The debounce is trailing-edge: every change restarts the `--debounce-ms` timer, and the restart happens once changes have gone quiet. A burst of saves causes one restart, and the last edit is never lost.
-- A restart sends SIGTERM to the child's group (escalating to SIGKILL after `--graceful-timeout-secs`), waits `--restart-delay-ms`, then starts a new child.
-
-### Socket activation
-
-With `--ports`, scinit binds the listening sockets itself and passes them to the child following the [systemd socket-activation protocol](https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds.html), so any server that supports `sd_listen_fds()` (or a library like `listenfd`) can use them:
-
-- The sockets are at fds **3, 4, ...** in `--ports` order.
-- The child gets no other fds besides stdio, with or without `--ports`: anything else scinit itself inherited is closed on exec, as systemd does.
-- `LISTEN_FDS` is the number of sockets, and `LISTEN_PID` is the child's own pid. Any `LISTEN_*` variables scinit itself inherited are replaced (and removed when there is no `--ports`), so the child never sees stale ones.
-- Each port is bound **once** and the same sockets are passed to every child. During a live-reload restart, connections wait in the socket's backlog and the new child serves them, so restarts don't drop or refuse connections.
-- Sockets are bound with `SO_REUSEADDR`, so a restarted scinit (e.g. after a container restart) can bind its ports again right away, even while connections it served are in TIME_WAIT. On Linux, a port another process is listening on still fails with "Address already in use". On macOS (BSD socket semantics), binding a specific address such as the default `127.0.0.1` succeeds even if another process listens on the wildcard address (`0.0.0.0`) for that port, and loopback connections then go to scinit's child; the same exact address still fails.
-- `SO_REUSEPORT` is only set with `--reuse-port`. Live-reload restarts don't need it; it is for sharing ports with other processes on purpose, such as handing over between two scinit instances or load balancing across several.
-
-## Platforms
-
-scinit targets Linux containers. macOS is supported for development, and the test suite runs on both. Behavior specific to PID 1 (orphan re-parenting, the kernel dropping unhandled signals) only applies on Linux.
+Known issues and planned work are tracked in [GitHub issues](https://github.com/divoxx/scinit/issues).
 
 ## Building
 
-```bash
-cargo build --release   # target/release/scinit
-```
+scinit has no prebuilt binaries yet. Build it with `cargo build --release`, which produces `target/release/scinit`. Running the test suite and the Linux container runner are covered in [docs/development.md](docs/development.md).
 
-## Testing
-
-The integration suite drives the real `scinit` binary with a purpose-built child process, and asserts on what the child actually experienced (signals, environment, fds, sockets) plus scinit's own exit status.
-
-```bash
-# Run all tests (unit + integration)
-cargo test
-
-# Run the integration suite, or one scenario module
-cargo test --test integration_test
-cargo test --test integration_test signals::
-
-# Run the suite on Linux in rootless podman, including scinit-as-PID-1 tests
-scripts/test-linux.sh
-scripts/test-linux.sh --test integration_test sockets::   # args go to cargo test
-```
-
-- **Fixture child** (`tests/fixtures/test_child.rs`, built as `scinit-test-child`): runs as scinit's child and appends what it observes (`started`, `signal`, `env`, `fds`, `exit`, ...) to the file named by `$SCINIT_TEST_REPORT`. Subcommands: `run`, `exit <code>`, `kill-self <SIG>`, `dump`, `listen`, `spawn-orphan`.
-- **Harness** (`tests/integration/harness.rs`): spawns scinit with the fixture, captures its output, polls the report instead of sleeping, and cleans up every process group on drop.
-- **Scenarios** (`tests/integration/scenarios/`): `cli`, `exit_codes`, `signals`, `sockets`, `live_reload`, and the Linux-only `linux` (`/proc` signal masks, scinit as PID 1 in a new PID namespace).
-- **Linux runner** (`scripts/test-linux.sh`, `tests/container/Containerfile`): builds a test image and runs `cargo test` in rootless podman, with the permissions the PID-1 tests need. Requires podman.
-- **CI** (`.github/workflows/ci.yml`): runs `cargo clippy --all-targets -- -D warnings` on macOS and Linux, `cargo test` on macOS and `scripts/test-linux.sh` on Linux for every pull request and push to `main`.
-
-Known issues and open design decisions are tracked in [KNOWN-ISSUES.md](KNOWN-ISSUES.md). Tests for a known bug are marked `#[ignore = "bug: <anchor> (KNOWN-ISSUES.md)"]` and can be run with `cargo test -- --ignored`.
+scinit targets Linux containers. macOS is supported for development, and the test suite runs on both; the behavior that is specific to PID 1 only applies on Linux.
 
 ## License
 
