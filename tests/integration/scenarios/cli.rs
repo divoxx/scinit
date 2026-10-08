@@ -2,7 +2,6 @@
 
 use crate::integration::harness::{Scinit, SCINIT, TEST_CHILD, TIMEOUT};
 use std::process::{Command, Output};
-use std::time::Duration;
 
 /// Run scinit directly (no child expected) and capture its output
 fn scinit_output(args: &[&str]) -> Output {
@@ -24,7 +23,7 @@ fn help_exits_zero() {
         stdout
     );
     assert!(
-        stdout.contains("--live-reload"),
+        stdout.contains("--watch-sentinel"),
         "help output missing flags:\n{}",
         stdout
     );
@@ -176,7 +175,7 @@ fn trailing_and_hyphenated_args_reach_child() {
         "--foo=bar",
         "a b",
         "--",
-        "--live-reload",
+        "--watch",
     ];
     let (scinit, status) = Scinit::builder().child(child_args).run(TIMEOUT).unwrap();
     assert!(status.success(), "{:?}\n{}", status, scinit.diagnostics());
@@ -192,18 +191,46 @@ fn trailing_and_hyphenated_args_reach_child() {
     assert_eq!(argv, expected, "{}", scinit.diagnostics());
 }
 
-/// `--watch-path` is ignored unless `--live-reload` is set: even a nonexistent
-/// path doesn't stop the child from starting and scinit keeps running
+/// The live-reload options are usage errors (exit 2) without `--watch`, and
+/// the child never starts
 #[test]
-fn watch_path_without_live_reload_is_ignored() {
-    let builder = Scinit::builder();
-    let missing = builder.dir().join("does-not-exist");
-    let (mut scinit, _) = builder
-        .args(["--watch-path".into(), missing.into_os_string()])
-        .child(["run"])
-        .start();
-    scinit.assert_running_for(Duration::from_millis(1000));
-    scinit.assert_start_count(1, "--watch-path alone must not restart the child");
+fn watch_options_without_watch_exit_two() {
+    for args in [
+        &["--watch-sentinel"][..],
+        &["--watch-extra", "config"],
+        &["--debounce-ms", "100"],
+        &["--restart-delay-ms", "100"],
+    ] {
+        let (scinit, status) = Scinit::builder()
+            .args(args)
+            .child(["exit", "0"])
+            .run(TIMEOUT)
+            .unwrap();
+        scinit.assert_exit_code(status, 2);
+        scinit.assert_start_count(0, "child must not start after a usage error");
+        let stderr = scinit.stderr();
+        assert!(
+            stderr.contains(args[0]) && stderr.contains("--watch\n"),
+            "{:?}: expected an error naming {} and --watch\n{}",
+            args,
+            args[0],
+            scinit.diagnostics()
+        );
+    }
+}
+
+/// The removed `--live-reload` and `--watch-path` are usage errors
+#[test]
+fn removed_live_reload_options_exit_two() {
+    for args in [&["--live-reload"][..], &["--watch-path", "config"]] {
+        let (scinit, status) = Scinit::builder()
+            .args(args)
+            .child(["exit", "0"])
+            .run(TIMEOUT)
+            .unwrap();
+        scinit.assert_exit_code(status, 2);
+        scinit.assert_start_count(0, "child must not start after a usage error");
+    }
 }
 
 /// A command that cannot be executed makes scinit exit 1
@@ -359,14 +386,14 @@ fn double_dash_before_the_command_is_consumed_once() {
 #[test]
 fn misspelled_option_exits_two() {
     let (scinit, status) = Scinit::builder()
-        .args(["--live-relaod"])
+        .args(["--wacth"])
         .child(["exit", "0"])
         .run(TIMEOUT)
         .unwrap();
     scinit.assert_exit_code(status, 2);
     scinit.assert_start_count(0, "child must not start after a usage error");
     assert!(
-        scinit.stderr().contains("--live-relaod"),
+        scinit.stderr().contains("--wacth"),
         "{}",
         scinit.diagnostics()
     );

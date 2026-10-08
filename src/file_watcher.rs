@@ -1,5 +1,7 @@
 use crate::Result;
+use eyre::eyre;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -18,8 +20,11 @@ pub enum FileChangeEvent {
 /// Configuration for file watching behavior
 #[derive(Debug, Clone)]
 pub struct FileWatchConfig {
-    /// Path to watch for changes
-    pub watch_path: PathBuf,
+    /// Paths to watch for content changes (files or directories)
+    pub watch_paths: Vec<PathBuf>,
+    /// Sentinel file to watch: its creation and any change to it, including
+    /// a metadata-only one (`touch`), count. It need not exist yet.
+    pub sentinel: Option<PathBuf>,
     /// Debounce time for file changes (prevents excessive restarts)
     pub debounce: Duration,
 }
@@ -32,6 +37,8 @@ struct WatchTarget {
     dir: PathBuf,
     /// For a single file, its name: only events for this entry of `dir` count
     file_name: Option<OsString>,
+    /// Whether this is the sentinel file (see [`FileWatcher::is_sentinel_change`])
+    sentinel: bool,
 }
 
 impl WatchTarget {
@@ -44,6 +51,7 @@ impl WatchTarget {
             return Ok(WatchTarget {
                 dir: path.to_path_buf(),
                 file_name: None,
+                sentinel: false,
             });
         }
         let file = path.canonicalize()?;
@@ -51,12 +59,32 @@ impl WatchTarget {
             (Some(dir), Some(name)) => Ok(WatchTarget {
                 dir: dir.to_path_buf(),
                 file_name: Some(name.to_os_string()),
+                sentinel: false,
             }),
             _ => Ok(WatchTarget {
                 dir: file,
                 file_name: None,
+                sentinel: false,
             }),
         }
+    }
+
+    /// The target for the sentinel file `path`, which need not exist: its
+    /// parent directory is watched for entries with its name, so its
+    /// creation is seen too
+    fn sentinel(path: &Path) -> Result<Self> {
+        let name = path
+            .file_name()
+            .ok_or_else(|| eyre!("invalid sentinel path {:?}", path))?;
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        Ok(WatchTarget {
+            dir: dir.canonicalize()?,
+            file_name: Some(name.to_os_string()),
+            sentinel: true,
+        })
     }
 
     /// Whether an event for `path` concerns the watched file or directory.
@@ -76,16 +104,17 @@ impl WatchTarget {
 /// written or compiled. A single file is watched through its parent directory
 /// (see [`WatchTarget::new`]).
 pub struct FileWatcher {
-    /// The underlying notify watcher; dropping it stops watching
+    /// The underlying notify watcher (one watch per directory); dropping it
+    /// stops watching
     _watcher: RecommendedWatcher,
     /// Channel receiver for file change events
     event_rx: mpsc::UnboundedReceiver<FileChangeEvent>,
 }
 
 impl FileWatcher {
-    /// Starts watching `config.watch_path` (non-recursively, and a single
-    /// file through its parent directory), with a background task that
-    /// debounces the changes into events
+    /// Starts watching `config.watch_paths` and the sentinel
+    /// (non-recursively, and a single file through its parent directory),
+    /// with a background task that debounces the changes into events
     pub fn start(config: FileWatchConfig) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (tx, rx) = mpsc::channel(100);
@@ -100,22 +129,32 @@ impl FileWatcher {
             notify::Config::default(),
         )?;
 
-        // Start watching the configured path
-        let watch_path = config.watch_path;
-        let target = WatchTarget::new(&watch_path)?;
-        watcher.watch(&target.dir, RecursiveMode::NonRecursive)?;
-        info!("Started watching path: {:?}", watch_path);
-        if let Some(name) = &target.file_name {
-            debug!("Watching {:?} through directory {:?}", name, target.dir);
+        // Start watching the configured paths. Targets in the same directory
+        // (e.g. the sentinel and an extra file next to it) share one watch.
+        let mut targets = Vec::new();
+        for watch_path in &config.watch_paths {
+            targets.push(WatchTarget::new(watch_path)?);
+        }
+        if let Some(sentinel) = &config.sentinel {
+            targets.push(WatchTarget::sentinel(sentinel)?);
+        }
+        let mut watched_dirs = HashSet::new();
+        for target in &targets {
+            if watched_dirs.insert(&target.dir) {
+                watcher.watch(&target.dir, RecursiveMode::NonRecursive)?;
+            }
+            if let Some(name) = &target.file_name {
+                debug!("Watching {:?} through directory {:?}", name, target.dir);
+            }
+        }
+        for watch_path in &config.watch_paths {
+            info!("Started watching path: {:?}", watch_path);
+        }
+        if let Some(sentinel) = &config.sentinel {
+            info!("Started watching sentinel: {:?}", sentinel);
         }
 
-        tokio::spawn(debounce_events(
-            rx,
-            event_tx,
-            watch_path,
-            target,
-            config.debounce,
-        ));
+        tokio::spawn(debounce_events(rx, event_tx, targets, config.debounce));
 
         Ok(FileWatcher {
             _watcher: watcher,
@@ -147,6 +186,10 @@ impl FileWatcher {
     fn is_relevant_change(event: &notify::Event, target: &WatchTarget) -> bool {
         use notify::event::ModifyKind;
 
+        if target.sentinel {
+            return Self::is_sentinel_change(event, target);
+        }
+
         // Content changes and renames (editors save by renaming over the file)
         // count; metadata-only changes (permissions, timestamps, xattrs, e.g.
         // from creating an empty file) don't
@@ -165,6 +208,20 @@ impl FileWatcher {
                 .iter()
                 .any(|path| target.matches(path) && path.is_file())
     }
+
+    /// Whether a file system event for the sentinel should trigger a
+    /// restart: its creation and any change, including a metadata-only one
+    /// (the builder `touch`es it), but not its removal. The sentinel is the
+    /// only watched file whose metadata-only changes count.
+    fn is_sentinel_change(event: &notify::Event, target: &WatchTarget) -> bool {
+        matches!(
+            event.kind,
+            notify::EventKind::Create(_) | notify::EventKind::Modify(_)
+        ) && event
+            .paths
+            .iter()
+            .any(|path| target.matches(path) && path.is_file())
+    }
 }
 
 /// Turns raw notify events into debounced [`FileChangeEvent`]s.
@@ -175,8 +232,7 @@ impl FileWatcher {
 async fn debounce_events(
     mut rx: mpsc::Receiver<notify::Result<notify::Event>>,
     event_tx: mpsc::UnboundedSender<FileChangeEvent>,
-    watch_path: PathBuf,
-    target: WatchTarget,
+    targets: Vec<WatchTarget>,
     debounce: Duration,
 ) {
     let mut pending: Option<PathBuf> = None;
@@ -190,11 +246,14 @@ async fn debounce_events(
                 match res {
                     Ok(event) => {
                         debug!("File system event: {:?}", event);
-                        if FileWatcher::is_relevant_change(&event, &target) {
+                        if let Some(target) = targets
+                            .iter()
+                            .find(|target| FileWatcher::is_relevant_change(&event, target))
+                        {
                             if pending.is_some() {
                                 debug!("Debouncing file change");
                             }
-                            pending = Some(changed_path(&event, &target, &watch_path));
+                            pending = Some(changed_path(&event, target));
                             deadline.as_mut().reset(tokio::time::Instant::now() + debounce);
                         }
                     }
@@ -217,14 +276,14 @@ async fn debounce_events(
     }
 }
 
-/// The event's first path that `target` matches (or `fallback`),
-/// canonicalized when possible
-fn changed_path(event: &notify::Event, target: &WatchTarget, fallback: &Path) -> PathBuf {
+/// The event's first path that `target` matches (or the target's
+/// directory), canonicalized when possible
+fn changed_path(event: &notify::Event, target: &WatchTarget) -> PathBuf {
     let path = event
         .paths
         .iter()
         .find(|path| target.matches(path))
-        .map_or(fallback, PathBuf::as_path);
+        .map_or(target.dir.as_path(), PathBuf::as_path);
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -238,7 +297,8 @@ mod tests {
     async fn test_file_watcher_start() {
         let temp_dir = tempdir().unwrap();
         let config = FileWatchConfig {
-            watch_path: temp_dir.path().to_path_buf(),
+            watch_paths: vec![temp_dir.path().to_path_buf()],
+            sentinel: None,
             debounce: Duration::from_millis(100),
         };
 
@@ -249,7 +309,8 @@ mod tests {
     async fn test_file_change_detection() {
         let temp_dir = tempdir().unwrap();
         let config = FileWatchConfig {
-            watch_path: temp_dir.path().to_path_buf(),
+            watch_paths: vec![temp_dir.path().to_path_buf()],
+            sentinel: None,
             debounce: Duration::from_millis(100),
         };
 
@@ -279,7 +340,8 @@ mod tests {
     async fn test_debouncing() {
         let temp_dir = tempdir().unwrap();
         let config = FileWatchConfig {
-            watch_path: temp_dir.path().to_path_buf(),
+            watch_paths: vec![temp_dir.path().to_path_buf()],
+            sentinel: None,
             debounce: Duration::from_millis(500),
         };
 
@@ -437,10 +499,7 @@ mod tests {
             vec![sibling.clone(), file.clone()],
         );
         assert!(FileWatcher::is_relevant_change(&both, &target));
-        assert_eq!(
-            changed_path(&both, &target, &file),
-            file.canonicalize().unwrap()
-        );
+        assert_eq!(changed_path(&both, &target), file.canonicalize().unwrap());
     }
 
     /// Discard events until none arrives for a while: FSEvents (macOS) can
@@ -467,7 +526,8 @@ mod tests {
         let file = temp_dir.path().join("app");
         fs::write(&file, "v0").unwrap();
         let mut watcher = FileWatcher::start(FileWatchConfig {
-            watch_path: file.clone(),
+            watch_paths: vec![file.clone()],
+            sentinel: None,
             debounce: Duration::from_millis(100),
         })
         .unwrap();
@@ -494,7 +554,8 @@ mod tests {
         let file = temp_dir.path().join("app");
         fs::write(&file, "v0").unwrap();
         let mut watcher = FileWatcher::start(FileWatchConfig {
-            watch_path: file.clone(),
+            watch_paths: vec![file.clone()],
+            sentinel: None,
             debounce: Duration::from_millis(100),
         })
         .unwrap();
@@ -524,7 +585,8 @@ mod tests {
         fs::write(&file, "v0").unwrap();
         fs::write(&sibling, "v0").unwrap();
         let mut watcher = FileWatcher::start(FileWatchConfig {
-            watch_path: file,
+            watch_paths: vec![file],
+            sentinel: None,
             debounce: Duration::from_millis(100),
         })
         .unwrap();
@@ -536,5 +598,135 @@ mod tests {
             .await
             .unwrap();
         assert!(event.is_none(), "expected no event, got {:?}", event);
+    }
+
+    #[test]
+    fn test_sentinel_is_watched_through_parent_before_it_exists() {
+        let temp_dir = tempdir().unwrap();
+        let dir = temp_dir.path().canonicalize().unwrap();
+        let sentinel = dir.join("app.scinit");
+
+        let target = WatchTarget::sentinel(&sentinel).unwrap();
+        assert_eq!(target.dir, dir);
+        assert_eq!(target.file_name.as_deref(), Some("app.scinit".as_ref()));
+        assert!(target.sentinel);
+    }
+
+    #[test]
+    fn test_sentinel_creation_and_metadata_changes_are_relevant() {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, MetadataKind, ModifyKind, RemoveKind,
+        };
+        use notify::EventKind;
+
+        let temp_dir = tempdir().unwrap();
+        let sentinel = temp_dir.path().join("app.scinit");
+        let other = temp_dir.path().join("app");
+        fs::write(&sentinel, "").unwrap();
+        fs::write(&other, "v1").unwrap();
+        let target = WatchTarget::sentinel(&sentinel).unwrap();
+        let relevant = |kind, path: &Path| {
+            let event = notify::Event {
+                kind,
+                paths: vec![path.to_path_buf()],
+                attrs: notify::event::EventAttributes::default(),
+            };
+            FileWatcher::is_relevant_change(&event, &target)
+        };
+
+        assert!(relevant(EventKind::Create(CreateKind::File), &sentinel));
+        // `touch` on an existing sentinel
+        assert!(relevant(
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            &sentinel
+        ));
+        assert!(!relevant(
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            &sentinel
+        ));
+        // Other files in the directory, the executable included, don't count
+        assert!(!relevant(EventKind::Create(CreateKind::File), &other));
+        // Nor does removing the sentinel
+        fs::remove_file(&sentinel).unwrap();
+        assert!(!relevant(EventKind::Remove(RemoveKind::File), &sentinel));
+    }
+
+    #[tokio::test]
+    async fn test_sentinel_creation_and_touch_trigger() {
+        let temp_dir = tempdir().unwrap();
+        let sentinel = temp_dir.path().join("app.scinit");
+        let mut watcher = FileWatcher::start(FileWatchConfig {
+            watch_paths: vec![],
+            sentinel: Some(sentinel.clone()),
+            debounce: Duration::from_millis(100),
+        })
+        .unwrap();
+        settle(&mut watcher).await;
+
+        fs::File::create(&sentinel).unwrap();
+        let event = watcher
+            .wait_for_event(Duration::from_millis(2000))
+            .await
+            .unwrap();
+        assert!(
+            matches!(event, Some(FileChangeEvent::FileChanged(_))),
+            "creation: expected FileChanged, got {:?}",
+            event
+        );
+        settle(&mut watcher).await;
+
+        // A metadata-only change, as `touch` makes
+        let mtime = std::time::SystemTime::now() + Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&sentinel)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let event = watcher
+            .wait_for_event(Duration::from_millis(2000))
+            .await
+            .unwrap();
+        assert!(
+            matches!(event, Some(FileChangeEvent::FileChanged(_))),
+            "touch: expected FileChanged, got {:?}",
+            event
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extra_path_and_sentinel_share_a_directory() {
+        let temp_dir = tempdir().unwrap();
+        let config = temp_dir.path().join("app.conf");
+        let exe = temp_dir.path().join("app");
+        fs::write(&config, "v0").unwrap();
+        fs::write(&exe, "v0").unwrap();
+        let mut watcher = FileWatcher::start(FileWatchConfig {
+            watch_paths: vec![config.clone()],
+            sentinel: Some(temp_dir.path().join("app.scinit")),
+            debounce: Duration::from_millis(100),
+        })
+        .unwrap();
+        settle(&mut watcher).await;
+
+        // The executable next to the sentinel isn't watched
+        fs::write(&exe, "v1").unwrap();
+        let event = watcher
+            .wait_for_event(Duration::from_millis(1000))
+            .await
+            .unwrap();
+        assert!(event.is_none(), "expected no event, got {:?}", event);
+
+        fs::write(&config, "v1").unwrap();
+        let event = watcher
+            .wait_for_event(Duration::from_millis(2000))
+            .await
+            .unwrap();
+        match event {
+            Some(FileChangeEvent::FileChanged(path)) => {
+                assert_eq!(path, config.canonicalize().unwrap())
+            }
+            other => panic!("expected FileChanged, got {:?}", other),
+        }
     }
 }

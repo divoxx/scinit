@@ -1,10 +1,13 @@
 //! Live-reload: file changes restart the child; nothing else does.
 //!
-//! Watching is non-recursive on a single `--watch-path` (file or directory).
-//! A file is watched through its parent directory, so it can be replaced by
-//! rename or deleted and recreated.
+//! `--watch` watches the command's executable, or with `--watch-sentinel`
+//! `<executable>.scinit` instead; `--watch-extra` adds files or directories.
+//! Watching is non-recursive. A file is watched through its parent
+//! directory, so it can be replaced by rename or deleted and recreated.
 //! Only content changes and renames of regular files count, not
-//! metadata-only changes. Debouncing is trailing-edge: the restart fires once
+//! metadata-only changes, except for the sentinel, whose creation and
+//! `touch` count too. Most tests watch a directory or file with
+//! `--watch-extra` (the harness's `watch`). Debouncing is trailing-edge: the restart fires once
 //! changes have been quiet for `--debounce-ms`. A restart is SIGTERM to the
 //! child's group, a `--restart-delay-ms` pause, then a fresh spawn that gets
 //! the same listening sockets.
@@ -185,35 +188,133 @@ fn watch_single_file_ignores_other_files_in_its_directory() {
     assert_no_restart(&mut scinit, "changing another file in the directory");
 }
 
-/// The default watch path, the executable, replaced by rename twice (as a
-/// build copying in a fresh binary does) restarts the child twice, running
-/// the new binary each time
-#[test]
-fn default_watch_path_survives_executable_replaced_by_rename() {
-    let b = Scinit::builder();
-    let exe = watched_dir(&b).join("app");
+/// A copy of the fixture child in its own watched directory, so tests can
+/// replace the executable that `--watch` watches
+fn watched_executable(builder: &ScinitBuilder) -> PathBuf {
+    let exe = watched_dir(builder).join("app");
     std::fs::copy(TEST_CHILD, &exe).unwrap();
+    exe
+}
+
+/// `--watch` (plus `extra`) with short delays, running `exe run`
+fn watch_executable(builder: ScinitBuilder, exe: &Path, extra: &[&str]) -> ScinitBuilder {
     let_setup_writes_age();
-    let (mut scinit, _) = start_and_settle(
-        b.args(["--live-reload", "--debounce-ms", "200"])
-            .args([
-                "--restart-delay-ms",
-                "100",
-                "--zombie-reap-interval-ms",
-                "100",
-            ])
-            .command([exe.as_os_str(), "run".as_ref()]),
-    );
+    builder
+        .args(["--watch", "--debounce-ms", "200"])
+        .args([
+            "--restart-delay-ms",
+            "100",
+            "--zombie-reap-interval-ms",
+            "100",
+        ])
+        .args(extra)
+        .command([exe.as_os_str(), "run".as_ref()])
+}
+
+/// Replace the executable with a fresh copy of the fixture, by rename
+fn replace_executable(exe: &Path) {
+    replace_by_rename(exe, |tmp| {
+        std::fs::copy(TEST_CHILD, tmp).unwrap();
+    });
+}
+
+/// Change only `path`'s modification time, as `touch` on an existing file does
+fn touch(path: &Path) {
+    let mtime = std::time::SystemTime::now() + Duration::from_secs(60);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+}
+
+/// The executable `--watch` watches, replaced by rename twice (as a build
+/// copying in a fresh binary does), restarts the child twice, running the
+/// new binary each time
+#[test]
+fn watch_survives_executable_replaced_by_rename() {
+    let b = Scinit::builder();
+    let exe = watched_executable(&b);
+    let (mut scinit, _) = start_and_settle(watch_executable(b, &exe, &[]));
 
     for n in 2..=3 {
-        replace_by_rename(&exe, |tmp| {
-            std::fs::copy(TEST_CHILD, tmp).unwrap();
-        });
+        replace_executable(&exe);
         scinit.wait_for_nth("started", n, TIMEOUT).unwrap();
         std::thread::sleep(SETTLE);
     }
     scinit.assert_running_for(QUIET);
     scinit.assert_start_count(3, "two replacements must restart the child twice");
+}
+
+/// With `--watch-sentinel`, replacing the executable doesn't restart the
+/// child; creating `<executable>.scinit`, which needn't exist at startup,
+/// does
+#[test]
+fn watch_sentinel_creation_restarts_but_executable_does_not() {
+    let b = Scinit::builder();
+    let exe = watched_executable(&b);
+    let sentinel = exe.with_file_name("app.scinit");
+    let (mut scinit, _) = start_and_settle(watch_executable(b, &exe, &["--watch-sentinel"]));
+
+    replace_executable(&exe);
+    assert_no_restart(&mut scinit, "replacing the executable with a sentinel");
+
+    std::fs::File::create(&sentinel).unwrap();
+    scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
+}
+
+/// Touching an existing sentinel (a metadata-only change) restarts the child,
+/// and two touches within the debounce window restart it once
+#[test]
+fn watch_sentinel_touch_restarts_once_per_debounce() {
+    let b = Scinit::builder();
+    let exe = watched_executable(&b);
+    let sentinel = exe.with_file_name("app.scinit");
+    std::fs::File::create(&sentinel).unwrap();
+    let (mut scinit, _) = start_and_settle(watch_executable(b, &exe, &["--watch-sentinel"]));
+
+    touch(&sentinel);
+    std::thread::sleep(Duration::from_millis(50));
+    touch(&sentinel);
+    scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
+    scinit.assert_running_for(QUIET);
+    scinit.assert_start_count(2, "two quick touches must restart the child once");
+
+    touch(&sentinel);
+    scinit.wait_for_nth("started", 3, TIMEOUT).unwrap();
+}
+
+/// A `--watch-extra` file and directory each restart the child on their own,
+/// with or without `--watch-sentinel`
+#[test]
+fn watch_extra_file_and_directory_restart_child() {
+    for sentinel in [false, true] {
+        let b = Scinit::builder();
+        let exe = watched_executable(&b);
+        let config = b.dir().join("config");
+        let dir = b.dir().join("templates");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        let file = config.join("app.conf");
+        let template = dir.join("index.html");
+        modify(&file, "v0");
+        modify(&template, "v0");
+        let mut extra = vec!["--watch-extra", file.to_str().unwrap()];
+        extra.extend(["--watch-extra", dir.to_str().unwrap()]);
+        if sentinel {
+            extra.push("--watch-sentinel");
+        }
+        let (scinit, _) = start_and_settle(watch_executable(b, &exe, &extra));
+
+        modify(&file, "v1");
+        scinit.wait_for_nth("started", 2, TIMEOUT).unwrap();
+        std::thread::sleep(SETTLE);
+        modify(&template, "v1");
+        scinit
+            .wait_for_nth("started", 3, TIMEOUT)
+            .unwrap_or_else(|e| panic!("sentinel={}: the directory change: {}", sentinel, e));
+    }
 }
 
 /// The new child starts no sooner than `--restart-delay-ms` after the old one exits
@@ -584,7 +685,7 @@ fn restart_is_prompt_with_default_reap_interval() {
     );
 }
 
-/// A `--watch-path` that does not exist is a startup error
+/// A `--watch-extra` path that does not exist is a startup error
 #[test]
 fn nonexistent_watch_path_exits_1() {
     let b = Scinit::builder();
@@ -598,12 +699,12 @@ fn nonexistent_watch_path_exits_1() {
     scinit.assert_start_count(0, "no child should start when the watch fails");
 }
 
-/// Without `--watch-path`, the watch path defaults to the command string. An
-/// absolute command path is therefore watchable and scinit runs normally.
+/// `--watch` watches the command. An absolute command path is used as is,
+/// and scinit runs normally.
 #[test]
-fn default_watch_path_is_absolute_command() {
+fn watch_absolute_command() {
     let (mut scinit, _) = Scinit::builder()
-        .args(["--live-reload", "--zombie-reap-interval-ms", "100"])
+        .args(["--watch", "--zombie-reap-interval-ms", "100"])
         .child(["run"])
         .start();
 
@@ -611,37 +712,48 @@ fn default_watch_path_is_absolute_command() {
     scinit.assert_start_count(1, "the child must keep running");
 }
 
-/// Without `--watch-path`, a bare command name is looked up in PATH, like
-/// exec does, and the executable found there is watched.
+/// With `--watch`, a bare command name is looked up in PATH, like exec
+/// does, and the executable found there is watched; with `--watch-sentinel`,
+/// the sentinel next to it is watched instead
 #[test]
-fn default_watch_path_bare_command_is_resolved_via_path() {
+fn watch_bare_command_is_resolved_via_path() {
     let path = path_with(Path::new(TEST_CHILD).parent().unwrap());
-    let (mut scinit, _) = Scinit::builder()
-        .env("PATH", path.to_str().unwrap())
-        // SCINIT_LOG once scinit stops reading RUST_LOG (#2); both until then
-        .env("SCINIT_LOG", "info")
-        .env("RUST_LOG", "info")
-        .args(["--live-reload", "--zombie-reap-interval-ms", "100"])
-        .command(["scinit-test-child", "run"])
-        .start();
+    let sentinel = format!("{}.scinit", TEST_CHILD);
+    for (flags, watched) in [
+        (
+            &["--watch"][..],
+            format!("Started watching path: {:?}", TEST_CHILD),
+        ),
+        (
+            &["--watch", "--watch-sentinel"],
+            format!("Started watching sentinel: {:?}", sentinel),
+        ),
+    ] {
+        let (mut scinit, _) = Scinit::builder()
+            .env("PATH", path.to_str().unwrap())
+            .env("SCINIT_LOG", "info")
+            .args(flags)
+            .args(["--zombie-reap-interval-ms", "100"])
+            .command(["scinit-test-child", "run"])
+            .start();
 
-    scinit.assert_running_for(Duration::from_secs(1));
-    scinit.assert_start_count(1, "the child must keep running");
-    let watched = format!("Started watching path: {:?}", Path::new(TEST_CHILD));
-    assert!(
-        scinit.stdout().contains(&watched) || scinit.stderr().contains(&watched),
-        "expected log line {:?}\n{}",
-        watched,
-        scinit.diagnostics()
-    );
+        scinit.assert_running_for(Duration::from_secs(1));
+        scinit.assert_start_count(1, "the child must keep running");
+        assert!(
+            scinit.stderr().contains(&watched),
+            "expected log line {:?}\n{}",
+            watched,
+            scinit.diagnostics()
+        );
+    }
 }
 
 /// A bare command that isn't in PATH can't be watched: scinit fails at
-/// startup with exit 1, naming the command and pointing at `--watch-path`.
+/// startup with exit 1, naming the command and `--watch`.
 #[test]
-fn default_watch_path_unresolvable_command_exits_1() {
+fn watch_unresolvable_command_exits_1() {
     let (scinit, status) = Scinit::builder()
-        .args(["--live-reload"])
+        .args(["--watch"])
         .command(["scinit-definitely-not-a-command"])
         .run(TIMEOUT)
         .unwrap();
@@ -650,8 +762,8 @@ fn default_watch_path_unresolvable_command_exits_1() {
     scinit.assert_start_count(0, "nothing can be spawned");
     let stderr = scinit.stderr();
     assert!(
-        stderr.contains("scinit-definitely-not-a-command") && stderr.contains("--watch-path"),
-        "expected an error naming the command and --watch-path\n{}",
+        stderr.contains("scinit-definitely-not-a-command") && stderr.contains("--watch:"),
+        "expected an error naming the command and --watch\n{}",
         scinit.diagnostics()
     );
 }

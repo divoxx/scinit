@@ -171,10 +171,11 @@ impl ScinitBuilder {
         self.args(["--ports", &list])
     }
 
-    /// `--live-reload --watch-path <path>`. Call `let_setup_writes_age` first
-    /// if the test just wrote files there.
+    /// `--watch --watch-extra <path>`. `--watch` also watches the command's
+    /// executable, which tests that use this never change. Call
+    /// `let_setup_writes_age` first if the test just wrote files there.
     pub fn watch(self, path: &Path) -> Self {
-        self.args(["--live-reload", "--watch-path"]).args([path])
+        self.args(["--watch", "--watch-extra"]).args([path])
     }
 
     /// Run the test-child fixture with the given subcommand and args

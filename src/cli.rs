@@ -1,7 +1,7 @@
 use clap::Parser;
 use eyre::eyre;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::environment::Environment;
@@ -32,13 +32,17 @@ Environment:
               scinit does not read RUST_LOG; it reaches the child
               unchanged.")]
 pub struct Cli {
-    /// Enable live-reload functionality
+    /// Restart the child when its executable (looked up in PATH like exec does) changes
     #[arg(long)]
-    pub live_reload: bool,
+    pub watch: bool,
 
-    /// Path to watch for changes (default: the command's executable, looked up in PATH like exec does)
-    #[arg(long)]
-    pub watch_path: Option<PathBuf>,
+    /// With --watch, restart when <executable>.scinit next to the executable is created or touched, instead of when the executable changes
+    #[arg(long, requires = "watch")]
+    pub watch_sentinel: bool,
+
+    /// With --watch, also restart when this file or directory (not recursive) changes; can be repeated
+    #[arg(long, requires = "watch", value_name = "PATH")]
+    pub watch_extra: Vec<PathBuf>,
 
     /// Comma-separated list of ports to bind
     #[arg(long, value_delimiter = ',')]
@@ -52,12 +56,12 @@ pub struct Cli {
     #[arg(long)]
     pub reuse_port: bool,
 
-    /// Debounce time for file changes (ms)
-    #[arg(long, default_value = "500")]
+    /// With --watch, debounce time for file changes (ms)
+    #[arg(long, default_value = "500", requires = "watch")]
     pub debounce_ms: u64,
 
-    /// Delay before restart after graceful shutdown (ms)
-    #[arg(long, default_value = "1000")]
+    /// With --watch, delay before restart after graceful shutdown (ms)
+    #[arg(long, default_value = "1000", requires = "watch")]
     pub restart_delay_ms: u64,
 
     /// Graceful shutdown timeout (seconds)
@@ -92,7 +96,11 @@ pub struct Config {
 
 #[derive(Debug, Clone)]
 pub struct LiveReloadConfig {
-    pub watch_path: PathBuf,
+    /// Paths whose content changes restart the child: the executable (unless
+    /// `--watch-sentinel` is set) and the `--watch-extra` paths
+    pub watch_paths: Vec<PathBuf>,
+    /// `<executable>.scinit` with `--watch-sentinel`
+    pub sentinel: Option<PathBuf>,
     pub debounce: Duration,
     pub restart_delay: Duration,
 }
@@ -110,13 +118,19 @@ impl Config {
             .parse()
             .map_err(|e| eyre!("Invalid bind address '{}': {}", cli.bind_addr, e))?;
 
-        let live_reload = if cli.live_reload {
-            let watch_path = match cli.watch_path {
-                Some(path) => path,
-                None => default_watch_path(&program)?,
+        let live_reload = if cli.watch {
+            let executable = watched_executable(&program)?;
+            let mut watch_paths = Vec::new();
+            let sentinel = if cli.watch_sentinel {
+                Some(sentinel_path(&executable))
+            } else {
+                watch_paths.push(executable);
+                None
             };
+            watch_paths.extend(cli.watch_extra);
             Some(LiveReloadConfig {
-                watch_path,
+                watch_paths,
+                sentinel,
                 debounce: Duration::from_millis(cli.debounce_ms),
                 restart_delay: Duration::from_millis(cli.restart_delay_ms),
             })
@@ -158,18 +172,85 @@ impl Config {
         self.live_reload
             .as_ref()
             .map(|live_reload| FileWatchConfig {
-                watch_path: live_reload.watch_path.clone(),
+                watch_paths: live_reload.watch_paths.clone(),
+                sentinel: live_reload.sentinel.clone(),
                 debounce: live_reload.debounce,
             })
     }
 }
 
-/// Watch path without `--watch-path`: the executable `command` runs
-fn default_watch_path(command: &str) -> Result<PathBuf> {
-    resolve_program(command).map_err(|_| {
-        eyre!(
-            "--live-reload: cannot find '{}' in PATH to watch; pass --watch-path",
-            command
-        )
-    })
+/// The executable `command` runs, which `--watch` watches
+fn watched_executable(command: &str) -> Result<PathBuf> {
+    resolve_program(command)
+        .map_err(|_| eyre!("--watch: cannot find '{}' in PATH to watch", command))
+}
+
+/// The `--watch-sentinel` file for `executable`: `<executable>.scinit` next to it
+fn sentinel_path(executable: &Path) -> PathBuf {
+    let mut path = executable.as_os_str().to_os_string();
+    path.push(".scinit");
+    PathBuf::from(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(args: &[&str]) -> Config {
+        let cli =
+            Cli::try_parse_from(std::iter::once("scinit").chain(args.iter().copied())).unwrap();
+        Config::from_cli(cli).unwrap()
+    }
+
+    #[test]
+    fn test_watch_watches_the_executable() {
+        let live_reload = config(&["--watch", "/bin/sh"]).live_reload.unwrap();
+        assert_eq!(live_reload.watch_paths, vec![PathBuf::from("/bin/sh")]);
+        assert_eq!(live_reload.sentinel, None);
+    }
+
+    #[test]
+    fn test_watch_sentinel_replaces_the_executable() {
+        let live_reload = config(&["--watch", "--watch-sentinel", "/app/bin/server"])
+            .live_reload
+            .unwrap();
+        assert!(live_reload.watch_paths.is_empty());
+        assert_eq!(
+            live_reload.sentinel,
+            Some(PathBuf::from("/app/bin/server.scinit"))
+        );
+    }
+
+    #[test]
+    fn test_watch_extra_paths_are_added() {
+        let live_reload = config(&[
+            "--watch",
+            "--watch-sentinel",
+            "--watch-extra",
+            "config",
+            "--watch-extra",
+            "templates",
+            "/app/bin/server",
+        ])
+        .live_reload
+        .unwrap();
+        assert_eq!(
+            live_reload.watch_paths,
+            vec![PathBuf::from("config"), PathBuf::from("templates")]
+        );
+    }
+
+    #[test]
+    fn test_watch_options_require_watch() {
+        for args in [
+            &["--watch-sentinel", "app"][..],
+            &["--watch-extra", "config", "app"],
+            &["--debounce-ms", "100", "app"],
+            &["--restart-delay-ms", "100", "app"],
+        ] {
+            let result = Cli::try_parse_from(std::iter::once("scinit").chain(args.iter().copied()));
+            assert!(result.is_err(), "{:?} must require --watch", args);
+        }
+        assert!(config(&["app"]).live_reload.is_none());
+    }
 }
